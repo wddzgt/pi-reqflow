@@ -1,0 +1,48 @@
+services:
+  reqflow:
+    image: ${REQFLOW_IMAGE:-pi-reqflow:local}
+    build:
+      context: .
+      args:
+        NODE_IMAGE: ${REQFLOW_NODE_IMAGE:-node:22.22.0-bookworm-slim}
+        PI_VERSION: "0.87.1"
+        APP_UID: ${REQFLOW_UID:-1000}
+        APP_GID: ${REQFLOW_GID:-1000}
+    user: "${REQFLOW_UID:-1000}:${REQFLOW_GID:-1000}"
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 2g
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=256m,mode=1777
+    ports:
+      - "127.0.0.1:${REQFLOW_PORT:-4173}:4173"
+    environment:
+      REQFLOW_PUBLIC_ORIGIN: ${REQFLOW_PUBLIC_ORIGIN:-http://localhost:4173}
+      REQFLOW_IMPORT_DIR: /projects/project
+      REQFLOW_PI_EXECUTABLE: /usr/local/bin/pi
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+    volumes:
+      - type: bind
+        source: ${REQFLOW_PROJECT_DIR:-./examples/demo-app}
+        target: /projects/project
+        read_only: true
+        bind:
+          create_host_path: false
+      - workspaces:/projects/.reqflow-workspaces
+      - pi-state:/home/node/.pi
+      - service-state:/var/lib/reqflow
+    command: [web, --port, "4173", --host, "0.0.0.0", --origin, "${REQFLOW_PUBLIC_ORIGIN:-http://localhost:4173}"]
+    healthcheck:
+      test: [CMD, node, /opt/reqflow/docker/healthcheck.js]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  workspaces:
+  pi-state:
+  service-state:

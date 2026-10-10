@@ -1,0 +1,17 @@
+{
+  "role": "qa",
+  "contractHash": "REPLACE_WITH_STATUS_CONTRACT_HASH",
+  "coveredAcceptanceIds": ["AC1"],
+  "judgments": {
+    "objective": "agree",
+    "desiredBehavior": "agree",
+    "scope": "agree",
+    "acceptance": "agree"
+  },
+  "interfaceDecisions": { "calculator": "multiply returns product; add remains unchanged" },
+  "blockers": [],
+  "evidence": "验收条件 AC1 可由现有测试框架验证。",
+  "testScenarios": [
+    { "acceptanceId": "AC1", "scenario": "断言 multiply(2, 3) 为 6，add(2, 3) 为 5" }
+  ]
+}

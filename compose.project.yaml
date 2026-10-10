@@ -1,0 +1,17 @@
+# Optional CLI-managed deployment for a project already initialized in place.
+services:
+  reqflow:
+    volumes:
+      - type: bind
+        source: ${REQFLOW_PROJECT_DIR:?Set an absolute REQFLOW_PROJECT_DIR}
+        target: /projects/project
+        read_only: false
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${REQFLOW_CONFIG_FILE:?Set an absolute REQFLOW_CONFIG_FILE}
+        target: /config/project.json
+        read_only: true
+        bind:
+          create_host_path: false
+    command: [web, --project, /projects/project, --port, "4173", --host, "0.0.0.0", --origin, "${REQFLOW_PUBLIC_ORIGIN:-http://localhost:4173}"]

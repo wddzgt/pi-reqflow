@@ -1,0 +1,20 @@
+# Include this file in the existing .gitlab-ci.yml; preserve company jobs.
+# Allow API pipelines in the existing workflow:rules, and provide an available
+# runner with the project's build/deployment dependencies and test credentials.
+pi_reqflow_deploy_test:
+  # Include deploy in the existing stages list (it is also a default stage).
+  stage: deploy
+  resource_group: pi-reqflow-test
+  allow_failure: false
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "api" && $DEPLOY_ENV == "test" && $REVISION != ""'
+      when: on_success
+    - when: never
+  script:
+    - test "$CI_COMMIT_SHA" = "$REVISION"
+    - test "$(git rev-parse HEAD)" = "$REVISION"
+    # Integrate the company's real deployment here, with a nonzero exit on failure.
+    - test -x scripts/deploy-test.sh
+    - ./scripts/deploy-test.sh
+  environment:
+    name: test

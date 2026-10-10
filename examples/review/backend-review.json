@@ -1,0 +1,14 @@
+{
+  "role": "backend",
+  "contractHash": "REPLACE_WITH_STATUS_CONTRACT_HASH",
+  "coveredAcceptanceIds": ["AC1"],
+  "judgments": {
+    "objective": "agree",
+    "desiredBehavior": "agree",
+    "scope": "agree",
+    "acceptance": "agree"
+  },
+  "interfaceDecisions": { "calculator": "multiply returns product; add remains unchanged" },
+  "blockers": [],
+  "evidence": "阅读现有 src/calculator.mjs 与测试后，确认可保持 add 原行为。"
+}

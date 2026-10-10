@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f6f8">
+  <title>pi-reqflow · 需求交付工作台</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/mermaid.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="brand"><span class="brand-mark">π<span>.</span></span><div><strong>pi-reqflow</strong><small>需求交付工作台</small></div></div>
+      <div class="sidebar-label">工作区</div>
+      <nav class="nav-list">
+        <button class="nav-item active" type="button" data-nav="all"><span class="nav-icon">◫</span>需求总览<span class="nav-count" id="navTotal">0</span></button>
+        <button class="nav-item" type="button" data-nav="review"><span class="nav-icon">◇</span>待我审核<span class="nav-count" id="navReview">0</span></button>
+        <button class="nav-item" type="button" data-nav="active"><span class="nav-icon">↗</span>进行中</button>
+        <button class="nav-item" type="button" data-nav="done"><span class="nav-icon">✓</span>已归档</button>
+        <button class="nav-item" type="button" id="adminNavButton" hidden><span class="nav-icon">⚙</span>用户管理</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="project-selector" id="projectSelector">
+          <label for="projectSelect">当前项目</label>
+          <select id="projectSelect" class="project-select">
+            <option value="">加载中…</option>
+          </select>
+          <button id="importProjectButton" class="button small" type="button" title="导入项目">+ 导入</button>
+        </div>
+        <div class="security-note"><span class="security-dot"></span><span>本地工作台<br><small>仅在当前设备开放</small></span></div>
+        <div class="sidebar-version">pi-reqflow Preview <span>v0.1</span></div>
+      </div>
+    </aside>
+    <main class="main-area">
+      <header class="topbar">
+        <div class="breadcrumb"><span>工作区</span><span class="crumb-separator">/</span><strong id="projectCrumb">正在连接…</strong></div>
+        <div class="topbar-actions">
+          <span class="mode-pill" id="projectMode">LOCAL</span>
+          <span class="actor-field"><span>当前用户</span><strong id="identityName">未登录</strong></span>
+          <button id="projectRefButton" class="button" type="button" hidden>项目文档</button>
+          <button id="projectSettingsButton" class="button" type="button" hidden>项目设置</button>
+          <button id="modelSettingsButton" class="button" type="button" hidden>模型设置</button>
+          <button id="adminReportButton" class="button" type="button" hidden>审计报告</button>
+          <button id="refreshButton" class="icon-button" type="button" aria-label="刷新数据" title="刷新数据">↻</button>
+          <button id="loginButton" class="button" type="button">登录</button>
+          <button id="logoutButton" class="icon-button" type="button" aria-label="退出登录" title="退出登录" hidden>↪</button>
+        </div>
+      </header>
+      <div class="page-content">
+        <section class="page-heading">
+          <div><p class="eyebrow">REQUIREMENT DELIVERY</p><h1>需求工作台<span class="heading-dot">.</span></h1><p class="page-subtitle">每一步都有依据，每次修改都能回看。</p></div>
+          <div class="today-block"><span>当前项目</span><strong id="projectName">—</strong><small id="projectPath">—</small></div>
+        </section>
+        <p id="executionNotice" class="plain-copy" hidden></p>
+        <section class="metrics" aria-label="需求统计">
+          <div class="metric-card"><span class="metric-icon review">◇</span><div><span class="metric-label">待审核</span><strong id="metricReview">0</strong><small>需要人工决定</small></div></div>
+          <div class="metric-card"><span class="metric-icon active">↗</span><div><span class="metric-label">进行中</span><strong id="metricActive">0</strong><small>正在推进交付</small></div></div>
+          <div class="metric-card"><span class="metric-icon done">✓</span><div><span class="metric-label">已归档</span><strong id="metricDone">0</strong><small>可追溯的历史记录</small></div></div>
+          <div class="metric-card metric-total"><span class="metric-icon total">▦</span><div><span class="metric-label">需求总数</span><strong id="metricTotal">0</strong><small>当前项目</small></div></div>
+        </section>
+        <section class="workbench" aria-label="需求列表与详情">
+          <div class="list-panel">
+            <div class="panel-heading"><div><span class="section-kicker">WORK ITEMS</span><h2>需求列表</h2></div><div class="list-tools"><span class="list-count" id="listCount">0 项</span><button id="newTaskButton" class="button primary" type="button" hidden>新建</button></div></div>
+            <label class="search-box"><span aria-hidden="true">⌕</span><input id="searchInput" type="search" placeholder="搜索需求编号或标题" aria-label="搜索需求"></label>
+            <div class="filter-row" role="group" aria-label="筛选状态">
+              <button type="button" class="filter-chip active" data-filter="all">全部</button>
+              <button type="button" class="filter-chip" data-filter="review">待审核</button>
+              <button type="button" class="filter-chip" data-filter="active">进行中</button>
+              <button type="button" class="filter-chip" data-filter="done">已归档</button>
+            </div>
+            <div id="taskList" class="task-list" role="list"></div>
+            <button id="loadMoreButton" class="load-more" type="button" hidden>加载更多需求</button>
+          </div>
+          <div id="detailPanel" class="detail-panel"><div class="empty-state"><span class="empty-icon">◇</span><h2>选择一条需求</h2><p>查看方案、验证记录与完整进度。</p></div></div>
+        </section>
+        <footer class="page-footer">pi-reqflow · 从明确需求到可验证交付</footer>
+      </div>
+    </main>
+  </div>
+  <div id="modalRoot" class="modal-root" hidden></div>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <div id="loginRoot" class="login-root">
+    <form id="loginForm" class="login-card">
+      <div class="brand-mark">π<span>.</span></div>
+      <h2>登录需求工作台</h2>
+      <p>新部署默认管理员为 admin / admin123。已有部署使用当前密码。登录后可导入项目和配置模型。</p>
+      <label for="loginUsername">用户名</label>
+      <input id="loginUsername" type="text" autocomplete="username">
+      <label for="loginPassword">密码</label>
+      <input id="loginPassword" type="password" autocomplete="current-password">
+      <div class="login-divider"><span>或使用访问令牌</span></div>
+      <label for="loginToken">访问令牌</label>
+      <input id="loginToken" type="password" autocomplete="off">
+      <button class="button primary" type="submit">登录</button>
+      <small id="loginError" role="alert"></small>
+    </form>
+  </div>
+  <div id="changePasswordRoot" class="login-root" hidden>
+    <form id="changePasswordForm" class="login-card">
+      <div class="brand-mark">d<span>.</span></div>
+      <h2>修改密码</h2>
+      <p>首次登录或密码重置后需要修改密码。</p>
+      <label for="oldPassword">当前密码</label>
+      <input id="oldPassword" type="password" autocomplete="current-password" required>
+      <label for="newPassword">新密码</label>
+      <input id="newPassword" type="password" autocomplete="new-password" required minlength="6">
+      <label for="confirmPassword">确认新密码</label>
+      <input id="confirmPassword" type="password" autocomplete="new-password" required minlength="6">
+      <button class="button primary" type="submit">修改密码</button>
+      <small id="changePasswordError" role="alert"></small>
+    </form>
+  </div>
+  <div id="adminRoot" class="admin-root" hidden>
+    <div class="admin-header">
+      <h2>用户管理</h2>
+      <button id="closeAdminButton" class="icon-button" type="button" aria-label="关闭管理后台">✕</button>
+    </div>
+    <div class="admin-toolbar">
+      <button id="addUserButton" class="button primary" type="button">新建用户</button>
+      <button id="refreshUsersButton" class="button" type="button">刷新</button>
+    </div>
+    <div id="userList" class="user-list"></div>
+  </div>
+  <div id="userFormModal" class="modal-root" hidden>
+    <form id="userForm" class="modal-card">
+      <h3 id="userFormTitle">新建用户</h3>
+      <label for="userFormId">用户 ID</label>
+      <input id="userFormId" type="text" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,63}">
+      <label for="userFormUsername">用户名</label>
+      <input id="userFormUsername" type="text" required>
+      <label for="userFormPassword">密码</label>
+      <input id="userFormPassword" type="password" required minlength="6">
+      <label>角色</label>
+      <div id="roleSelector" class="role-selector"></div>
+      <div class="modal-actions">
+        <button class="button" type="button" id="userFormCancel">取消</button>
+        <button class="button primary" type="submit">保存</button>
+      </div>
+      <small id="userFormError" role="alert"></small>
+    </form>
+  </div>
+  <div id="editRolesModal" class="modal-root" hidden>
+    <div class="modal-card">
+      <h3 id="editRolesTitle">修改角色</h3>
+      <p id="editRolesUser" class="edit-roles-user"></p>
+      <div id="editRoleSelector" class="role-selector"></div>
+      <div class="modal-actions">
+        <button class="button" type="button" id="editRolesCancel">取消</button>
+        <button class="button primary" type="button" id="editRolesSave">保存</button>
+      </div>
+      <small id="editRolesError" role="alert"></small>
+    </div>
+  </div>
+  <div id="importProjectModal" class="modal-root" hidden>
+    <form id="importProjectForm" class="modal-card">
+      <h3>导入项目</h3>
+      <p class="import-hint">选择已有系统的代码目录，AI 将了解项目，为后续需求开发准备上下文。沿用工作台账号和模型设置。</p>
+      <label for="importProjectName">项目名称</label>
+      <input id="importProjectName" type="text" required placeholder="例如：我的应用">
+      <label for="importRootPath">项目根目录</label>
+      <div class="path-input-row">
+        <input id="importRootPath" type="text" placeholder="例如：/path/to/form-edit">
+        <button class="button small" type="button" id="importRootBrowse" title="选择项目根目录">浏览</button>
+      </div>
+      <p class="import-hint">前后端在同一个项目中，直接选择包含 frontend、backend 的上层目录。保留原目录结构及根配置、公共脚本。</p>
+      <details>
+      <summary>前后端在独立目录（可选）</summary>
+      <p class="import-hint">仅在没有统一项目根目录时使用，填写后请留空上面的根目录。</p>
+      <label for="importFrontendPath">前端目录 <span class="optional">（可选）</span></label>
+      <div class="path-input-row">
+        <input id="importFrontendPath" type="text" placeholder="/path/to/frontend">
+        <button class="button small" type="button" id="importFrontendBrowse" title="选择文件夹">浏览</button>
+      </div>
+      <label for="importBackendPath">后端目录 <span class="optional">（可选）</span></label>
+      <div class="path-input-row">
+        <input id="importBackendPath" type="text" placeholder="/path/to/backend">
+        <button class="button small" type="button" id="importBackendBrowse" title="选择文件夹">浏览</button>
+      </div>
+      </details>
+      <details>
+        <summary>高级执行配置（可选）</summary>
+        <p class="import-hint">自动识别 Git 仓库并保留历史，在隔离副本中开发。根目录导入沿用原路径；独立普通目录以 frontend/backend 为根。缺少执行配置也可先导入，之后由管理员连接测试流水线。</p>
+        <p class="import-hint">源码快照默认上限 100 MB，自动排除识别到的构建产物和运行日志，保留字体等项目资源。快照用于本地备份，不会全部加载到 AI 上下文。上传配置可调整 maxSnapshotBytes 和 excludedPaths。</p>
+        <label for="importConfig">项目执行配置</label>
+        <input id="importConfig" type="file" accept=".json,application/json">
+      </details>
+      <div id="importAnalysis" class="import-analysis" hidden>
+        <h4>项目结构</h4>
+        <div id="importAnalysisContent" class="import-analysis-content"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="button" type="button" id="importProjectCancel">取消</button>
+        <button class="button primary" type="submit" id="importProjectSubmit">导入并初始化</button>
+      </div>
+      <small id="importProjectError" role="alert"></small>
+    </form>
+  </div>
+  <div id="directoryBrowserModal" class="modal-root" hidden>
+    <div class="modal-card dir-browser-card">
+      <h3>选择目录</h3>
+      <div class="dir-browser-toolbar">
+        <button class="dir-browser-nav-btn" type="button" id="dirBrowserUp" title="上级目录">⬆</button>
+        <div class="dir-browser-breadcrumbs" id="dirBrowserBreadcrumbs"></div>
+      </div>
+      <div class="dir-browser-list" id="dirBrowserList"></div>
+      <div class="modal-actions">
+        <button class="button" type="button" id="dirBrowserCancel">取消</button>
+        <button class="button primary" type="button" id="dirBrowserSelect">选择此目录</button>
+      </div>
+    </div>
+  </div>
+  <div id="projectOverviewModal" class="modal-root" hidden>
+    <div class="modal-card project-overview-card">
+      <h3>项目初始化完成</h3>
+      <div class="overview-section">
+        <h4>基本信息</h4>
+        <div class="overview-grid">
+          <div class="overview-item">
+            <span class="overview-label">项目名称</span>
+            <span class="overview-value" id="overviewProjectName">-</span>
+          </div>
+          <div class="overview-item">
+            <span class="overview-label">项目路径</span>
+            <span class="overview-value mono" id="overviewProjectPath">-</span>
+          </div>
+        </div>
+      </div>
+      <div class="overview-section">
+        <h4>代码结构</h4>
+        <div id="overviewStructure" class="overview-grid"></div>
+      </div>
+      <div class="overview-section">
+        <h4>配置信息</h4>
+        <div id="overviewConfig" class="overview-grid"></div>
+      </div>
+      <div class="overview-section">
+        <h4>下一步</h4>
+        <ul class="overview-next-steps">
+          <li>使用当前账号切换项目；产品提出需求，研发确认方案并推进开发</li>
+          <li>登录后可以创建需求、管理成员、配置项目</li>
+          <li>建议在「管理后台」添加研发和产品成员</li>
+        </ul>
+      </div>
+      <div class="overview-section">
+        <button class="button small" type="button" id="toggleReferenceBtn">查看项目参考文档</button>
+        <div id="overviewReference" class="overview-reference" hidden>
+          <pre id="overviewReferenceContent"></pre>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="button primary" type="button" id="overviewClose">开始使用</button>
+      </div>
+    </div>
+  </div>
+  <div id="projectRefModal" class="modal-root" hidden>
+    <div class="modal-card project-ref-card">
+      <h3>项目参考文档</h3>
+      <div class="modal-actions" role="group" aria-label="文档类型">
+        <button class="button primary" type="button" id="projectRefDeveloper" aria-pressed="true">开发者指南</button>
+        <button class="button" type="button" id="projectRefAgent" aria-pressed="false" disabled>Agent 指南</button>
+      </div>
+      <div class="project-ref-content">
+        <pre id="projectRefContent">加载中…</pre>
+      </div>
+      <div class="modal-actions">
+        <button class="button" type="button" id="projectRefRefresh">刷新文档</button>
+        <button class="button primary" type="button" id="projectRefClose">关闭</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

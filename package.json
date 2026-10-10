@@ -1,0 +1,32 @@
+{
+  "name": "pi-reqflow",
+  "description": "Controlled requirement delivery for existing systems, powered by Pi.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/wddzgt/pi-reqflow.git" },
+  "homepage": "https://github.com/wddzgt/pi-reqflow#readme",
+  "bugs": { "url": "https://github.com/wddzgt/pi-reqflow/issues" },
+  "keywords": ["pi", "pi-coding-agent", "ai", "requirements", "workflow", "human-in-the-loop", "docker"],
+  "exports": "./src/core.js",
+  "files": ["src/", "web/", "examples/config.local.json", "examples/config.docker.json", "examples/review/", "examples/demo-app/src/", "examples/demo-app/test/", "examples/demo-app/package.json"],
+  "type": "module",
+  "bin": {
+    "pi-reqflow": "./src/cli.js",
+    "devsail": "./src/cli.js",
+    "reqflow": "./src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/cli.js web",
+    "test": "node --test test/*.test.js",
+    "check": "for f in src/*.js; do node --check \"$f\" || exit 1; done"
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "dependencies": {
+    "@mermaid-js/tiny": "12.1.0",
+    "ajv": "^8.17.1",
+    "minisearch": "7.2.0",
+    "shell-quote": "1.8.3"
+  }
+}

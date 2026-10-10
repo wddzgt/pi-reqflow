@@ -1,0 +1,47 @@
+# Place at .github/workflows/deploy-test.yml in the default branch and the
+# development branch. Use a current self-hosted runner with company deployment access.
+name: pi-reqflow test deployment
+on:
+  workflow_dispatch:
+    inputs:
+      req_id:
+        required: true
+        type: string
+      revision:
+        required: true
+        type: string
+      plan_sha256:
+        required: true
+        type: string
+      contract_sha256:
+        required: true
+        type: string
+      deploy_env:
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: pi-reqflow-test
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: self-hosted
+    env:
+      REQ_ID: ${{ inputs.req_id }}
+      REVISION: ${{ inputs.revision }}
+      PLAN_SHA256: ${{ inputs.plan_sha256 }}
+      CONTRACT_SHA256: ${{ inputs.contract_sha256 }}
+      DEPLOY_ENV: ${{ inputs.deploy_env }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.revision }}
+      - name: Deploy verified test revision
+        shell: sh
+        run: |
+          set -eu
+          test "$DEPLOY_ENV" = test
+          test "$(git rev-parse HEAD)" = "$REVISION"
+          test -x scripts/deploy-test.sh
+          ./scripts/deploy-test.sh

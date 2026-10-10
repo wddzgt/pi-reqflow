@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 2,
+  "mode": "local",
+  "piExecutable": "/absolute/path/to/pi",
+  "provider": "anthropic",
+  "model": "claude-haiku-4-5",
+  "environment": { "pi": [], "checks": [], "localDeployment": [] },
+  "allowedPaths": ["src", "test"],
+  "excludedPaths": [".env", "dist", "coverage"],
+  "maxSnapshotBytes": 20000000,
+  "maxPiMs": 300000,
+  "maxToolCalls": 60,
+  "maxEventBytes": 2000000,
+  "maxCostUsd": 2,
+  "codingStandards": { "globalRules": [] },
+  "fastPath": { "enabled": false },
+  "checks": [["npm", "test"]],
+  "testDeployment": {
+    "kind": "local",
+    "command": ["npm", "run", "deploy:test"]
+  },
+  "productionDeployment": {
+    "kind": "none"
+  }
+}

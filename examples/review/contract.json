@@ -1,0 +1,11 @@
+{
+  "objective": "支持乘法计算",
+  "currentBehavior": "现有计算器只提供加法",
+  "desiredBehavior": "新增 multiply(left, right) 返回乘积，add 保持原行为",
+  "acceptance": [
+    { "id": "AC1", "text": "multiply(2, 3) 返回 6，add(2, 3) 仍返回 5" }
+  ],
+  "inScope": ["src/calculator.mjs", "test/calculator.test.mjs"],
+  "outOfScope": ["界面交互"],
+  "answers": { "Q1": "本次不需要界面入口" }
+}

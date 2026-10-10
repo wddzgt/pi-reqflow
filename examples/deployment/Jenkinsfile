@@ -1,0 +1,31 @@
+// Pipeline from SCM; reuse that job's repository and Git credentials.
+// The runner must provide this project's build/deployment dependencies.
+pipeline {
+  agent any
+  options { skipDefaultCheckout(true); disableConcurrentBuilds() }
+  parameters {
+    string(name: 'REQ_ID', defaultValue: '')
+    string(name: 'BRANCH', defaultValue: '')
+    string(name: 'REVISION', defaultValue: '')
+    string(name: 'PLAN_SHA256', defaultValue: '')
+    string(name: 'CONTRACT_SHA256', defaultValue: '')
+    string(name: 'DEPLOY_ENV', defaultValue: '')
+  }
+  stages {
+    stage('Checkout verified revision') {
+      steps {
+        script {
+          if (!params.REVISION || params.DEPLOY_ENV != 'test') error('A verified test revision is required')
+          checkout([$class: 'GitSCM', branches: [[name: params.REVISION]], userRemoteConfigs: scm.userRemoteConfigs])
+        }
+        sh 'test "$(git rev-parse HEAD)" = "$REVISION"'
+      }
+    }
+    stage('Deploy test environment') {
+      steps {
+        // Integrate the company's real deployment here, with a nonzero exit on failure.
+        sh 'test -x scripts/deploy-test.sh && ./scripts/deploy-test.sh'
+      }
+    }
+  }
+}

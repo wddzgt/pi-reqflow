@@ -1,0 +1,7 @@
+{
+  "summary": "现有计算器只有 add。建议增加 multiply，保留 add 的行为与测试。",
+  "questions": [
+    { "id": "Q1", "text": "这次是否需要界面入口？" }
+  ],
+  "requiredRoles": ["backend", "qa"]
+}
