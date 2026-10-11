@@ -3,7 +3,7 @@ import { sha256 } from "./files.js";
 
 export const admissionDefaults = Object.freeze({ maxFiles: 12, maxAcceptance: 8, maxBusinessModules: 2,
   maxDeliveryUnits: 1, maxEstimatedChangedLines: 1000, maxChangedBytes: 250000,
-  maxPlanAttempts: 3, maxModelCalls: 36, maxTotalTokens: 200000, maxModelMs: 1200000, budgetMode: "adaptive",
+  maxPlanAttempts: 3, maxModelCalls: 36, maxTotalTokens: 200000, budgetMode: "adaptive",
   restrictedPaths: Object.freeze([]) });
 export const excludedWork = Object.freeze(["architecture_redesign", "staged_migration", "core_security_rework",
   "framework_upgrade", "exploratory_work", "irreversible_data_operation"]);
@@ -112,7 +112,6 @@ export function executionUsage(events) {
     else unmeasuredDuration = true;
     const values = ["input", "output", "cacheRead", "cacheWrite"].map((key) => telemetry?.tokens?.[key]);
     if (!values.every((value) => Number.isSafeInteger(value) && value >= 0)
-        || !Number.isSafeInteger(telemetry?.durationMs) || telemetry.durationMs < 0
         || !Number.isSafeInteger(telemetry?.assistantMessages) || telemetry.assistantMessages < 0) { unmeasuredCalls++; continue; }
     if (telemetry.unmeasuredRequests > 0 || telemetry.requestTimings?.some(row => row.usageMeasured === false
         || ["running", "timed_out", "interrupted"].includes(row.status))) unmeasuredCalls++;
@@ -124,16 +123,9 @@ export function executionUsage(events) {
 
 export function modelAllowance(events, policy, calls = 1) {
   const usage = executionUsage(events);
-  let maxModelMs = policy.maxModelMs;
-  for (const event of events.filter(event => event.type === "execution_budget_extended")) {
-    const additionalMs = event.detail.additionalModelMs;
-    if (!Number.isSafeInteger(additionalMs) || additionalMs < 60000 || additionalMs > 3600000)
-      throw new Error("Execution budget extension requires an explicit duration between one and sixty minutes");
-    maxModelMs += additionalMs;
-  }
-  if (usage.unmeasuredDuration || (policy.budgetMode === "strict" && usage.unmeasuredCalls))
-    throw new Error("Execution budget has unmeasured model calls or duration; further model execution is blocked");
-  if ((policy.budgetMode === "strict" && (usage.calls + calls > policy.maxModelCalls || usage.totalTokens >= policy.maxTotalTokens)) || usage.modelMs >= maxModelMs) {
+  if (policy.budgetMode === "strict" && usage.unmeasuredCalls)
+    throw new Error("Execution budget has unmeasured model calls; further model execution is blocked");
+  if (policy.budgetMode === "strict" && (usage.calls + calls > policy.maxModelCalls || usage.totalTokens >= policy.maxTotalTokens)) {
     throw new Error("Requirement execution budget exhausted; hand off to the responsible developer");
   }
   const scope = events.findLast(event => event.type === "plan_draft_completed")?.detail.admission?.scope;
@@ -141,7 +133,6 @@ export function modelAllowance(events, policy, calls = 1) {
     ? "small" : scope.files <= 6 && scope.estimatedChangedLines <= 400 ? "standard" : "bounded_complex";
   const expectedTokens = { planning: 60000, small: 30000, standard: 60000, bounded_complex: 120000 }[complexity];
   return { maxTokens: policy.budgetMode === "strict" ? policy.maxTotalTokens - usage.totalTokens : expectedTokens,
-    maxMs: maxModelMs - usage.modelMs,
     maxRequests: policy.budgetMode === "strict" ? policy.maxModelCalls - usage.calls : policy.maxModelCalls,
     budget: { mode: policy.budgetMode, complexity, expectedTokens, usedTokens: usage.totalTokens,
       unmeasuredCalls: usage.unmeasuredCalls,

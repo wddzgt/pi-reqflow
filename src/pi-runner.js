@@ -22,8 +22,8 @@ function assistantText(message) {
 export async function runPi(project, cwd, phase, prompt, logFile, costLimit, role = null, images = [], executionLimit = null) {
   assertExecutionActive();
   if (typeof costLimit !== "number" || costLimit <= 0) throw new Error("Pi cost limit must be positive");
-  if (executionLimit !== null && (!Number.isSafeInteger(executionLimit.maxTokens) || executionLimit.maxTokens < 1
-      || !Number.isSafeInteger(executionLimit.maxMs) || executionLimit.maxMs < 1)) throw new Error("Pi execution limit requires positive token and duration allowances");
+  if (executionLimit !== null && (!Number.isSafeInteger(executionLimit.maxTokens) || executionLimit.maxTokens < 1))
+    throw new Error("Pi execution limit requires a positive token allowance");
   if (executionLimit?.maxRequests !== undefined && (!Number.isSafeInteger(executionLimit.maxRequests) || executionLimit.maxRequests < 1)) throw new Error("Pi provider request allowance must be a positive integer");
   if (executionLimit?.approvedFiles !== undefined && (phase !== "implement" || !Array.isArray(executionLimit.approvedFiles)
       || !executionLimit.approvedFiles.length || new Set(executionLimit.approvedFiles).size !== executionLimit.approvedFiles.length
@@ -80,8 +80,6 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
   const tokenLimit = Math.min(executionLimit?.maxTokens ?? modelUsage.maxTokens,
     phase === "initialize" ? modelUsage.initializationMaxTokens : modelUsage.maxTokens);
   const adaptiveBudget = phase === "implement" || executionLimit?.budget?.mode === "adaptive";
-  const runTimeoutMs = executionLimit === null ? project.config.maxPiMs : phase === "implement" ? executionLimit.maxMs
-    : Math.min(executionLimit.maxMs, project.config.maxPiMs * (adaptiveBudget ? requestLimit : 1));
   const tokenBudgetKind = executionLimit !== null && executionLimit.maxTokens <= (phase === "initialize"
     ? modelUsage.initializationMaxTokens : modelUsage.maxTokens) ? "remaining requirement" : "phase";
   const toolLimit = phase === "initialize"
@@ -402,7 +400,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       implementationResearchRequests: researchRequests,
       ...(phase === "implement" && executionLimit?.approvedFiles && project.config.checks ? {
         implementationChecks: { commands: project.config.checks, environment: project.config.environment.checks,
-          sandbox: project.config.checkSandbox, timeoutMs: runTimeoutMs, maxBytes: project.config.maxEventBytes,
+          sandbox: project.config.checkSandbox, timeoutMs: project.config.maxPiMs, maxBytes: project.config.maxEventBytes,
           maxSnapshotBytes: project.config.maxSnapshotBytes, logPrefix: `${logFile}.internal` },
       } : {}),
       providerRequestLimit: Math.min(executionLimit?.maxRequests ?? (phase === "implement" ? requestLimit : modelUsage.maxRequests),
@@ -473,13 +471,11 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
   if (signal?.aborted) terminate();
   let stderr = "";
   child.stderr.on("data", (part) => { stderr = (stderr + part.toString()).slice(-16000); });
-  let timer;
   let requestTimer;
-  let timeoutScope = "stage";
   const completion = new Promise((resolve, reject) => {
     child.once("error", reject);
     child.once("exit", () => {
-      clearTimeout(timer);
+      clearTimeout(requestTimer);
       try { signalGroup("SIGKILL"); }
       catch (error) { reject(error); }
     });
@@ -536,12 +532,11 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
     developmentChecks, budgetExpansions, requestBudgetExpansions,
     budget: executionLimit?.budget ?? { mode: "strict" }, planValidation, intakeValidation, contextExpansions,
     compactions, unmeasuredRequests: pendingCompactions + requestTimings.filter(row => !row.usageMeasured).length,
-    timeouts: { requestMs: project.config.maxPiMs, stageMs: runTimeoutMs, mode: adaptiveBudget ? "per_request" : "stage" },
+    timeouts: { requestMs: project.config.maxPiMs, mode: "per_request" },
     pricingKnown: pendingCompactions === 0 && requestTimings.every(row => row.usageMeasured)
       && !(project.config.compatibleProviders ?? []).length,
     imageArtifacts: [...imageArtifacts.values()].filter((entry) => entry.persisted).map(({ buffer, persisted, ...entry }) => entry) });
-  timer = setTimeout(() => { clearTimeout(requestTimer); timedOut = true; terminate(); }, runTimeoutMs);
-  if (adaptiveBudget) requestTimer = setTimeout(() => { clearTimeout(timer); timedOut = true; timeoutScope = "request"; terminate(); }, project.config.maxPiMs);
+  requestTimer = setTimeout(() => { timedOut = true; terminate(); }, project.config.maxPiMs);
   try {
     for await (const line of readline.createInterface({ input: child.stdout })) {
       const event = JSON.parse(line);
@@ -596,7 +591,11 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
         }
         await log.writeFile(`${auditedLine}\n`);
       }
-      if (event.type === "entry_appended" && event.entry?.customType === "reqflow_compaction_started") pendingCompactions++;
+      if (event.type === "entry_appended" && event.entry?.customType === "reqflow_compaction_started") {
+        pendingCompactions++;
+        clearTimeout(requestTimer);
+        requestTimer = setTimeout(() => { timedOut = true; terminate(); }, project.config.maxPiMs);
+      }
       if (event.type === "entry_appended" && event.entry?.customType === "reqflow_compaction") {
         const record = event.entry.data;
         if (![0, 1].includes(pendingCompactions) || record?.started?.requests !== record.requests
@@ -608,6 +607,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
             || ["input", "output", "cacheRead", "cacheWrite"].some(key => !Number.isSafeInteger(record.usage?.[key]) || record.usage[key] < 0)
             || !Number.isFinite(record.usage.cost?.total) || record.usage.cost.total < 0) throw new Error("Invalid native compaction usage evidence");
         pendingCompactions = 0;
+        clearTimeout(requestTimer);
         assistantMessages += record.requests;
         for (const key of Object.keys(tokens)) tokens[key] = (tokens[key] ?? 0) + record.usage[key];
         completedCost += record.usage.cost.total;
@@ -624,10 +624,8 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
         requestTimings.push({ request: estimate.request, provider: estimate.provider, model: estimate.model,
           startedAt: new Date().toISOString(), startedAfterMs: Date.now() - startedMs,
           firstResponseMs: null, firstTextMs: null, durationMs: null, status: "running", usageMeasured: false, contextBytes: estimate.contextBytes });
-        if (adaptiveBudget) {
-          clearTimeout(requestTimer);
-          requestTimer = setTimeout(() => { clearTimeout(timer); timedOut = true; timeoutScope = "request"; terminate(); }, project.config.maxPiMs);
-        }
+        clearTimeout(requestTimer);
+        requestTimer = setTimeout(() => { timedOut = true; terminate(); }, project.config.maxPiMs);
         reportProgress(`正在进行第 ${estimate.request} 次模型请求，等待分析与输出。`, "", "request");
       }
       if (event.type === "entry_appended" && event.entry?.customType === "reqflow_provider_request") {
@@ -638,12 +636,12 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
         requestTimings.push({ ...observed, startedAt: new Date().toISOString(), startedAfterMs: Date.now() - startedMs,
           firstResponseMs: null, firstTextMs: null, durationMs: null, status: "running", usageMeasured: false });
         clearTimeout(requestTimer);
-        requestTimer = setTimeout(() => { clearTimeout(timer); timedOut = true; timeoutScope = "request"; terminate(); }, project.config.maxPiMs);
+        requestTimer = setTimeout(() => { timedOut = true; terminate(); }, project.config.maxPiMs);
         reportProgress(`Pi 正在进行第 ${observed.request} 次模型请求。`, "", "request");
       }
       if (event.type === "entry_appended" && event.entry?.customType === "reqflow_development_check") {
         const check = event.entry.data;
-        if (phase !== "implement" || !["passed", "failed", "error"].includes(check?.status)
+        if (phase !== "implement" || !["passed", "failed", "error", "manual_pending"].includes(check?.status)
             || check.attempt !== developmentChecks.length + 1 || !Array.isArray(check.checks)
             || check.formalVerificationRequired !== true) throw new Error("Invalid development check evidence");
         developmentChecks.push(check);
@@ -853,8 +851,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
     if (timedOut) {
       const current = requestTimings.at(-1);
       const validation = planValidation.at(-1);
-      const limitMs = timeoutScope === "request" ? project.config.maxPiMs : runTimeoutMs;
-      throw new Error(`AI ${phase === "plan" ? "研发方案" : phase === "review" ? "方案核对" : phase === "intake" ? "需求分析" : "任务"}${timeoutScope === "request" ? "单次模型请求" : ""}超过 ${Math.round(limitMs / 1000)} 秒执行时限；模型 ${selection.model}，${requestTimings.length} 次模型请求、${toolCalls} 次工具调用。`
+      throw new Error(`AI ${phase === "plan" ? "研发方案" : phase === "review" ? "方案核对" : phase === "intake" ? "需求分析" : "任务"}单次模型请求超过 ${Math.round(project.config.maxPiMs / 1000)} 秒执行时限；模型 ${selection.model}，${requestTimings.length} 次模型请求、${toolCalls} 次工具调用。`
         + (current?.status === "running" ? `当前第 ${current.request} 次请求已用 ${Math.round((Date.now() - Date.parse(current.startedAt)) / 1000)} 秒。` : "")
         + (validation?.status === "invalid" ? `最近未通过的检查：${validation.error}` : "")
         + (["plan", "review"].includes(phase) ? "本轮未成功，不会批准或覆盖旧方案；" : "本轮未成功；")
@@ -891,7 +888,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       }
     }
     if (timedOut) error.code = "PI_TIMEOUT";
-    if (timedOut) error.timeoutScope = timeoutScope;
+    if (timedOut) error.timeoutScope = "request";
     for (const timing of [...requestTimings, ...toolTimings]) if (timing.status === "running") {
       timing.durationMs = Date.now() - Date.parse(timing.startedAt);
       timing.status = timedOut ? "timed_out" : "interrupted";
@@ -917,7 +914,6 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
     throw error;
   } finally {
     signal?.removeEventListener("abort", terminate);
-    clearTimeout(timer);
     clearTimeout(requestTimer);
     clearTimeout(escalation);
     await log.close();

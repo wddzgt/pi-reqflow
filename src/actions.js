@@ -4,7 +4,6 @@ import { assignMember, assignDevelopmentTeam, respondToAssignment } from "./assi
 import { reviewPlanPart } from "./plan-review.js";
 import { actionAuditContext, appendEvent, readTask, recoverTaskLock, taskPath, withLock } from "./store.js";
 import path from "node:path";
-import { executionUsage } from "./admission.js";
 import { progressContext, reportProgress, controlledExecution, executionStatus, pauseExecution, assertExecutionActive } from "./action-progress.js";
 import { confirmContract, finalizeRoleReview, recordDevFeedback, reviseContract,
   runRoleReviewWithPi, submitRoleReview } from "./intake.js";
@@ -63,20 +62,6 @@ export async function executeRequirementAction(projectPath, id, body, principal,
   const execute = async () => {
   reportProgress("请求已接收，正在准备本轮任务。", "", "started");
   switch (action) {
-    case "extend-execution-budget": {
-      if (!Number.isSafeInteger(body.additionalModelMs) || body.additionalModelMs < 60000 || body.additionalModelMs > 3600000
-          || typeof body.reason !== "string" || !body.reason.trim() || body.reason.length > 4000)
-        throw new Error("请明确追加1至60分钟执行时长，并填写继续执行的原因。");
-      return withLock(path.join(taskPath(project, id), "task.lock"), async () => {
-        const task = await readTask(project, id);
-        if (body.expectedAuditHead !== task.lastHash) throw new Error("需求记录已改变，请刷新后再追加预算。");
-        const next = { ...task.meta, executionBoundary: null, updatedAt: new Date().toISOString() };
-        await appendEvent(project, id, "execution_budget_extended", next, { actor,
-          additionalModelMs: body.additionalModelMs, reason: body.reason.trim(), contractHash: task.meta.contractHash,
-          priorAuditHead: task.lastHash, usageBefore: executionUsage(task.events) });
-        return next;
-      });
-    }
     case "intake-message": return addIntakeMessage(projectPath, id, actor, body.message);
     case "analyze-intake": return analyzeIntake(projectPath, id, actor);
     case "assign-member": return assignMember(projectPath, id, actor, body.role, body.member);
@@ -126,13 +111,14 @@ export async function executeRequirementAction(projectPath, id, body, principal,
       body.outcome, body.observedRevision, evidence);
     case "accept-test": {
       const current = await readTask(project, id);
+      if (!["manual", "local", "deployed"].includes(body.acceptanceMode)) throw new Error("Acceptance mode must be manual, local or deployed");
+      if (body.acceptanceMode !== "deployed" && (current.meta.state !== "verified"
+          || body.expectedAfterHash !== current.meta.afterHash || body.expectedPlanHash !== current.meta.planHash))
+        throw new Error("代码或方案已改变，请刷新后确认当前研发交付。");
       if (current.meta.state === "verified" && current.meta.changeApproval?.afterHash !== current.meta.afterHash)
         await approveChanges(projectPath, id, actor, evidence);
-      const accepted = await acceptTest(projectPath, id, actor, evidence);
-      if (project.config.productionDeployment.kind === "none") {
-        return archiveTestOnly(projectPath, id, actor);
-      }
-      return accepted;
+      await acceptTest(projectPath, id, actor, evidence, body.acceptanceMode);
+      return archiveTestOnly(projectPath, id, actor);
     }
     case "verify-candidate": return verifyCandidate(projectPath, id);
     case "approve-release": return approveRelease(projectPath, id, actor);

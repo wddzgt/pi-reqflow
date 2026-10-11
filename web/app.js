@@ -1,6 +1,6 @@
 const state = { overview: null, detail: null, selectedId: null, filter: "all", tab: "plan", token: null,
   principal: null, actions: new Set(), busy: false, diff: null, projects: [], currentProjectId: null, detailRequest: 0,
-  planDrafts: new Map(), intakeDrafts: new Map() };
+  planDrafts: new Map(), intakeDrafts: new Map(), page: "requirements", environmentRequest: 0 };
 const $ = (selector) => document.querySelector(selector);
 const states = {
   intake_draft: ["待 AI 研发分析", "active", 0], assignment_pending: ["待研发接单", "review", 0],
@@ -13,11 +13,11 @@ const states = {
   approved: ["方案已批准", "active", 2], implementing: ["实施中", "active", 3],
   implementation_failed: ["实施失败", "error", 3], implementation_inspection_failed: ["需检查变更", "error", 3],
   implementation_interrupted: ["实施已中断", "error", 3], implemented: ["待验证", "active", 3],
-  verification_failed: ["验证失败", "error", 4], verified: ["待人工验证", "active", 4],
+  verification_failed: ["验证失败", "error", 4], verified: ["待人工确认", "review", 5],
   test_deploy_submitting: ["正在提交测试部署", "active", 4],
   test_deploy_outcome_unknown: ["测试部署结果待核实", "error", 4],
   test_deploy_running: ["测试部署中", "active", 4], test_deploy_failed: ["测试部署失败", "error", 4],
-  test_deployed: ["待测试验收", "review", 4], test_accepted: ["测试已验收", "active", 4],
+  test_deployed: ["待测试验收", "review", 5], test_accepted: ["人工验收已确认", "active", 6],
   merge_verifying: ["候选验证中", "active", 5], merge_verification_failed: ["候选验证失败", "error", 5],
   merge_verified: ["候选已验证", "active", 5], release_approved: ["发布已批准", "active", 5],
   release_submitting: ["正在提交发布", "active", 5],
@@ -28,7 +28,6 @@ const states = {
 };
 const eventNames = {
   execution_binding_updated: "执行规则绑定已更新，原方案保留",
-  execution_budget_extended: "负责人已追加执行时长，历史消耗保留",
   execution_continued: "已从暂停现场继续", execution_paused: "用户已暂停，现场保留",
   development_authorized: "已授权自动开发",
   development_restarted: "回退后已返回研发方案，上一轮证据保留",
@@ -53,6 +52,7 @@ const eventNames = {
   development_paused: "执行已暂停，现场已保存", implementation_resumed: "从保存的现场继续执行",
   revision_published: "需求分支已发布", test_deployed: "测试环境就绪", test_deploy_running: "测试部署中",
   local_validation_requested: "研发获取本地验证代码", local_validation_changes_retained: "本地修改前证据已保留",
+  local_validation_blocked: "本地验证等待环境配置", local_validation_failed: "本地服务启动失败，代码现场保留",
   git_commit_authorized: "研发授权代码提交", git_committed: "需求代码已提交",
   git_candidate_prepared: "已形成测试合并候选", git_candidate_verified: "测试合并候选已验证",
   git_test_branch_published: "测试分支已推送", git_delivery_failed: "Git 交付暂停，待研发处理",
@@ -60,13 +60,13 @@ const eventNames = {
   test_deploy_submitting: "测试部署已提交", test_deploy_outcome_unknown: "测试部署结果待核实",
   test_deploy_poll_failed: "测试部署查询失败",
   test_deployment_reconciled: "测试部署结果已人工核实",
-  test_deploy_failed: "测试部署失败", test_accepted: "人工测试验收", merge_candidate_prepared: "开始候选版本验证",
+  test_deploy_failed: "测试部署失败", test_accepted: "人工验收确认", merge_candidate_prepared: "开始候选版本验证",
   merge_verified: "候选验证通过", merge_verification_failed: "候选验证失败", release_approved: "发布已批准",
   release_running: "发布中", released: "发布完成", release_failed: "发布失败", archived: "已归档",
   release_submitting: "发布已提交", release_outcome_unknown: "发布结果待核实",
   release_poll_failed: "发布查询失败",
   release_reconciled: "发布结果已人工核实",
-  archived_test_only: "测试归档", workspace_rolled_back: "工作区已回退", rollback_rejected: "回退被拒绝",
+  archived_test_only: "研发交付归档", workspace_rolled_back: "工作区已回退", rollback_rejected: "回退被拒绝",
   stale_lock_cleared: "过期锁已清除",
   pi_budget_exhausted: "模型预算耗尽，流程已停止", fast_path_attempt_failed: "自动流程未能推进", fast_path_scope_failed: "变更超出批准范围",
   credential_added: "账号已创建", credential_revoked: "账号凭据已撤销", credentials_reprovisioned: "账号凭据已重新配置",
@@ -79,7 +79,6 @@ const actionRoles = {
   "redeploy-test": "developer",
   "approve-plan": "developer", "approve-changes": "developer", rollback: "developer", "restart-development": "developer", "archive-test-only": "developer",
   "run-review": "developer", plan: "developer", develop: "developer", "fast-track": "developer",
-  "extend-execution-budget": "developer",
   implement: "developer", verify: "developer",
   "inspect-interrupted": "developer", "recover-lock": "developer", "record-published": "developer",
   "deploy-test": "developer", "poll-deploy": "developer", "verify-candidate": "developer",
@@ -89,6 +88,7 @@ const actionRoles = {
 };
 
 function canUseAction(meta, action, role) {
+  if (action === "configure-environment") return state.overview.project.canConfigureEnvironment === true;
   if (action.startsWith("review-plan-")) return state.actions.has("review-plan")
     && meta.assignments?.[action.slice("review-plan-".length)]?.userId === state.principal?.id
     && meta.assignments[action.slice("review-plan-".length)].status === "accepted";
@@ -187,11 +187,10 @@ async function refresh(preferredId = state.selectedId) {
   $("#projectPath").textContent = productView ? "基于现有系统提出需求、对齐理解并确认验收结果" : project.root;
   $("#projectPath").title = productView ? "" : project.root;
   $("#projectRefButton").hidden = productView;
-  $("#projectSettingsButton").hidden = !state.actions.has("configure-project");
   $("#modelSettingsButton").hidden = !state.principal.roles.includes("admin");
   $("#executionNotice").hidden = project.executionReady !== false;
   $("#executionNotice").textContent = project.executionReady === false
-    ? "未连接固定测试环境，仍可沟通需求和设计方案。开发测试通过后，由研发选择本地人工验证；有固定环境时再连接发布工具。" : "";
+    ? "未连接固定测试环境。研发检查通过后可人工确认归档；需要环境验证时再配置本地环境或连接测试发布工具。" : "";
   $("#projectMode").textContent = project.mode.toUpperCase();
   $("#metricReview").textContent = counts.review;
   $("#metricActive").textContent = counts.active + counts.error;
@@ -204,6 +203,7 @@ async function refresh(preferredId = state.selectedId) {
   renderList();
   if (state.selectedId) await loadDetail(state.selectedId, state.selectedId === previousId);
   else clear($("#detailPanel")).append(element("div", "empty-state", "暂无需求。产品负责人可以新建第一条需求。"));
+  if (state.page === "environment") await openEnvironmentPage();
 }
 
 function matchesFilter(task) {
@@ -233,7 +233,7 @@ function renderList() {
     const bottom = element("div", "task-item-bottom");
     const isArchived = ["archived", "archived_test_only"].includes(task.state);
     if (isArchived) {
-      const archiveLabel = task.state === "archived" ? "已归档" : "仅测试归档";
+      const archiveLabel = task.state === "archived" ? "已归档" : "研发交付归档";
       const archiveMeta = task.archivedBy ? `${archiveLabel} · ${task.archivedBy}` : archiveLabel;
       bottom.append(element("span", "task-archive-label", archiveMeta));
       if (task.changeCount != null) bottom.append(element("span", "task-change-count", `${task.changeCount} 文件变更`));
@@ -247,12 +247,7 @@ function renderList() {
 
 function nextStep(meta) {
   if (meta.executionBoundary?.length) {
-    const timeExhausted = state.overview.project.admission.budgetMode === "adaptive"
-      && meta.executionBoundary.includes("Requirement execution budget exhausted; hand off to the responsible developer");
-    return ["自动执行已停止", timeExhausted
-      ? "已达到累计执行时限。负责人可以明确追加时长，历史消耗和未知用量全部保留；追加后需主动重试。"
-      : "已达到承接或执行预算边界，请研发负责人查看流程记录并处理具体原因。未知用量或范围限制不能通过追加时长绕过。", "error",
-      timeExhausted ? [["extend-execution-budget", "追加执行时长", "secondary"]] : []];
+    return ["自动执行已停止", "已达到承接或执行预算边界，请研发负责人查看流程记录并处理具体原因。", "error", []];
   }
   switch (meta.state) {
     case "intake_draft": return ["开始需求沟通", "AI 研发根据现有项目和图片提出分析、建议及必要问题。", "active", [["analyze-intake", "让 AI 研发分析", "primary"]]];
@@ -310,12 +305,12 @@ function nextStep(meta) {
       ? ["方案存在待解决问题", revision.length ? "请查看阻断原因并填写修改意见；解决后才能批准。" : "分析次数已用尽，请研发负责人接手；需求调整不会重置累计预算。", "error", [...revision, ["revise-contract", "修订需求", "secondary"]]]
       : [teamReview?.mode === "split" ? "分工审核完成，等待交付负责人启动开发" : "等待研发确认方案",
         state.overview.project.checksConfigured === false
-          ? "方案已包含影响范围内的检查与启动方式，确认后开始开发；完成后可选择本地验证或发布测试环境。"
-          : "确认后由 Pi 开发并运行测试；通过后由交付负责人选择本地人工验证或发布到固定测试环境。",
+          ? "方案已包含相关检查与可选启动方式，确认后开始开发；检查通过后可人工确认归档。"
+          : "确认后由 Pi 开发并运行相关测试；通过后人工确认即可归档，本地验证与测试发布可选。",
         "review", [["approve-plan", "确认方案并开发", "primary"], ...revision, ["revise-contract", "修订需求", "secondary"]]];
     }
     case "approved": return ["方案已确认", "继续开发和自动检查，通过后由研发选择人工验证方式。", "active", [["develop", "继续开发与测试", "primary"]]];
-    case "implemented": return ["代码修改完成", "继续运行自动检查，通过后选择本地人工验证或发布测试环境。", "active", [["develop", "继续测试", "primary"]]];
+    case "implemented": return ["代码修改完成", "继续运行相关检查，通过后人工确认即可归档；环境验证可选。", "active", [["develop", "继续测试", "primary"]]];
     case "implementation_failed": return ["开发已暂停，现场已保存",
       `${meta.developmentPause?.reason ?? meta.developmentFailure?.message ?? state.detail?.events?.findLast(event => event.type === "implementation_failed")?.error ?? "本轮执行未完成。"} 可以查看已有修改，再从现场继续。`, "error",
       [...(meta.developmentFailure?.retryable === false ? [] : [["develop", "从现场继续开发", "primary"]]), ["rollback", "回退工作区", "danger"]]];
@@ -327,17 +322,18 @@ function nextStep(meta) {
       [["develop", "继续修复并测试", "primary"], ...(state.overview.project.mode === "git" ? [["recheck-local", "检查本地修改", "secondary"]] : []), ["rollback", "回退工作区", "danger"]]];
     case "verified": {
       const configured = state.overview.project.executionReady !== false;
+      const blocked = meta.localValidation?.status === "blocked" && state.overview.project.localEnvironment?.status === "blocked";
       const git = state.overview.project.mode === "git";
       const publish = git ? ["publish-test", state.overview.project.gitDelivery?.testMode === "merge"
         ? "合并并发布测试环境" : "发布需求分支到测试环境", "secondary"] : ["deploy-test", "发布到测试环境", "secondary"];
-      return [meta.verificationMode === "manual_pending" ? "代码已就绪，待人工验证" : "范围内检查通过，选择人工验证方式", meta.gitDeliveryError || (configured
-        ? "先查看代码差异，再选择本地人工验证或发布到项目的固定测试环境。本地验证后仍可继续发布。"
-        : "可先在本地人工验证。项目未连接固定测试环境，暂不能自动发布；连接后再继续发布。"), "review",
-        [["local-validation", meta.localValidation?.status === "running" ? "查看本地环境" : "启动本地验证", "primary"],
-           ...(meta.localValidation?.environment && ["running", "not_applicable", "stopped"].includes(meta.localValidation.status) && meta.localValidation.afterHash === meta.afterHash
-             ? [["accept-test", "确认代码与本地验证并归档", "primary"]] : []), ...(configured ? [publish] : []),
+      return [meta.verificationMode === "manual_pending" ? "代码已就绪，待人工确认" : "研发检查通过，待人工确认", meta.gitDeliveryError ||
+        (meta.verificationMode === "manual_pending" ? "本轮没有合适的自动检查，请核对需求、代码差异并记录实际人工检查结论。" : "核对需求、代码差异及相关测试结果，人工确认后即可归档。")
+        + " 本地验证和测试环境发布均为可选步骤，不配置环境也可归档。"
+        + (blocked ? " 本地启动缺少环境条件，重试前请先补齐配置。" : ""), "review",
+        [["accept-test", "人工确认并归档", "primary"],
+           ["local-validation", meta.localValidation?.status === "running" ? "查看本地环境" : blocked ? "重试本地验证（可选）" : "启动本地验证（可选）", "secondary"], ...(configured ? [publish] : []),
            ["recheck-local", "重新检查本地修改", "secondary"],
-          ...(!configured && state.actions.has("configure-project") ? [["configure-project", "连接固定测试环境", "secondary"]] : [])]];
+           ...(!configured && state.overview.project.canConfigureEnvironment ? [["configure-environment", "配置测试环境", "secondary"]] : [])]];
     }
     case "test_deploy_running": return ["测试部署进行中", "查询已提交的部署任务并保留执行记录。", "active", [["poll-deploy", "查询部署结果", "primary"]]];
     case "test_deploy_submitting": case "test_deploy_outcome_unknown":
@@ -345,11 +341,9 @@ function nextStep(meta) {
     case "test_deployed": return meta.testEnvironmentSupersededBy
       ? ["共享测试环境已用于其他需求", "当前链接不能用于本需求验收；研发可重新发布已验证代码。", "review", [["redeploy-test", "重新发布测试环境", "primary"]]]
       : ["等待人工验证", "按需求终版在测试环境验证业务结果，确认后记录验收与归档。", "review", [["accept-test", "确认验证结果", "primary"], ["rollback", "恢复需求工作目录", "secondary"]]];
-    case "test_accepted": return ["测试已验收", "在候选版本上再次运行检查。", "active", [["verify-candidate", "验证候选版本", "primary"]]];
+    case "test_accepted": return ["人工验收已确认", "核对验收记录后归档研发交付。", "review", [["archive-test-only", "归档需求", "primary"]]];
     case "merge_verifying": return ["候选版本验证中", "正在候选版本上运行检查，完成后刷新查看结果。", "active", []];
-    case "merge_verified": return state.overview.project.productionDeployment === "none"
-      ? ["候选版本已验证", "生产发布已禁用，可归档此次测试交付。", "done", [["archive-test-only", "归档需求", "primary"]]]
-      : ["候选版本已验证", "核对已验证版本后，批准生产发布。", "review", [["approve-release", "批准发布", "primary"]]];
+    case "merge_verified": return ["候选版本已验证", "可归档此次测试交付。", "done", [["archive-test-only", "归档需求", "primary"]]];
     case "release_approved": return ["发布已批准", "发布前会再次校验候选版本哈希。", "active", [["release", "执行发布", "primary"]]];
     case "release_running": return ["发布进行中", "查询部署作业结果。", "active", [["poll-release", "查询发布结果", "primary"]]];
     case "release_submitting": case "release_outcome_unknown":
@@ -444,12 +438,10 @@ function renderDetail() {
   panel.append(subline);
 
   const track = element("div", "stage-track");
-  ["需求对齐", "研发方案", "代码实施", "验证测试", "发布观察", "交付归档"].forEach((title, index) => {
-    const skipped = index === 4 && meta.state === "archived_test_only";
-    const complete = !skipped && (isArchived || index < stageIndex);
-    const stage = element("div", `stage ${skipped ? "skipped" : complete ? "complete" : index === stageIndex ? "current" : ""}`);
-    stage.append(element("span", "stage-dot", skipped ? "—" : complete ? "✓" : String(index + 1)),
-      element("span", "", skipped ? `${title}（未执行）` : title));
+  ["需求对齐", "研发方案", "代码实施", "研发检查", "人工验收", "交付归档"].forEach((title, index) => {
+    const complete = isArchived || index < stageIndex;
+    const stage = element("div", `stage ${complete ? "complete" : index === stageIndex ? "current" : ""}`);
+    stage.append(element("span", "stage-dot", complete ? "✓" : String(index + 1)), element("span", "", title));
     track.append(stage);
   });
   panel.append(track);
@@ -497,6 +489,13 @@ function renderDetail() {
     if (row.childElementCount) copy.append(row);
   }
   attention.append(copy); panel.append(attention);
+  const environment = element("div", "environment-summary");
+  const report = state.overview.project.localEnvironment;
+  environment.append(element("strong", "", "项目环境"), element("span", "", `本地：${report ? environmentStatusText(report.status) : "待检查"} · 测试发布：${state.overview.project.executionReady ? "已配置" : "未配置"}`));
+  if (report?.status === "blocked") renderEnvironmentItems(environment, report);
+  const configure = element("button", "button small", state.overview.project.canConfigureEnvironment ? "配置 / 检查环境" : "查看环境状态");
+  configure.type = "button"; configure.addEventListener("click", () => openEnvironmentPage().catch(error => toast(error.message, true)));
+  environment.append(configure); panel.append(environment);
   if (meta.state === "test_deployed" && meta.testDeployment?.url) {
     const link = element("a", "button primary", "打开测试环境");
     link.href = meta.testDeployment.url; link.target = "_blank"; link.rel = "noopener";
@@ -512,7 +511,7 @@ function renderDetail() {
     const strip = element("div", "archive-summary");
     const archivedBy = meta.state === "archived" ? (meta.observedBy ?? "未知") : (meta.archivedBy ?? "未知");
     const archivedAt = meta.state === "archived" ? meta.observedAt : meta.updatedAt;
-    const archiveType = meta.state === "archived" ? "生产归档" : "测试归档";
+    const archiveType = meta.state === "archived" ? "生产归档" : "研发交付归档";
     strip.append(element("span", "archive-chip", archiveType));
     strip.append(element("span", "", `归档人：${archivedBy}`));
     if (archivedAt) strip.append(element("span", "", `归档时间：${dateText(archivedAt)}`));
@@ -894,9 +893,7 @@ function renderTab(container) {
       const record = element("details", "audit-event-detail");
       record.append(element("summary", "", `${dateText(event.at)} · ${eventNames[event.type] ?? event.type} · ${Math.round(timing.durationMs / 1000)} 秒`));
       record.append(element("p", "plain-copy", `模型 ${timing.model} · 工具调用 ${timing.toolCalls} 次`));
-      if (timing.timeouts) record.append(element("p", "plain-copy", timing.timeouts.mode === "per_request"
-        ? `单次模型请求时限 ${timing.timeouts.requestMs / 1000} 秒 · 本阶段累计时限 ${timing.timeouts.stageMs / 1000} 秒`
-        : `本阶段累计时限 ${timing.timeouts.stageMs / 1000} 秒`));
+      if (timing.timeouts) record.append(element("p", "plain-copy", `单次模型请求时限 ${timing.timeouts.requestMs / 1000} 秒`));
       if (timing.tokens) record.append(element("p", "plain-copy", `已计量 Token：输入 ${timing.tokens.input ?? "未知"} · 输出 ${timing.tokens.output ?? "未知"}`
         + ` · 缓存读取 ${timing.tokens.cacheRead ?? "未知"} · 缓存写入 ${timing.tokens.cacheWrite ?? "未知"}`
         + (timing.unmeasuredRequests > 0 ? `；另有 ${timing.unmeasuredRequests} 次请求未返回完整计量，最终用量未知。` : "")));
@@ -1848,7 +1845,7 @@ function renderDeploymentSettings(container, fields, setup) {
   const kind = fields.kind.value;
   const saved = setup.kind === kind ? setup.fields : {};
   if (kind === "unconfigured") {
-    container.append(element("p", "plain-copy", "公司有固定测试环境时，选择上面的发布工具并连接既有流水线。本地测试配置在研发端的需求中维护。"));
+    container.append(element("p", "plain-copy", "公司有固定测试环境时，选择上面的发布工具并连接既有流水线。本地变量和依赖在环境配置页维护，启动命令由研发方案确定。"));
     return;
   }
   if (kind === "local") {
@@ -1885,12 +1882,90 @@ function renderDeploymentSettings(container, fields, setup) {
   });
 }
 
-async function openProjectSettings() {
+function environmentStatusText(status) {
+  const labels = { ready: "配置检查通过", blocked: "缺少环境条件", unconfigured: "尚未配置", unchecked: "待检查" };
+  if (!Object.hasOwn(labels, status)) throw new Error(`未知环境状态：${status}`);
+  return labels[status];
+}
+
+function renderEnvironmentItems(root, report) {
+  if (report.target) root.append(element("p", "plain-copy", `已保存配置的检查范围：${report.targetName}。`));
+  if (report.checkedAt) root.append(element("p", "plain-copy", `最近检查 ${dateText(report.checkedAt)}${report.actor ? ` · ${report.actor}` : ""}。端口可连接不代表数据库登录、表结构或业务验证通过。`));
+  for (const item of report.items) root.append(element("p", item.status === "blocked" ? "environment-blocked" : "plain-copy",
+    `${item.name}：${item.status === "ready" ? "通过" : item.message}`));
+  if (!report.checkedAt) root.append(element("p", "plain-copy", "保存后请检查环境；系统只检查已声明的变量和依赖，不会创建数据库或安装服务。"));
+}
+
+function renderTestEnvironmentCard(root, setup) {
+  const card = element("section", "environment-card");
+  card.append(element("h2", "", "测试环境发布"), element("p", "plain-copy", setup.test.kind === "unconfigured"
+    ? "尚未连接固定测试环境。也可先使用本地验证。" : `发布工具：${setup.test.kind}。发布由研发确认本次代码版本后触发。`));
+  if (setup.test.url) { const link = element("a", "button", "打开测试环境"); link.href = setup.test.url;
+    link.target = "_blank"; link.rel = "noopener"; card.append(link); }
+  if (setup.canConfigure) {
+    const edit = element("button", "button", "配置测试环境"); edit.type = "button";
+    edit.addEventListener("click", () => openTestEnvironmentSettings().catch(error => toast(error.message, true)));
+    card.append(edit);
+  }
+  card.append(element("p", "plain-copy", "用户准备好测试环境和流水线，系统保存连接配置、检查连接并在确认后发布。产品按需求验收，结果与实际版本一起归档。"));
+  for (const [index, event] of setup.test.history.entries()) card.append(element("p", "plain-copy",
+    `配置 v${index + 1} · ${event.actor} · ${dateText(event.at)} · ${event.configHash.slice(0, 12)}`));
+  root.append(card);
+}
+
+async function openLocalEnvironmentSettings() {
+  await openEnvironmentPage();
+}
+
+async function openEnvironmentPage() {
+  const projectId = state.currentProjectId; const request = ++state.environmentRequest;
+  const setup = await api("/api/environment-status");
+  if (state.currentProjectId !== projectId || request !== state.environmentRequest) return;
+  state.page = "environment";
+  $("#requirementPage").hidden = true; $("#environmentPage").hidden = false;
+  document.querySelectorAll("[data-nav]").forEach(node => node.classList.remove("active"));
+  $("#environmentNavButton").classList.add("active");
+  const root = clear($("#environmentPage"));
+  const heading = element("section", "page-heading");
+  const intro = element("div", ""); intro.append(element("p", "eyebrow", "PROJECT ENVIRONMENTS"),
+    element("h1", "", "环境配置"), element("p", "page-subtitle", `${state.overview.project.name} · 项目共用，测试验收后归档`));
+  heading.append(intro); root.append(heading);
+  root.append(element("p", "plain-copy", setup.canConfigure ? "管理员和已接受项目研发分工的研发可配置。保存配置、检查连接、发布和验收分别留痕。"
+    : "你可以查看环境状态和测试地址；请联系项目研发或管理员配置环境。"));
+  const cards = element("div", "environment-grid");
+  const local = element("section", "environment-card");
+  local.append(element("h2", "", "本地验证"), element("span", "status-chip", environmentStatusText(setup.local.report.status)),
+    element("p", "plain-copy", "选择启动目标，按服务补齐配置。保存和检查不会启动应用；启动方式仍由已确认研发方案确定。"));
+  renderEnvironmentItems(local, setup.local.report);
+  cards.append(local); root.append(cards);
+  if (setup.canConfigure) {
+    try { await renderScannedEnvironment(local, projectId, request); }
+    catch (error) { local.append(element("p", "environment-blocked", `扫描失败：${error.message}`)); throw error; }
+    if (state.currentProjectId !== projectId || request !== state.environmentRequest) return;
+    const check = element("button", "button", "检查已保存配置"); check.type = "button";
+    check.addEventListener("click", async () => {
+      check.disabled = true;
+      try { await api("/api/local-environment-check", { method: "POST", headers: { "Content-Type": "application/json", "X-Reqflow-Token": state.token }, body: "{}" });
+        if (state.currentProjectId === projectId) { await refresh(); toast("环境检查已完成。检查只读取变量并连接依赖端口，不启动业务服务。"); }
+      } catch (error) { toast(error.message, true); } finally { check.disabled = false; }
+    });
+    local.append(check);
+  }
+  renderTestEnvironmentCard(cards, setup);
+  root.append(element("p", "plain-copy", `共用配置影响当前项目的未归档需求：${setup.affectedRequirements.map(row => `${row.id} ${row.title}`).join("、") || "暂无"}。运行期间禁止修改，修改后重新检查。`));
+  const history = element("section", "environment-card"); history.append(element("h2", "", "本地配置变更记录"));
+  for (const [index, event] of setup.local.history.entries()) history.append(element("p", "plain-copy",
+    `v${index + 1} · ${event.actor} · ${dateText(event.at)} · ${event.revision.slice(0, 12)} · 影响需求 ${event.affectedRequirements.join("、") || "无"}`));
+  if (!setup.local.history.length) history.append(element("p", "plain-copy", "尚无配置记录。"));
+  root.append(history);
+}
+
+async function openTestEnvironmentSettings() {
   const projectId = state.currentProjectId;
   const setup = await api("/api/project-execution");
   const gitSetup = setup.mode === "git" ? await api("/api/project-git") : null;
   if (!["local", "unconfigured", "jenkins", "gitlab", "github"].includes(setup.kind)) return toast(`此项目使用 ${setup.kind} 扩展，请由开发人员维护已有配置。`, false);
-  structuredModal("项目设置", "由管理员维护 Git 交付规则和固定测试环境连接。本地启动和影响范围内的检查由系统写入研发方案，确认时无需填命令。保存不会执行检查或发布。", form => {
+  structuredModal("测试环境配置", "管理员和当前项目研发可维护测试环境与 Git 交付规则。保存不会发布；研发仍需确认发布版本，验收通过后归档。", form => {
     const checks = formField(form, "项目共用检查命令（可选，每行一条）", "textarea", "使用项目已有的测试脚本命令"); checks.value = setup.checksText;
     form.append(element("p", "plain-copy", "可留空。这里只提供项目检查候选，系统根据源码依赖在研发方案中选择本次范围，不会默认全量回归。"));
     const kind = formField(form, "固定测试环境发布工具", "select");
@@ -1911,7 +1986,7 @@ async function openProjectSettings() {
     const delivery = element("div", ""); form.append(delivery);
     let testMode = null; let testBranch = null;
     if (gitSetup) {
-      delivery.append(element("h3", "", "Git 交付规则"), element("p", "plain-copy", `仓库：${gitSetup.root} · 开发基线：${gitSetup.baseBranch} · 正式目标：${gitSetup.releaseBranch}`));
+      delivery.append(element("h3", "", "Git 交付规则"), element("p", "plain-copy", `仓库：${gitSetup.root} · 开发基线：${gitSetup.baseBranch}`));
       testMode = formField(delivery, "测试环境使用的代码", "select");
       for (const [value, text] of [["branch", "直接部署需求分支（推荐）"], ["merge", "合并到指定分支后部署"]]) {
         const option = element("option", "", text); option.value = value; testMode.append(option);
@@ -1931,7 +2006,7 @@ async function openProjectSettings() {
     kind.addEventListener("change", render); render();
     return { ...fields, providerFields: fields, checks, url, checkEnv, deployEnv, timeout, testMode, testBranch };
   }, async fields => {
-    if (state.currentProjectId !== projectId) { toast("项目已切换，请重新打开当前项目设置。", true); return false; }
+    if (state.currentProjectId !== projectId) { toast("项目已切换，请重新打开测试环境配置。", true); return false; }
     const names = value => value.trim() ? value.trim().split(/\r?\n/).map(name => name.trim()) : [];
     await api("/api/project-execution", { method: "POST", headers: { "Content-Type": "application/json", "X-Reqflow-Token": state.token },
       body: JSON.stringify({ expectedConfigHash: setup.configHash, checksText: fields.checks.value,
@@ -1952,7 +2027,7 @@ async function openPlanApproval() {
     headers: { "Content-Type": "application/json", "X-Reqflow-Token": state.token },
     body: JSON.stringify({ action: "local-validation", stage: "development", expectedPlanHash }) });
   if (state.selectedId !== taskId || state.currentProjectId !== projectId) return;
-  structuredModal("确认方案并开发", "核对技术方案与本次检查方式。Pi 在独立工作目录开发和测试；完成后再选择本地人工验证或发布测试环境。", form => {
+  structuredModal("确认方案并开发", "核对技术方案与本次检查方式。Pi 在独立工作目录开发和测试；检查通过后可人工确认归档，本地验证和测试发布可选。", form => {
     const validation = development.validation;
     for (const item of validation.checks) form.append(element("p", "plain-copy", `自动检查：${item.command.join(" ")} · ${item.reason}`));
     for (const item of validation.skipped) form.append(element("p", "plain-copy", `跳过：${item.command.join(" ")} · ${item.reason}`));
@@ -1982,13 +2057,35 @@ async function openPlanApproval() {
   }, "确认方案并开始开发");
 }
 
-async function openGitDelivery(action) {
+async function openGitDelivery(action, startupConfirmation = null) {
   const { meta } = state.detail; const taskId = state.selectedId; const projectId = state.currentProjectId;
   const input = { expectedAfterHash: meta.afterHash, expectedPlanHash: meta.planHash };
   if (action === "local-validation") {
+    if (!startupConfirmation) {
+      const source = await api(`/api/local-environment-scan?taskId=${encodeURIComponent(taskId)}`);
+      if (state.selectedId !== taskId || state.currentProjectId !== projectId) return;
+      const effects = source.setup.settings?.scan ? scannedServices(source.scan, source.setup.settings.target)
+        .filter(service => service.kind === "application").flatMap(service => service.effects) : [];
+      if (effects.length) {
+        structuredModal("确认本地启动影响", "配置检查不会执行数据库操作。启动应用可能执行下列写入，请确认连接的是允许验证的环境。", form => {
+          form.append(element("p", "plain-copy", `环境配置 v${source.setup.version} · 目标 ${source.setup.settings.target === "all" ? "完整应用" : source.setup.settings.target === "frontend" ? "仅前端" : source.setup.settings.target}`));
+          for (const effect of effects) form.append(element("p", "environment-effect", effect));
+          const label = element("label", "environment-confirm"); const consent = element("input", ""); consent.type = "checkbox"; consent.required = true;
+          label.append(consent, document.createTextNode("确认本次验证环境允许上述启动写入")); form.append(label); return { consent };
+        }, async fields => {
+          if (!fields.consent.checked || state.selectedId !== taskId || state.currentProjectId !== projectId) throw new Error("请重新确认当前需求和环境。");
+          closeModal(); return openGitDelivery(action, { revision: source.setup.revision });
+        }, "确认并启动");
+        return;
+      }
+    } else Object.assign(input, { confirmStartupEffects: true, expectedEnvironmentRevision: startupConfirmation.revision });
     const result = await sendAction(action, input, true);
     if (!result) return;
     if (state.selectedId !== taskId || state.currentProjectId !== projectId) return;
+    if (result.status === "blocked") {
+      toast(`本地验证等待环境配置：${result.prerequisites.items.filter(item => item.status === "blocked").map(item => `${item.name} ${item.message}`).join("；")}。可配置环境或发布到测试环境。`, true);
+      return;
+    }
     structuredModal("本地环境验证", result.status === "running" ? "项目已启动。按方案中的验收场景验证，也可关闭窗口后发布测试环境。" : "此项目没有常驻本地服务。按方案验证 CLI/库，也可直接发布测试环境。", form => {
       form.append(element("p", "plain-copy", `工作目录：${result.workspace}`));
       for (const service of result.services) {
@@ -2075,17 +2172,6 @@ async function openGitDelivery(action) {
 }
 
 function openModal(action) {
-  if (action === "extend-execution-budget") {
-    const expectedAuditHead = state.detail.auditHead;
-    return structuredModal("追加执行时长", "为继续处理这条需求明确增加1至60分钟模型执行时长。原有消耗、失败和未知用量全部保留；追加时长不会自动执行需求。", form => {
-      const minutes = formField(form, "追加分钟数", "number", "1至60分钟");
-      minutes.min = 1; minutes.max = 60; minutes.step = 1; minutes.required = true;
-      const reason = formField(form, "继续执行的原因", "textarea", "说明已定位的问题及继续执行范围");
-      reason.required = true; reason.maxLength = 4000;
-      return { minutes, reason };
-    }, fields => sendAction(action, { expectedAuditHead,
-      additionalModelMs: Number(fields.minutes.value) * 60000, reason: fields.reason.value.trim() }));
-  }
   if (action === "revise-plan" && state.detail.meta.state === "contract_confirmed" && state.detail.meta.planHash
       && state.detail.meta.planFeedbackVersion === state.detail.meta.planVersion) {
     return sendAction("revise-plan", { retry: true, expectedPlanHash: state.detail.meta.planHash });
@@ -2105,15 +2191,16 @@ function openModal(action) {
   if (action === "redeploy-test" && state.overview.project.mode === "git") return openGitDelivery(action).catch(error => toast(error.message, true));
   const taskId = state.selectedId; const expectedPlanHash = state.detail.meta.planHash; const expectedAfterHash = state.detail.meta.afterHash;
   const expectedAuditHead = state.detail.auditHead;
+  const acceptanceMode = state.detail.meta.state === "verified" ? "manual" : "deployed";
   const copy = {
     develop: ["从当前现场继续", "沿用已确认方案、已有修改及可用的 Pi 会话，在剩余任务预算内继续开发和测试。可恢复问题最多自动处理一次；仍失败时保留原因和现场。", null, null],
     "redeploy-test": ["重新发布测试环境", "确认重新发布本需求的已验证代码，不会重新开发或改变需求。", null, null],
-    "approve-plan": ["确认方案并开发", `确认方案 v${state.detail.meta.planVersion} 与需求终版一致。确认后由 Pi 开发、运行测试，通过后选择本地人工验证或发布测试环境；代码差异和回滚证据全程保留。`, null, null],
+    "approve-plan": ["确认方案并开发", `确认方案 v${state.detail.meta.planVersion} 与需求终版一致。确认后由 Pi 开发、运行相关测试，通过后可人工确认归档；环境验证可选，代码差异和回滚证据全程保留。`, null, null],
     "approve-changes": ["审核实际代码变更", "核对代码差异及历史功能、接口、数据影响；你将成为这次变更的具名风险责任人。请写一句审核结论。", "例如：已核对变更文件与原功能回归，确认可进入测试。", "evidence"],
     "deploy-test": ["发布到固定测试环境", "将本需求已通过自动检查的代码发布到项目配置的测试环境。发布完成后再按已定版验收标准进行人工验证。", null, null],
     "revise-plan": ["要求修改方案", "只写需要修正的事实或决定，Pi 会据此生成下一版。", "写下审核意见…", "feedback"],
     "accept-test": state.detail.meta.state === "verified"
-      ? ["确认代码与本地验证", "确认已查看代码差异并完成本地验证。记录环境、关键路径和结果后验收归档。", "填写实际验证结果，不能用尚未执行的计划代替。", "evidence"]
+      ? ["人工确认并归档", "核对当前需求、代码差异及研发检查结果，留下具名确认结论后归档。本地验证与测试环境发布均为可选；没有自动检查时，请记录实际人工检查结论。", "例如：已核对需求、代码差异和相关用例结果，确认此次研发交付。", "evidence"]
       : ["记录测试验收", "简要记录测试环境、关键路径和结果。", "例如：测试环境接口返回正确，原功能回归正常。", "evidence"],
     "observe-release": ["记录发布观察", "简要记录上线后健康状态和关键功能结果。", "例如：错误率正常，核心接口抽查通过。", "evidence"],
     "approve-release": ["批准生产发布", `确认发布候选版本 ${state.detail.meta.mergedRevision || state.detail.meta.candidateHash} 已验证，且人工测试结论可接受。`, null, null],
@@ -2127,6 +2214,17 @@ function openModal(action) {
   card.append(element("h2", "", title), element("p", "", description));
   const input = field ? element("textarea", "") : null;
   if (input) { input.placeholder = placeholder; input.maxLength = 4000; card.append(input); }
+  let acceptanceChoice;
+  if (action === "accept-test" && acceptanceMode === "manual" && state.detail.meta.localValidation?.environment
+      && ["running", "not_applicable", "stopped"].includes(state.detail.meta.localValidation.status)
+      && state.detail.meta.localValidation.afterHash === expectedAfterHash) {
+    const label = element("label", "", "验收依据");
+    acceptanceChoice = element("select", "");
+    for (const [value, text] of [["manual", "人工确认研发交付"], ["local", "已完成本地验证"]]) {
+      const option = element("option", "", text); option.value = value; acceptanceChoice.append(option);
+    }
+    acceptanceChoice.value = "manual"; label.append(acceptanceChoice); card.append(label);
+  }
   const actions = element("div", "modal-actions");
   const cancel = element("button", "button", "取消"); cancel.type = "button"; cancel.addEventListener("click", closeModal);
   const submit = element("button", `button ${action === "rollback" ? "danger" : "primary"}`,
@@ -2139,6 +2237,8 @@ function openModal(action) {
     closeModal(); await sendAction(action, action === "restart-development" ? { expectedAuditHead }
       : action === "develop" ? { authorizeImplementation: true, expectedPlanHash, expectedAfterHash }
       : action === "redeploy-test" ? { authorizeDeployment: true, expectedAfterHash, expectedPlanHash }
+      : action === "accept-test" ? { evidence: value, acceptanceMode: acceptanceChoice ? acceptanceChoice.value : acceptanceMode,
+        expectedAfterHash, expectedPlanHash }
       : action === "approve-plan" ? { expectedPlanHash } : field ? { [field]: value } : {});
   });
   actions.append(cancel, submit); card.append(actions); root.append(card);
@@ -2146,6 +2246,9 @@ function openModal(action) {
 }
 
 document.querySelectorAll("[data-nav], [data-filter]").forEach((node) => node.addEventListener("click", () => {
+  state.page = "requirements"; state.environmentRequest++;
+  $("#environmentPage").hidden = true; $("#requirementPage").hidden = false;
+  $("#environmentNavButton").classList.remove("active");
   state.filter = node.dataset.nav || node.dataset.filter;
   renderList();
 }));
@@ -2184,7 +2287,7 @@ $("#detailPanel").addEventListener("click", async (event) => {
     return;
   }
   if (action === "continue-execution") return sendAction(action, { expectedAuditHead: state.detail.auditHead });
-  if (action === "configure-project") return openProjectSettings().catch(error => toast(error.message, true));
+  if (action === "configure-environment") return openEnvironmentPage().catch(error => toast(error.message, true));
   if (action === "assign-member" || action === "assign-team") return openAssignmentForm().catch((error) => toast(error.message, true));
   if (action === "review-plan-frontend" || action === "review-plan-backend") {
     const taskId = state.selectedId; const expectedPlanHash = state.detail.meta.planHash;
@@ -2223,6 +2326,8 @@ document.addEventListener("keydown", (event) => { if (event.key === "Escape") cl
 function showLogin() {
   state.token = null; state.principal = null; state.actions = new Set();
   state.overview = null; state.detail = null; state.diff = null; state.selectedId = null;
+  state.page = "requirements"; state.environmentRequest++;
+  clear($("#environmentPage")); $("#environmentPage").hidden = true; $("#requirementPage").hidden = false;
   closeModal(); clear($("#taskList")); clear($("#detailPanel"));
   $("#loadMoreButton").hidden = true;
   $("#identityName").textContent = "未登录";
@@ -2230,7 +2335,6 @@ function showLogin() {
   $("#adminReportButton").hidden = true;
   $("#adminNavButton").hidden = true;
   $("#projectRefButton").hidden = true;
-  $("#projectSettingsButton").hidden = true;
   $("#modelSettingsButton").hidden = true;
   $("#loginButton").hidden = false;
   $("#logoutButton").hidden = true;
@@ -2319,7 +2423,7 @@ $("#importProjectButton").addEventListener("click", () => {
   $("#importAnalysis").hidden = true;
   $("#importProjectError").textContent = "";
 });
-$("#projectSettingsButton").addEventListener("click", () => openProjectSettings().catch(error => toast(error.message, true)));
+$("#environmentNavButton").addEventListener("click", () => openEnvironmentPage().catch(error => toast(error.message, true)));
 $("#modelSettingsButton").addEventListener("click", () => openModelSettings().catch(error => toast(error.message, true)));
 
 $("#importProjectCancel").addEventListener("click", () => {

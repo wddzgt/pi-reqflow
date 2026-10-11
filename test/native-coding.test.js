@@ -47,7 +47,7 @@ test("native Pi investigates beyond eight rounds, retains large search evidence 
       apiKeyEnv: "NATIVE_FIXTURE_KEY", models: [{ id: "local", input: ["text"], contextWindow: 65536, maxTokens: 16384 }] }] };
   const logFile = path.join(directory, "native.events.jsonl");
   const result = await runPi({ config }, directory, "implement", "Implement the approved local state update.", logFile,
-    1, null, [], { maxTokens: 1000, maxMs: 20000, approvedFiles: ["source.mjs"],
+    1, null, [], { maxTokens: 1000, approvedFiles: ["source.mjs"],
       implementationScope: "project", authoritativeContext: { contract: { acceptance: [{ id: "AC1", text: "State is delivered" }] } } });
   assert.equal(await fs.readFile(path.join(directory, "source.mjs"), "utf8"), "export const state = 'delivered';\n");
   assert.equal(payloads.length, 12);

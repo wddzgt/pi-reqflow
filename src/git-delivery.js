@@ -3,7 +3,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { quote } from "shell-quote";
 import { allowedFile, describePolicy, loadProject } from "./config.js";
-import { manifest, manifestHash, sha256 } from "./files.js";
+import { manifest, manifestHash, sha256, writeJson } from "./files.js";
 import { appendEvent, readTask, taskPath, withLock } from "./store.js";
 import { runGit, inspectGit } from "./git-project.js";
 import { inspectChanges, publishedRevision, workspacePath } from "./workspace.js";
@@ -12,6 +12,7 @@ import { runCommand } from "./commands.js";
 import { readPlanAnalysis } from "./plan-analysis.js";
 import { localRuntimePorts, startLocalRuntime, stopLocalRuntime } from "./local-runtime.js";
 import { reportProgress } from "./action-progress.js";
+import { inspectLocalEnvironment, environmentStartup } from "./local-environment.js";
 
 export async function readGitSetup(projectPath) {
   const project = await loadProject(projectPath);
@@ -35,7 +36,7 @@ async function assertReviewedWorkspace(project, meta, input) {
 
 export async function localValidation(projectPath, id, actor, input) {
   const project = await loadProject(projectPath);
-  return withLock(path.join(taskPath(project, id), "task.lock"), async () => {
+  return withLock(path.join(project.archive, "execution-config.lock"), () => withLock(path.join(taskPath(project, id), "task.lock"), async () => {
     const { meta, directory, events } = await readTask(project, id);
     if (meta.assignments?.developer?.userId !== actor || meta.assignments.developer.status !== "accepted") throw new Error("本地验证需要负责研发操作。");
     const preparing = input.stage === "development";
@@ -69,24 +70,37 @@ export async function localValidation(projectPath, id, actor, input) {
     }
     if (![undefined, "start", "stop"].includes(input.operation)) throw new Error("无效的本地服务操作。");
     let runtime;
+    const inspected = input.operation === "stop" ? null : await inspectLocalEnvironment(project, workspace);
+    if (inspected && validation.startup.length && inspected.report.status === "unconfigured") inspected.report.status = "blocked";
+    if (inspected) await writeJson(path.join(project.archive, "local-environment-check.json"), { ...inspected.report, actor });
+    if (inspected?.report.status === "blocked") {
+      const blocked = { actor, afterHash: meta.afterHash, status: "blocked", prerequisites: inspected.report,
+        at: new Date().toISOString() };
+      await appendEvent(project, id, "local_validation_blocked", { ...meta, localValidation: blocked }, blocked);
+      return { id, ...blocked };
+    }
+    const selected = inspected ? environmentStartup(inspected, validation.startup) : { startup: validation.startup };
+    const effects = inspected?.services.filter(service => selected.appIds.includes(service.id)).flatMap(service => service.effects) ?? [];
+    if (effects.length && (input.confirmStartupEffects !== true || input.expectedEnvironmentRevision !== inspected.report.revision))
+      throw new Error(`启动将写入数据库，请确认当前环境版本的启动影响：${effects.join("；")}`);
     try {
       reportProgress(input.operation === "stop" ? "正在停止本地环境。" : "正在按研发方案启动本地环境，等待服务地址就绪。", "", "local-validation");
       runtime = input.operation === "stop" ? await stopLocalRuntime(directory)
-        : await startLocalRuntime(directory, workspace, validation.startup, directory, project.config.environment.localDeployment, project.config.maxPiMs);
+        : await startLocalRuntime(directory, workspace, selected.startup, directory, [], project.config.maxPiMs, {}, selected.environments);
     } catch (error) {
       await appendEvent(project, id, "local_validation_failed", { ...meta,
         localValidation: { actor, afterHash: meta.afterHash, status: "failed", error: error.message, at: new Date().toISOString() } },
         { actor, afterHash: meta.afterHash, error: error.message, services: error.runtime?.services ?? [] });
       throw error;
     }
-    const environment = { instructions: validation.startup.map(service => `${service.name}: ${quote(service.command)}`).join("\n")
-      || validation.manualReason || "按研发方案中的验收场景验证此 CLI/库。", url: validation.startup[0]?.url ?? "" };
+    const environment = { instructions: selected.startup.map(service => `${service.name}: ${quote(service.command)}`).join("\n")
+      || validation.manualReason || "按研发方案中的验收场景验证此 CLI/库。", url: selected.startup[0]?.url ?? "", target: inspected?.report.target ?? meta.localValidation?.environment?.target };
     await appendEvent(project, id, "local_validation_requested", { ...meta, localValidation: { actor, afterHash: meta.afterHash,
-      environment, ...runtime, at: new Date().toISOString() } },
+      environment, ...runtime, prerequisites: inspected?.report ?? meta.localValidation?.prerequisites ?? null, at: new Date().toISOString() } },
       { actor, afterHash: meta.afterHash, patchHash: patch === null ? null : sha256(patch), environment, ...runtime });
     return { id, workspace: meta.workspace, branch: meta.branch, baseRevision: meta.baseRevision, baseHash: meta.baseHash,
       afterHash: meta.afterHash, checks: meta.developmentChecks, patch, validation, environment, ...runtime };
-  });
+  }));
 }
 
 export async function recheckLocalChanges(projectPath, id, actor, input) {

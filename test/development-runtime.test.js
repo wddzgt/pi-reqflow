@@ -7,8 +7,9 @@ import test from "node:test";
 import { runPi } from "../src/pi-runner.js";
 import { sha256, manifest, manifestHash } from "../src/files.js";
 
-for (const { editAfterCheck, recheck } of [{ editAfterCheck: false, recheck: true },
-  { editAfterCheck: true, recheck: true }, { editAfterCheck: false, recheck: false }]) test(`native Pi repairs failed checks and records snapshot evidence: later edit=${editAfterCheck}, recheck=${recheck}`, {
+for (const { editAfterCheck, recheck, manual = false } of [{ editAfterCheck: false, recheck: true },
+  { editAfterCheck: true, recheck: true }, { editAfterCheck: false, recheck: false },
+  { editAfterCheck: false, recheck: false, manual: true }]) test(`native Pi records development check evidence: later edit=${editAfterCheck}, recheck=${recheck}, manual=${manual}`, {
   skip: !process.env.REQFLOW_TEST_PI,
 }, async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-development-"));
@@ -24,7 +25,7 @@ for (const { editAfterCheck, recheck } of [{ editAfterCheck: false, recheck: tru
     ["edit", { path: "source.py", edits: [{ oldText: "value = 2", newText: "value = 4" }] }],
     ...(recheck ? [["run_checks", {}]] : []),
     ...(editAfterCheck ? [["edit", { path: "support.py", edits: [{ oldText: "expected = 4", newText: "expected = 5" }] }]] : []),
-  ];
+  ].slice(0, manual ? 2 : undefined);
   const payloads = [];
   const server = createServer(async (request, response) => {
     let text = "";
@@ -54,24 +55,33 @@ for (const { editAfterCheck, recheck } of [{ editAfterCheck: false, recheck: tru
     environment: { pi: ["NATIVE_TEST_KEY", "PI_CODING_AGENT_DIR"], checks: [] },
     allowedPaths: ["."], excludedPaths: [], maxPiMs: 15000, maxToolCalls: 12, maxEventBytes: 1000000,
     maxSnapshotBytes: 1000000, modelUsage: { maxRequests: 10, maxTokens: 100000 },
-    checks: [[process.execPath, "-e", 'const fs=require("fs"); if(fs.readFileSync("source.py","utf8")!=="value = 4\\n" || !fs.existsSync("support.py")) { console.error("Expected value 4 and support.py; investigate dependency.py");process.exit(1); }']],
+    checks: manual ? [] : [[process.execPath, "-e", 'const fs=require("fs"); if(fs.readFileSync("source.py","utf8")!=="value = 4\\n" || !fs.existsSync("support.py")) { console.error("Expected value 4 and support.py; investigate dependency.py");process.exit(1); }']],
     compatibleProviders: [{ name: "fixture", baseUrl: `http://127.0.0.1:${server.address().port}/v1`,
       apiKeyEnv: "NATIVE_TEST_KEY", thinkingToggle: false,
       models: [{ id: "local", input: ["text"], contextWindow: 64000, maxTokens: 2000, reasoning: false }] }] };
   const result = await runPi({ config }, workspace, "implement", "Use project checks to verify the required value.",
-    path.join(root, "events.jsonl"), 1, null, [], { maxTokens: 100000, maxMs: 15000,
+    path.join(root, "events.jsonl"), 1, null, [], { maxTokens: 100000,
       approvedFiles: ["source.py"], implementationScope: "project" });
-  assert.deepEqual(result.telemetry.developmentChecks.map(row => row.status), recheck ? ["failed", "passed"] : ["failed"]);
+  assert.deepEqual(result.telemetry.developmentChecks.map(row => row.status), manual ? ["manual_pending"] : recheck ? ["failed", "passed"] : ["failed"]);
   assert.equal(Object.hasOwn(result.telemetry, "internalChecks"), false, "formal checks are controlled outside coding");
   const currentHash = manifestHash(await manifest(workspace, [], config.maxSnapshotBytes));
-  assert.equal(result.telemetry.developmentChecks.at(-1).afterHash === currentHash, recheck && !editAfterCheck);
+  assert.equal(result.telemetry.developmentChecks.at(-1).afterHash === currentHash, manual || recheck && !editAfterCheck);
+  if (manual) {
+    assert.deepEqual(result.telemetry.developmentChecks[0].checks, []);
+    assert.equal(result.telemetry.developmentChecks[0].beforeHash, currentHash);
+    assert.equal(result.telemetry.developmentChecks[0].formalVerificationRequired, true);
+    assert.equal(payloads.length, 3, "Pi continues after manual_pending and completes its turn");
+    assert.match(JSON.stringify(payloads[2].messages), /manual_pending/);
+  }
   const logNames = await fs.readdir(root);
   assert.equal(logNames.includes("events.jsonl.internal-1-1.log"), false, "coding does not inject another check or repair loop at completion");
   assert.ok(payloads[0].tools.some(tool => tool.function.name === "run_checks"));
-  assert.match(JSON.stringify(payloads[2].messages), /Expected value 4/);
-  assert.match(JSON.stringify(payloads[3].messages), /expected = 4/);
-  assert.equal(await fs.readFile(path.join(workspace, "source.py"), "utf8"), "value = 4\n");
-  assert.equal(await fs.readFile(path.join(workspace, "support.py"), "utf8"), `expected = ${editAfterCheck ? 5 : 4}\n`);
+  if (!manual) {
+    assert.match(JSON.stringify(payloads[2].messages), /Expected value 4/);
+    assert.match(JSON.stringify(payloads[3].messages), /expected = 4/);
+    assert.equal(await fs.readFile(path.join(workspace, "support.py"), "utf8"), `expected = ${editAfterCheck ? 5 : 4}\n`);
+  }
+  assert.equal(await fs.readFile(path.join(workspace, "source.py"), "utf8"), `value = ${manual ? 2 : 4}\n`);
   assert.equal(await fs.readFile(path.join(workspace, "dependency.py"), "utf8"), "expected = 4\n");
   assert.equal(result.telemetry.sessionStatus, "saved");
   const checkpoint = result.telemetry.sessionCheckpoint;
@@ -80,13 +90,13 @@ for (const { editAfterCheck, recheck } of [{ editAfterCheck: false, recheck: tru
   if (!editAfterCheck && recheck) {
     const before = payloads.length;
     const resumed = await runPi({ config }, workspace, "implement", "Continue the saved work; no new changes requested.",
-      path.join(root, "continued.events.jsonl"), 1, null, [], { maxTokens: 100000, maxMs: 15000,
+      path.join(root, "continued.events.jsonl"), 1, null, [], { maxTokens: 100000,
         approvedFiles: ["source.py"], implementationScope: "project", resumeSession: checkpoint });
     assert.equal(resumed.telemetry.sessionStatus, "saved");
     assert.match(JSON.stringify(payloads[before].messages), /expected = 4/);
     assert.equal(sha256(await fs.readFile(checkpoint.file)), checkpoint.hash, "original session evidence remains unchanged");
     await fs.appendFile(checkpoint.file, "\n");
     await assert.rejects(runPi({ config }, workspace, "implement", "Continue", path.join(root, "tampered.events.jsonl"), 1,
-      null, [], { maxTokens: 100000, maxMs: 15000, approvedFiles: ["source.py"], resumeSession: checkpoint }), /session changed/);
+      null, [], { maxTokens: 100000, approvedFiles: ["source.py"], resumeSession: checkpoint }), /session changed/);
   }
 });

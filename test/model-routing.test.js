@@ -72,7 +72,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
       ["primary", "unconstrained", "schema-secondary"].map(id => ({ id, input: ["text"], contextWindow: 65536,
         maxTokens: 8192, reasoning: false, supportsJsonSchema: id !== "unconstrained" })) }] };
   await assert.rejects(runPi({ config }, directory, "plan", "Return JSON", path.join(directory, "events.jsonl"), 1, null, [], {
-    maxTokens: 1000, maxMs: 3000, outputSchema: { name: "test", strict: true,
+    maxTokens: 1000, outputSchema: { name: "test", strict: true,
       schema: { type: "object", additionalProperties: false, required: ["ok"], properties: { ok: { type: "boolean" } } } },
   }), error => {
     assert.match(error.message, /不符合 test 结构/); assert.equal(error.telemetry.tokens.output, 5); return true;

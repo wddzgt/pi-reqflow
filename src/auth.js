@@ -23,7 +23,6 @@ const access = {
   "discuss-plan": ["developer", "admin"], "edit-plan": ["developer", "admin"],
   "resolve-plan-findings": ["developer", "admin"],
   "resume-implementation": ["developer", "admin"],
-  "extend-execution-budget": ["developer", "admin"],
   "pause-execution": ["product", "developer", "admin"], "continue-execution": ["product", "developer", "admin"],
   "local-validation": ["developer", "admin"], "recheck-local": ["developer", "admin"], "publish-test": ["developer", "admin"],
   "redeploy-test": ["developer", "admin"],
@@ -36,6 +35,7 @@ const access = {
   "audit-report": ["admin"], history: ["admin"], "auth-history": ["admin"],
   "import-project": ["admin"],
   "configure-project": ["admin"],
+  "configure-environment": ["admin", "developer"],
   "assign-team": ["product", "admin"], "review-plan": ["developer", "admin"],
 };
 
@@ -108,6 +108,11 @@ export function canReadTask(principal, meta) {
   if (principal.roles.includes("admin") || meta.createdBy === principal.id) return true;
   return Object.values(meta.assignments ?? {}).some((assignment) =>
     assignment.userId === principal.id && assignment.status !== "declined");
+}
+
+export function canConfigureEnvironment(principal, rows) {
+  return principal.roles.includes("admin") || (principal.roles.includes("developer") && rows.some(row =>
+    Object.values(row.assignments ?? {}).some(assignment => assignment.userId === principal.id && assignment.status === "accepted")));
 }
 
 export function authorizeTaskRead(principal, meta) {

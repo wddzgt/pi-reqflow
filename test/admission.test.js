@@ -85,7 +85,7 @@ test("engineering budgets count failed calls, caches and duration without counti
   assert.deepEqual(executionUsage(events), { calls: 4, totalTokens: 40, modelMs: 200, unmeasuredCalls: 0, unmeasuredDuration: false });
   assert.throws(() => modelAllowance(events, { ...policy, budgetMode: "strict", maxModelCalls: 2 }), /budget exhausted/);
   assert.throws(() => modelAllowance(events, { ...policy, budgetMode: "strict", maxTotalTokens: 40 }), /budget exhausted/);
-  assert.throws(() => modelAllowance([{ type: "implemented", detail: {} }], policy), /unmeasured/);
+  assert.throws(() => modelAllowance([{ type: "implemented", detail: {} }], { ...policy, budgetMode: "strict" }), /unmeasured/);
   assert.equal(modelAllowance(events, { ...policy, budgetMode: "strict" }).maxTokens, policy.maxTotalTokens - 40);
 });
 
@@ -95,7 +95,7 @@ test("product alignment successes and failures share the later engineering token
   assert.equal(executionUsage(events).totalTokens, 100);
   assert.equal(modelAllowance(events, { ...policy, budgetMode: "strict", maxTotalTokens: 101 }).maxTokens, 1);
   assert.throws(() => modelAllowance(events, { ...policy, budgetMode: "strict", maxTotalTokens: 100 }), /budget exhausted/);
-  assert.throws(() => modelAllowance([{ type: "intake_analysis_failed", detail: {} }], policy), /unmeasured/);
+  assert.throws(() => modelAllowance([{ type: "intake_analysis_failed", detail: {} }], { ...policy, budgetMode: "strict" }), /unmeasured/);
 });
 
 test("interrupted requests retain measured usage and mark legacy partial totals as unknown", () => {
@@ -106,11 +106,10 @@ test("interrupted requests retain measured usage and mark legacy partial totals 
   assert.deepEqual(executionUsage([event]), { calls: 2, totalTokens: 20, modelMs: 180000, unmeasuredCalls: 1, unmeasuredDuration: false });
   assert.throws(() => modelAllowance([event], { ...policy, budgetMode: "strict" }), /unmeasured/);
   const allowance = modelAllowance([event], { ...policy, budgetMode: "adaptive" });
-  assert.equal(allowance.maxMs, policy.maxModelMs - 180000);
+  assert.equal(Object.hasOwn(allowance, "maxMs"), false);
   assert.equal(allowance.budget.unmeasuredCalls, 1);
-  assert.throws(() => modelAllowance([event], { ...policy, budgetMode: "adaptive", maxModelMs: 180000 }), /budget exhausted/);
-  assert.throws(() => modelAllowance([{ ...event, detail: { ...event.detail, telemetry: { ...telemetry, durationMs: undefined } } }],
-    { ...policy, budgetMode: "adaptive" }), /unmeasured/);
+  assert.equal(modelAllowance([{ ...event, detail: { ...event.detail, telemetry: { ...telemetry, durationMs: undefined } } }],
+    { ...policy, budgetMode: "adaptive" }).budget.unmeasuredCalls, 1);
   const report = taskObservability({ meta: { id: "partial", state: "contract_confirmed" }, events: [event] });
   assert.equal(report.summary.tokens.input.total, 10);
   assert.equal(report.summary.unmeasuredAttempts, 1);
@@ -119,17 +118,19 @@ test("interrupted requests retain measured usage and mark legacy partial totals 
   assert.equal(report.summary.knownCostUsd, .1);
 });
 
-test("explicit time extensions retain historical consumption and do not waive strict token limits", () => {
-  const telemetry = { tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 }, durationMs: 100000, assistantMessages: 1 };
+test("historical duration is audit evidence and cannot exhaust the execution allowance", () => {
+  const telemetry = { tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 }, durationMs: 3600000, assistantMessages: 1 };
   const events = [{ type: "plan_attempt_failed", detail: { telemetry } }];
-  const limit = { ...policy, maxModelMs: 100000 };
-  assert.throws(() => modelAllowance(events, limit), /budget exhausted/);
-  events.push({ type: "execution_budget_extended", detail: { additionalModelMs: 60000 } });
-  assert.equal(modelAllowance(events, limit).maxMs, 60000);
-  assert.equal(executionUsage(events).modelMs, 100000);
-  assert.throws(() => modelAllowance(events, { ...limit, budgetMode: "strict", maxTotalTokens: 15 }), /budget exhausted/);
-  events.at(-1).detail.additionalModelMs = 3600001;
-  assert.throws(() => modelAllowance(events, limit), /explicit duration/);
+  for (const budgetMode of ["adaptive", "strict"]) {
+    const allowance = modelAllowance(events, { ...policy, budgetMode });
+    assert.equal(Object.hasOwn(allowance, "maxMs"), false);
+    assert.equal(executionUsage(events).modelMs, 3600000);
+    const unknownDuration = [{ type: "plan_attempt_failed", detail: { telemetry: { ...telemetry, durationMs: undefined } } }];
+    assert.deepEqual(modelAllowance(unknownDuration, { ...policy, budgetMode }), allowance);
+    assert.equal(executionUsage(unknownDuration).unmeasuredDuration, true);
+  }
+  assert.throws(() => modelAllowance(events, { ...policy, budgetMode: "strict", maxTotalTokens: 15 }), /budget exhausted/);
+  assert.throws(() => validateAdmissionPolicy({ ...policy, maxModelMs: 1200000 }), /Unknown admission field/);
 });
 
 test("first verification rate uses concluded first outcomes without retry inflation", () => {

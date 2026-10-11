@@ -12,8 +12,66 @@ import { createTask } from "../src/store.js";
 import { readJson, writeJson, sha256 } from "../src/files.js";
 import { startWebServer } from "../src/web-server.js";
 import { plan } from "../src/workflow.js";
+import { assignMember, respondToAssignment } from "../src/assignment.js";
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+
+test("project environment API permits involved developers without granting model administration or cross-project writes", async t => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-environment-api-"));
+  const previous = process.env.REQFLOW_STATE_DIR;
+  process.env.REQFLOW_STATE_DIR = path.join(temporary, "state");
+  t.after(async () => {
+    if (previous === undefined) delete process.env.REQFLOW_STATE_DIR; else process.env.REQFLOW_STATE_DIR = previous;
+    await fs.rm(temporary, { recursive: true, force: true });
+  });
+  const source = path.join(temporary, "source"); await fs.mkdir(source);
+  await fs.writeFile(path.join(source, "app.js"), "export const value=1;\n");
+  const config = { ...JSON.parse(await fs.readFile(path.join(repository, "examples/config.local.json"))),
+    piExecutable: path.join(repository, "test/fake-pi.mjs"), provider: "fake", model: "fake",
+    allowedPaths: ["backend"], checks: [], testDeployment: { kind: "unconfigured" } };
+  config.environment.localDeployment = ["DATABASE_PASSWORD"];
+  const entry = await importProject("Environment", { backendDir: source }, { config, inventoryOnly: true,
+    admin: { id: "admin", username: "admin", password: "environment-password" } });
+  const project = await loadProject(entry.projectDir);
+  for (const role of ["developer", "product"]) await addCredential(project, role, [role], { username: role, password: "environment-password" });
+  await createTask(project, "1", "Configuration ownership", "A real project participant", "product");
+  await assignMember(project.root, "1", "product", "developer", "developer");
+  const web = await startWebServer(project.root, 0);
+  t.after(() => new Promise(resolve => web.server.close(resolve)));
+  const login = async role => {
+    const response = await fetch(`${web.url}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: role, password: "environment-password" }) });
+    const Cookie = response.headers.get("set-cookie").split(";")[0];
+    const session = await (await fetch(`${web.url}/api/bootstrap`, { headers: { Cookie } })).json();
+    return { Cookie, "Content-Type": "application/json", "X-Reqflow-Token": session.token };
+  };
+  const developer = await login("developer");
+  assert.equal((await fetch(`${web.url}/api/project-execution`, { headers: developer })).status, 403);
+  await respondToAssignment(project.root, "1", "developer", "developer", true);
+  assert.equal((await fetch(`${web.url}/api/project-execution`, { headers: developer })).status, 200);
+  assert.equal((await fetch(`${web.url}/api/model-settings`, { headers: developer })).status, 403);
+  const environmentFile = path.join(temporary, "private.env");
+  await fs.writeFile(environmentFile, "DATABASE_PASSWORD=api-secret\n");
+  const scanned = await (await fetch(`${web.url}/api/local-environment-scan`, { headers: developer })).json();
+  const input = { expectedRevision: null, expectedScanHash: scanned.scan.hash, environmentFile, target: "all", decisions: {}, values: {} };
+  const save = await fetch(`${web.url}/api/local-environment`, { method: "POST", headers: developer, body: JSON.stringify(input) });
+  assert.equal(save.status, 200, await save.clone().text());
+  const check = await fetch(`${web.url}/api/local-environment-check`, { method: "POST", headers: developer, body: "{}" });
+  assert.equal(check.status, 200); assert.equal((await check.json()).status, "ready");
+  const product = await login("product");
+  assert.equal((await fetch(`${web.url}/api/local-environment`, { headers: product })).status, 403);
+  assert.equal((await fetch(`${web.url}/api/local-environment-scan`, { headers: product })).status, 403);
+  assert.equal((await fetch(`${web.url}/api/local-environment`, { method: "POST", headers: product, body: JSON.stringify(input) })).status, 403);
+  const status = await (await fetch(`${web.url}/api/environment-status`, { headers: product })).json();
+  assert.equal(status.canConfigure, false); assert.equal(status.local.report.status, "ready");
+  assert.doesNotMatch(JSON.stringify(status), /api-secret|private\.env/);
+  const otherSource = path.join(temporary, "other-source"); await fs.cp(source, otherSource, { recursive: true });
+  const other = await importProject("Other project", { backendDir: otherSource }, { config, inventoryOnly: true, accountSource: project.accountsArchive });
+  assert.equal((await fetch(`${web.url}/api/projects/${other.id}/switch`, { method: "POST", headers: developer, body: "{}" })).status, 200);
+  const switched = await (await fetch(`${web.url}/api/bootstrap`, { headers: developer })).json();
+  assert.equal((await fetch(`${web.url}/api/local-environment`, { method: "POST",
+    headers: { ...developer, "X-Reqflow-Token": switched.token }, body: JSON.stringify(input) })).status, 403);
+});
 
 test("web import uses account roles and detected scripts without creating accounts", async t => {
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-account-import-"));

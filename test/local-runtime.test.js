@@ -6,6 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { localRuntimeStatus, startLocalRuntime, stopLocalRuntime } from "../src/local-runtime.js";
 import { firstVerificationQuality, firstDeliveryQuality } from "../src/admission.js";
+import { initializationCommands } from "../src/project-initialization.js";
 
 async function fixture(t) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-runtime-"));
@@ -39,6 +40,36 @@ test("startup failure records output, closes all services and permits a clean re
   assert.equal(localRuntimeStatus(directory).status, "stopped");
   assert.match(await fs.readFile(error.runtime.services[0].logFile, "utf8"), /missing local dependency/);
   assert.equal((await startLocalRuntime(directory, directory, [], directory, [])).status, "not_applicable");
+});
+
+test("startup receives configured values and redacts secrets split across output chunks", async t => {
+  const { directory, url } = await fixture(t);
+  const command = [process.execPath, "-e", `process.stdout.write(process.env.DATABASE_PASSWORD.slice(0,5));
+    setTimeout(()=>{process.stdout.write(process.env.DATABASE_PASSWORD.slice(5));process.exit(2);},50)`];
+  const secret = "split-password-value";
+  const failure = await startLocalRuntime(directory, directory, [{ name: "bad", command, url }], directory,
+    ["DATABASE_PASSWORD"], 1000, { DATABASE_PASSWORD: secret }).then(() => assert.fail("must fail"), error => error);
+  assert.doesNotMatch(failure.message, /split-password-value/);
+  assert.match(failure.message, /REDACTED/);
+  const log = await fs.readFile(failure.runtime.services[0].logFile, "utf8");
+  assert.doesNotMatch(log, /split-password-value/); assert.match(log, /REDACTED/);
+});
+
+test("catalogued frontend script starts from the repository root without a root serve script", async t => {
+  const { directory, port, url } = await fixture(t);
+  const frontend = path.join(directory, "frontend app");
+  await fs.mkdir(frontend);
+  await fs.writeFile(path.join(directory, "package.json"), JSON.stringify({ scripts: {} }));
+  await fs.writeFile(path.join(frontend, "package.json"), JSON.stringify({ scripts: { serve: "node service.cjs" } }));
+  await fs.writeFile(path.join(frontend, "service.cjs"),
+    `require('node:http').createServer((req,res)=>res.end(process.cwd())).listen(${port},'127.0.0.1')`);
+  const [entry] = initializationCommands({ checks: [], files: {},
+    packages: [{ path: "frontend app/package.json", scripts: ["serve"], packageManager: "npm@10.9.2" }] });
+  const result = await startLocalRuntime(directory, directory,
+    [{ name: "frontend", command: entry.argv, url }], directory, [], 10000);
+  assert.equal(result.status, "running");
+  assert.equal(await (await fetch(url)).text(), await fs.realpath(frontend));
+  assert.equal(entry.cwd, ".", "catalogue and controller share the same repository root");
 });
 
 test("an occupied port cannot be mistaken for successful startup", async t => {

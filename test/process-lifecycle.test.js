@@ -14,13 +14,13 @@ test("Pi cumulative token limit stops execution and preserves measured billing",
   const project = { config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } };
   await assert.rejects(runPi(project, directory, "plan", "read only", path.join(directory, "pi.log"), 1,
-    null, [], { maxTokens: 17, maxMs: 2000 }), (error) => {
+    null, [], { maxTokens: 17 }), (error) => {
     assert.match(error.message, /remaining requirement token budget/);
     assert.equal(error.costUsd, 0.04); assert.equal(error.telemetry.tokens.cacheRead, 2);
     return true;
   });
   assert.equal((await runPi(project, directory, "plan", "read only", path.join(directory, "exact.log"), 1,
-    null, [], { maxTokens: 18, maxMs: 2000 })).costUsd, 0.04);
+    null, [], { maxTokens: 18 })).costUsd, 0.04);
 });
 
 test("timed-out check terminates signal-ignoring descendants", { skip: process.platform === "win32" }, async (t) => {
@@ -51,10 +51,10 @@ spawn(process.execPath, ['-e', ${JSON.stringify(grandchild)}, ${JSON.stringify(m
 process.on('SIGTERM',()=>{});setTimeout(()=>process.exit(0),4500);\n`);
   const project = { config: { mode: "local", piExecutable: fakePi, provider: "fake", model: "fake",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [],
-    maxPiMs: 5000, maxToolCalls: 10, maxEventBytes: 10000 } };
+    maxPiMs: 250, maxToolCalls: 10, maxEventBytes: 10000 } };
   const started = Date.now();
   await assert.rejects(runPi(project, directory, "plan", "read only",
-    path.join(directory, "pi.log"), 1, null, [], { maxTokens: 2000, maxMs: 250 }), /AI 研发方案超过 .*执行时限/);
+    path.join(directory, "pi.log"), 1, null, [], { maxTokens: 2000 }), /AI 研发方案单次模型请求超过 .*执行时限/);
   assert.ok(Date.now() - started < 3000, "timeout must not wait for the signal-ignoring Pi child");
   await new Promise((resolve) => setTimeout(resolve, 2200));
   await assert.rejects(fs.stat(marker), { code: "ENOENT" });

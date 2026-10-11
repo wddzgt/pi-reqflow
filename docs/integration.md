@@ -19,13 +19,17 @@
 
 产品交互仅讨论业务目标、当前和期望行为、业务规则、功能范围及验收结果。AI 内部读取项目，向产品翻译为业务影响，不要求产品决定文件、接口或数据结构。最终契约的 `inScope` 是业务功能，关键决定合并进最终字段，`answers` 为空；讨论与原文留在 `discussion` 供回看，不自动传给研发 Agent。技术定位由方案分析返回 `affectedFiles`，任何实施均受此获批清单限制。`getRequirementEvidence().planAnalysis` 提供影响、待执行场景、专项发现与阻断项，页面无需单独创建角色评审步骤。
 
-方案沟通通过授权动作 `discuss-plan` 接入，消息为 `{ text, expectedPlanHash }`，返回只读建议并在 `getRequirementEvidence().planDiscussion` 中留痕。直接编辑通过 `edit-plan`，传 `{ candidate, feedback, expectedPlanHash }`；candidate 为完整的结构化方案草稿，必须覆盖冻结验收，不能作为审批传入。新版本由 AI 核对并附 `candidateReview` 理由，仍等待研发确认。`approve-plan` 携带显示时的 `expectedPlanHash`，确认后自动实施、验证，停在研发选择本地测试或发布的步骤；过期审批拒绝执行。分工指派和审核接口见 [研发设计与分工审核](development-design.md)。
+方案沟通通过授权动作 `discuss-plan` 接入，消息为 `{ text, expectedPlanHash }`，返回只读建议并在 `getRequirementEvidence().planDiscussion` 中留痕。直接编辑通过 `edit-plan`，传 `{ candidate, feedback, expectedPlanHash }`；candidate 为完整的结构化方案草稿，必须覆盖冻结验收，不能作为审批传入。新版本由 AI 核对并附 `candidateReview` 理由，仍等待研发确认。`approve-plan` 携带显示时的 `expectedPlanHash`，确认后自动实施、验证，停在人工确认交付的步骤；本地验证和测试发布可选，过期审批拒绝执行。分工指派和审核接口见 [研发设计与分工审核](development-design.md)。
 
-管理员网页运行配置使用 `GET/POST /api/project-execution`；POST 要求当前会话、同源及 CSRF token，写入参数数组并留审计。输入包含 kind，选择 unconfigured / local / jenkins / gitlab / github；unconfigured 的 url 必须为空，可独立保存 checksText，固定测试环境不影响方案设计。远程平台使用 fields 与 timeoutMs，令牌由服务端私有文件保存，GET 不返回值。同权限的 `POST /api/deployment-connection` 只验证平台连接，不触发发布。字段与接入协议见 [内置发布工具](ci-platforms.md)。缺少测试或部署配置可先导入；真实自动检查必须在开始自动开发前配置。开发测试通过后返回 next=choose-validation，目录项目与 Git 项目都由负责研发选择本地验证或显式发布，本地验证不标记发布或验收成功。
+管理员及已接受当前项目分工的研发通过 `GET/POST /api/project-execution` 配置测试发布；POST 要求当前会话、同源及 CSRF token，写入参数数组并留审计。输入包含 kind，选择 unconfigured / local / jenkins / gitlab / github；unconfigured 的 url 必须为空，可独立保存 checksText，固定测试环境不影响方案设计。远程平台使用 fields 与 timeoutMs，令牌由服务端私有文件保存，GET 不返回值。同权限的 `POST /api/deployment-connection` 只验证平台连接，不触发发布。字段与接入协议见 [内置发布工具](ci-platforms.md)。研发方案选择相关检查并说明跳过依据；无合适自动检查时明确等待人工验证。开发检查完成后返回 next=choose-validation，目录项目与 Git 项目均可人工确认归档，也可按需选择本地验证或显式发布；环境未配置不阻挡归档。
 
 Git 信息通过 `GET /api/project-git` 读取。`approve-plan` 可传 developmentBranch={kind:new/existing,branch}；`local-validation`、`recheck-local` 和 `publish-test` 通过需求动作入口执行并限制为负责研发。提交确认必须携带 expectedPlanHash、expectedAfterHash、authorizeGit=true 和页面展示的 testMode；merge 模式还要传配置的 testBranch。保留的冲突候选通过任务 git-candidate GET 展示，再使用 expectedCandidateHash 确认。`redeploy-test` 另需 authorizeDeployment=true。项目设置可传 gitDelivery，详见 [Git 与研发交付](git-delivery.md)。
 
-`local-validation` 返回当前隔离工作目录、补丁（Git 模式）、自动检查、实际 package.json 中的启动脚本 startupScripts 和已保存的 environment。负责研发可以传 environment={instructions,url} 保存当前需求的本地启动步骤与地址，至少填写一项。它随操作人员、方案及代码版本留痕，不修改项目配置、不执行命令、不触发 CI，不作为已通过验收的证据。重新检查本地修改会保留这份设置。
+`local-validation` 要求 expectedPlanHash、expectedAfterHash，负责研发按已批准方案及选定启动目标启动服务，返回工作目录、Git 补丁、检查、validation、environment 和运行状态。operation 可为 start 或 stop；不接受手填 environment。启动前扫描并检查私有环境配置，缺条件返回 blocked 并保留代码；发现数据库初始化或启动回调时，须传 confirmStartupEffects=true 和当前 expectedEnvironmentRevision。服务可访问不代表业务验收通过。
+
+本地配置通过 `GET /api/local-environment-scan` 扫描，`GET/POST /api/local-environment` 读取及保存，`POST /api/local-environment-check` 检查；管理员与已接受当前项目分工的研发可操作。普通查看者通过 `GET /api/environment-status` 查看状态和允许范围内的配置历史。扫描不执行项目，检查仅验证必需变量及受支持依赖的 TCP 端口，密码不返回页面；POST 沿用同源和 CSRF 校验。配置保存绑定扫描哈希及已有配置版本。
+
+`accept-test` 必须传 evidence 和 acceptanceMode=manual/local/deployed。manual 在 verified 状态人工确认研发交付，不要求环境；local 要求当前代码及环境版本的实际本地验证；deployed 要求 test_deployed 状态和有效测试环境版本。manual/local 还须传当前 expectedPlanHash、expectedAfterHash；未经审核的实际变更先由负责研发具名确认。动作完成验收后直接归档，记录实际方式、人员与版本，不把未执行的环境验证算作通过。
 
 首次 `init` 会生成带源码与配置指纹的项目基线；维护者可用 `baseline-status` 检查当前性，源码或配置变动后用 `baseline-refresh` 明确更新。`src/baseline.js` 的 `readProjectBaseline` 可供其他适配器读取，必须保留其哈希与当前性校验。基线的静态线索会进入角色评审和方案提示词，已开始的不同角色评审不能混用新旧基线。刷新命令是本地项目维护操作，权限由项目目录的文件权限控制；它不替代需求审批。
 

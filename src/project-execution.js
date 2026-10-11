@@ -2,12 +2,26 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { parse, quote } from "shell-quote";
 import { loadProject, validateConfig } from "./config.js";
-import { readJson, sha256, writeJson } from "./files.js";
+import { sha256, writeJson } from "./files.js";
 import { withLock } from "./store.js";
 import { refreshProjectBaseline } from "./baseline.js";
 import { saveDeploymentCredentials, resolveDeploymentCredentials } from "./deployment-credentials.js";
 import { inspectCiConnection } from "./ci-deployment-adapters.js";
 import { validateDeploymentOptions } from "./deployment-adapters.js";
+import { assertEnvironmentIdle } from "./local-environment.js";
+
+export async function executionConfigurationHistory(project) {
+  const events = await fs.readFile(path.join(project.archive, "execution-config-events.jsonl"), "utf8")
+    .then(text => text.trim().split("\n").map(line => JSON.parse(line)),
+      error => { if (error.code === "ENOENT") return []; throw error; });
+  let previous = null;
+  for (const event of events) {
+    if (event.previous !== previous || sha256(JSON.stringify({ ...event, hash: undefined })) !== event.hash)
+      throw new Error("执行配置审计记录已改变。");
+    previous = event.hash;
+  }
+  return events;
+}
 
 export async function readExecutionSetup(projectPath) {
   const project = await loadProject(projectPath);
@@ -33,7 +47,7 @@ export async function readExecutionSetup(projectPath) {
 export async function configureExecution(projectPath, actor, input) {
   if (!input || typeof input.checksText !== "string" || input.checksText.length > 8000
        || typeof input.url !== "string"
-       || !/^[a-f0-9]{64}$/.test(input.expectedConfigHash ?? "")) throw new Error("项目设置格式不正确，请刷新后重新保存。");
+       || !/^[a-f0-9]{64}$/.test(input.expectedConfigHash ?? "")) throw new Error("测试环境配置格式不正确，请刷新后重新保存。");
   if (!["unconfigured", "local", "jenkins", "gitlab", "github"].includes(input.kind)) throw new Error("请选择固定测试环境的发布方式，或选择暂不连接。");
   if (input.kind !== "unconfigured" && !input.url.trim()) throw new Error("连接固定测试环境时，请填写真实环境地址；自动检查由研发确认。");
   if (input.kind === "unconfigured" && input.url.trim()) throw new Error("暂不连接固定测试环境时不填写环境地址；本地人工验证由负责研发在需求中选择。");
@@ -50,13 +64,8 @@ export async function configureExecution(projectPath, actor, input) {
   return withLock(path.join(project.archive, "execution-config.lock"), async () => {
     const current = await loadProject(projectPath);
     if (sha256(JSON.stringify(current.config)) !== input.expectedConfigHash) throw new Error("项目配置已改变，请刷新后再保存。");
-    if (!["local", "unconfigured", "jenkins", "gitlab", "github"].includes(current.config.testDeployment.kind)) throw new Error(`当前项目使用 ${current.config.testDeployment.kind} 部署适配器；请由管理员维护已有配置。`);
-    const rows = await readJson(path.join(current.archive, "index.json"));
-    for (const row of rows) {
-      const locked = await fs.stat(path.join(current.archive, "tasks", row.id, "task.lock")).then(() => true,
-        error => { if (error.code === "ENOENT") return false; throw error; });
-      if (locked) throw new Error("项目中有任务正在运行，请等待该操作完成后再调整执行配置。");
-    }
+    if (!["local", "unconfigured", "jenkins", "gitlab", "github"].includes(current.config.testDeployment.kind)) throw new Error(`当前项目使用 ${current.config.testDeployment.kind} 部署适配器；请维护已有配置。`);
+    await assertEnvironmentIdle(current);
     let deployment;
     if (input.kind === "unconfigured") deployment = { kind: "unconfigured" };
     else if (input.kind === "local") deployment = { kind: "local", command: commands.at(-1), url: input.url };
@@ -98,13 +107,8 @@ export async function configureExecution(projectPath, actor, input) {
       environment: { ...current.config.environment, checks: input.checksEnvironment, localDeployment: input.deploymentEnvironment },
       testDeployment: deployment });
     const file = path.join(current.archive, "execution-config-events.jsonl");
-    const history = await fs.readFile(file, "utf8").then(text => text.trim().split("\n").map(line => JSON.parse(line)),
-      error => { if (error.code === "ENOENT") return []; throw error; });
-    let previous = null;
-    for (const event of history) {
-      if (event.previous !== previous || sha256(JSON.stringify({ ...event, hash: undefined })) !== event.hash) throw new Error("执行配置审计记录已改变。");
-      previous = event.hash;
-    }
+    const history = await executionConfigurationHistory(current);
+    const previous = history.at(-1)?.hash ?? null;
     const event = { actor, at: new Date().toISOString(), previous, priorConfigHash: input.expectedConfigHash,
       configHash: sha256(JSON.stringify(next)), checks: next.checks, testDeployment: next.testDeployment,
       gitDelivery: next.gitDelivery ?? null,

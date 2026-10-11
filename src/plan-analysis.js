@@ -313,7 +313,7 @@ export async function reviewPlanAnalysis(project, id, meta, directory, workspace
     try {
       const allowance = modelAllowance((await readTask(project, id)).events, admissionPolicy(project.config));
       const outputContract = "\n输出顶层必须是单个对象，禁止数组。对象格式：{\"findings\":[]}。仅返回 findings；角色、需求和方案的身份由系统绑定，不要输出哈希。\n评审对象是方案是否可以实施，不是尚未编写的实现是否已经完美。方案已明确的验收和验证不要再次列为遗漏；实现顺序、变量命名、同等正确的写法属于实现指导，标 advisory。只有能够引用冻结需求与方案中明确矛盾、不可恢复的风险或缺少必要业务决策时才阻断。假设未来可能写错、要求把已有验收再写一遍，不构成 blocking。";
-      const testInstructions = "\n你是唯一的独立审查 Agent，统一检查受影响的前端、后端、接口、数据恢复与测试，不再拆成多个角色反复调查。逐项核对冻结验收、必要异常边界和历史功能回归，确认真实可执行的验证路径。只读审查，核实源码；不得重新设计、扩大业务范围或宣称测试已执行。";
+      const testInstructions = "\n你是唯一的独立审查 Agent，统一检查受影响的前端、后端、接口、数据恢复与测试，不再拆成多个角色反复调查。逐项核对冻结验收、必要异常边界和历史功能回归，确认真实可执行的验证路径。所有validation命令从仓库根目录运行，直接读取对应package.json/pom.xml和服务配置：子目录脚本须保留目录参数，Maven的-pl不能代替-f，startup地址须匹配真实端口和健康路径，前端代理须对应后端地址。已存在且未计划修改的脚本或配置与启动约定明确矛盾时属于不可验证，应blocking并给出最小命令修正；不要要求增加根目录代理脚本来迁就错误命令。只读审查，核实源码；不得重新设计、扩大业务范围或宣称测试已执行。";
       const convergenceInstructions = "\n只阻断真实无法安全实现或验收的矛盾、缺失业务决定和不可恢复风险。已确定需求内的ID重映射、文件唯一命名、过期提示、按原项目规范处理关联等普通技术细节，先核实源码后直接给最简建议，标advisory并指导Pi实现，不要求研发逐项再次确认。发现与当前方案明确相矛盾的删除范围、未受控数据改动或真实遗漏交付入口时仍应blocking，不能为了少提问隐去问题。不要把同一个问题变换措辞再开一轮。";
       const materialInstructions = `\n这份交接包保留完整冻结需求、验收、接口契约与风险，只发送职责相关的设计正文。deferredSections 中的原文未发送，不能把省略误判为遗漏；检查依赖这些内容时必须通过 read_plan 读取 planHash=${analysisHash} 的对应章节，按偏移读取必要范围。其他 Agent 的判断不作为源码事实或你的评审依据。复用附带的哈希校验源码，未覆盖的调用方、实体或回归按需定位。`;
       run = await runPi(project, workspace, "review", prompt + testInstructions + outputContract + convergenceInstructions + materialInstructions, logFile, remaining, role, [], {

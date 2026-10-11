@@ -16,6 +16,8 @@ import { admissionPolicy, assessAdmission, modelAllowance } from "./admission.js
 import { taskObservability } from "./report.js";
 import { runGit } from "./git-project.js";
 import { planReviewStatus } from "./plan-review.js";
+import { initializationCommands } from "./project-initialization.js";
+import { readLocalEnvironment } from "./local-environment.js";
 
 
 function requireState(meta, expected) {
@@ -64,11 +66,13 @@ function resultReport(meta, events) {
     `实际变更风险责任人：${meta.changeApproval?.actor ?? "未审核"}\n\n` +
     `实际变更审核结论：${meta.changeApproval?.evidence ?? "未审核"}\n\n` +
     `Pi 成本：${usage.costUsd === null ? "未知（缺少完整计价证据；零价格记录不代表免费）" : `$${usage.costUsd.toFixed(4)}`}\n\n` +
-    `测试验收人：${meta.acceptedBy ?? "未验收"}\n\n` +
+    `人工验收人：${meta.acceptedBy ?? "未验收"}\n\n` +
+    (meta.acceptanceMode === "manual" ? `验收方式：人工确认研发交付；未以本地运行或测试环境发布作为验收依据。\n\n研发检查：${meta.verificationMode === "manual_pending" ? "无合适自动检查，已记录人工确认结论；不代表自动测试通过" : "方案选定的相关检查已通过"}\n\n` : "") +
     (meta.acceptanceMode === "local" ? `验证方式：研发本地验证；地址：${meta.localValidation.environment.url || "通过本地启动步骤访问"}\n\n本地启动说明：${meta.localValidation.environment.instructions}\n\n` : "") +
     `需求分支：${meta.branch ?? "目录工作区"}；已推送版本：${meta.publishedRevision ?? "未推送"}\n\n` +
-    `测试环境版本：${meta.testCandidate?.publishedRevision ?? meta.publishedRevision ?? meta.afterHash ?? "未形成"}\n\n` +
-    `合并或本地候选版本：${meta.mergedRevision ?? "未形成"}；测试交付归档不代表已合入正式目标分支。\n\n` +
+    `研发交付版本：${meta.afterHash ?? "未形成"}\n\n` +
+    `测试环境版本：${meta.testDeployment ? meta.testCandidate?.publishedRevision ?? meta.publishedRevision ?? meta.afterHash : "未发布"}\n\n` +
+    `合并或本地候选版本：${meta.mergedRevision ?? "未形成"}；研发交付归档不代表已合入正式目标分支。\n\n` +
     `生产观察人：${meta.observedBy ?? "未观察"}\n\n` +
     `详细证据见本需求目录中的 events.jsonl、changes.json、检查日志和部署记录。\n`;
 }
@@ -118,7 +122,7 @@ export async function plan(projectPath, id) {
       partial: (event.detail.text ?? event.detail.reply.reply).length > 500 }));
     const reviewPolicy = project.config.planReview ?? "risk-based";
     const contextHash = sha256(JSON.stringify([meta.contractHash, baseHash, projectBaseline.snapshotHash,
-      configHash, revision, standards.hash, sha256(feedback), discussion.map(event => event.hash), "design-v7-validation-contract", reviewPolicy,
+      configHash, revision, standards.hash, sha256(feedback), discussion.map(event => event.hash), "design-v8-root-commands", reviewPolicy,
       process.env.REQFLOW_LOCAL_RUNTIME_CONTAINER === "1", localRuntimePorts]));
     const checkpoint = events.findLast(event => event.type === "plan_draft_completed"
       && event.detail.contextHash === contextHash && event.detail.version === meta.planVersion + 1);
@@ -170,7 +174,8 @@ export async function plan(projectPath, id) {
         + "\n返回前逐项核对设计的一致性：接口请求与前端调用、数据主记录与关联记录的身份映射、事务边界、跳过/覆盖的写入范围必须在文字、图、伪代码中一致。涉及删除或恢复字段必须直接读实体、schema和服务，既有字段与需要新增的字段明确区分，新增字段所需迁移也要列入拟改文件；不得凭项目文档假设已有支持。普通技术纠错直接写入方案，不转化为人工问答；新增关系表等扩大范围的建议先检查是否确有必要。"
         + (meta.planHash ? `\n正在收敛已有方案 ${meta.planHash}。通过read_plan读取当前相关设计、specialists和discussion原文；已明确的研发决定只核实是否偏离需求，不重复追问。过去AI意见不是人类审批，不能盲从；同一根因合并修正。近期沟通导航：${JSON.stringify(recentDiscussion)}。不论修改几轮，都以当前冻结需求为准。` : "")
         + (priorPlan?.draft.design ? `\n已有方案的接口索引：${JSON.stringify(priorPlan.draft.design.interfaces.map(({ name, method, path }) => ({ name, method, path })))}。本轮是在这份方案上局部修订，不是重新设计：未被意见、源码事实或冻结需求否定的接口路径、请求响应和文件职责必须保留；确有必要改动时在approach说明原因，并同步更新前后端、接口和关键伪代码。更改数据恢复方式不能顺带重新命名接口或重建Controller。请求响应、拟改文件和其余原文通过read_plan按需读取。` : "")
-        + "\n另返回 validation={checks:[{command:argv数组,reason:源码依赖和验收依据}],skipped:[{command:argv数组,reason:与影响范围无关的具体依据}],manualReason:字符串,startup:[{name,command:argv数组,url:回环HTTP地址}]}。检查和启动命令都从项目根目录运行。先读现有脚本、测试和调用依赖，只选择影响范围内的用例或构建；项目检查配置只是候选，禁止默认全量回归，无关失败不阻塞也不修复。后端改动也选择对应类/方法/依赖调用方测试。没有合适自动检查时checks=[]，manualReason说明人工验收步骤，绝不伪称通过。startup包含本地验证必需的前后端服务及其真实健康地址，明确回环绑定和端口；检查依赖/环境，不猜测凭据。缺启动脚本时将最小启动方式的文件纳入affectedFiles和changes，交由编码补齐。CLI或库没有常驻服务可startup=[]。用户不填写命令；完成后可启动本地验证或跳过本地发布测试环境。"
+        + "\n另返回 validation={checks:[{command:argv数组,reason:源码依赖和验收依据}],skipped:[{command:argv数组,reason:与影响范围无关的具体依据}],manualReason:字符串,startup:[{name,command:argv数组,url:回环HTTP地址}]}。检查和启动命令都从项目根目录运行。先读现有脚本、测试和调用依赖，只选择影响范围内的用例或构建；项目检查配置只是候选，禁止默认全量回归，无关失败不阻塞也不修复。后端改动也选择对应类/方法/依赖调用方测试。没有合适自动检查时checks=[]，manualReason说明人工验收步骤，绝不伪称通过。startup描述可选本地验证需要的前后端服务及其真实健康地址，明确回环绑定和端口；检查依赖/环境，不猜测凭据。缺启动脚本时将最小启动方式的文件纳入affectedFiles和changes，交由编码补齐。CLI或库没有常驻服务可startup=[]。用户不填写命令；相关检查通过后人工确认即可归档，不配置环境也可以；本地启动验证和测试环境发布均为可选步骤，不强制最终环境自动化测试。"
+        + `\n项目根目录命令目录：${JSON.stringify(initializationCommands(projectBaseline))}。复用其中已包含子目录参数的argv，不得丢掉--prefix/--dir/--cwd。子目录有脚本不等于根目录有脚本；例如frontend/package.json的serve必须用["npm","--prefix","frontend","run","serve"]。Maven没有根pom.xml时用-f指定真实pom.xml路径，-pl只选择已有聚合项目的模块，不能代替-f。逐项直接读取启动配置核对端口、监听地址、前端代理和可返回成功状态的健康路径，url必须与命令一致，不得猜8080/8081。核对数据库启动初始化和外部依赖，避免本地验证对现有业务数据库执行建表或初始化写入；需要变更启动参数时显式写入command。`
         + "\nAssess the real runtime feature, not only its isolated tests: persistent writes require impacts.data=changed and documented data recovery. Persistence alone is not irreversible. Use reversible only with concrete backup/restore steps and verification; irreversible means no documented recovery can restore the affected state. Test isolation does not establish code_only recovery for a data feature. Missing operational recovery facts stay unresolved; never invent them. Existing loaders and builtin registration must be read from real source, not guessed."
         + "\n有INSERT、UPDATE或逻辑删除时，即使没有DDL也不能把数据恢复写成code_only。给出受影响记录/旧值的备份或记录方式、失败事务回滚及必要时恢复的具体步骤和验证，核实后才能标documented。运维恢复步骤不等于增加用户可见的撤销功能，也不强制独立回退脚本；能用已有可靠方式就复用，缺少必要事实再提问。沟通中的AI建议须核实，不得直接沿用'代码回滚可恢复数据库'等错误结论。"
         + (revisionProposal ? `\n本轮包含研发直接编辑提案。额外返回 candidateReview={proposalHash:"${sha256(JSON.stringify(revisionProposal))}",status:accepted/adjusted/product_confirmation/human_led,reasons:非空理由数组最多4项}。核实源码，不盲从研发：合理保留的提案为accepted，调整改法须adjusted并说明具体理由和替代建议；需要改变业务需求则product_confirmation；复杂设计则human_led。当前方案仍必须遵守原冻结需求，不得为了通过而删除验收或隐藏未知影响。` : ""),
@@ -1069,17 +1074,25 @@ export async function reconcileTestDeployment(projectPath, id, actor, outcome, o
   });
 }
 
-export async function acceptTest(projectPath, id, actor, evidence) {
+export async function acceptTest(projectPath, id, actor, evidence, acceptanceMode) {
   requireActor(actor);
-  if (typeof evidence !== "string" || !evidence.trim()) throw new Error("Human test evidence is required");
+  if (typeof evidence !== "string" || !evidence.trim()) throw new Error("Human acceptance evidence is required");
+  if (!["manual", "local", "deployed"].includes(acceptanceMode)) throw new Error("Acceptance mode must be manual, local or deployed");
   const project = await loadProject(projectPath);
-  return withLock(path.join(project.archive, "test-environment.lock"), () => withLock(path.join(taskPath(project, id), "task.lock"), async () => {
+  return withLock(path.join(project.archive, "execution-config.lock"), () => withLock(path.join(project.archive, "test-environment.lock"), () => withLock(path.join(taskPath(project, id), "task.lock"), async () => {
     const { meta, directory } = await readTask(project, id);
-    const local = meta.state === "verified";
-    if (local) {
-      if (meta.localValidation?.afterHash !== meta.afterHash || !meta.localValidation.environment
-          || meta.changeApproval?.afterHash !== meta.afterHash || meta.changeApproval.actor !== meta.assignments?.developer?.userId)
-        throw new Error("请先由负责研发保存本地测试设置、确认代码和实际验证结果。");
+    const verified = acceptanceMode !== "deployed";
+    if (verified) {
+      requireState(meta, "verified");
+      if (meta.changeApproval?.afterHash !== meta.afterHash || meta.changeApproval.actor !== meta.assignments?.developer?.userId)
+        throw new Error("请先由负责研发确认当前代码和研发检查结果。");
+      if (acceptanceMode === "local") {
+        if (meta.localValidation?.afterHash !== meta.afterHash || !meta.localValidation.environment
+            || !["running", "not_applicable", "stopped"].includes(meta.localValidation.status))
+          throw new Error("请先完成当前代码的本地验证，再确认本地验证结果。");
+        if (meta.localValidation.prerequisites?.revision !== (await readLocalEnvironment(project)).revision)
+          throw new Error("本地环境配置已改变，请重新启动并验证当前配置后再验收。");
+      }
       await assertTaskStandards(project, meta, directory);
       await assertCheckEvidence(project, meta.checks, directory,
         meta.verificationAttempt === 1 ? "" : `verification-attempt-${meta.verificationAttempt}`,
@@ -1088,17 +1101,18 @@ export async function acceptTest(projectPath, id, actor, evidence) {
         throw new Error("本地代码已改变，请重新检查后再验收。");
     } else requireState(meta, "test_deployed");
     if (describePolicy(project.config).executionConfigHash !== meta.configHash) throw new Error("Project policy changed after plan approval");
-    const environment = local || meta.testDeployment.url === undefined ? null : await fs.readFile(path.join(project.archive, `test-environment-${sha256(meta.testDeployment.url)}.json`), "utf8").then(JSON.parse,
+    const environment = verified || meta.testDeployment.url === undefined ? null : await fs.readFile(path.join(project.archive, `test-environment-${sha256(meta.testDeployment.url)}.json`), "utf8").then(JSON.parse,
       error => { if (error.code === "ENOENT") return null; throw error; });
     if (environment && environment.taskId !== id && environment.url === meta.testDeployment.url) throw new Error("共享测试环境已用于其他需求发布，请重新发布本需求后再验收。");
     await fs.writeFile(path.join(directory, "acceptance.md"), evidence, { flag: "wx", mode: 0o600 });
     const stopped = await stopLocalRuntime(directory);
-    const next = { ...meta, state: "test_accepted", acceptanceMode: local ? "local" : "deployed",
-      ...(meta.localValidation ? { localValidation: { ...meta.localValidation, status: stopped.status } } : {}),
+    const next = { ...meta, state: "test_accepted", acceptanceMode,
+      ...(meta.localValidation?.status === "running" ? { localValidation: { ...meta.localValidation, status: stopped.status } } : {}),
       acceptedBy: actor, acceptedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-    await appendEvent(project, id, "test_accepted", next, { actor, evidenceHash: sha256(evidence), localRuntime: stopped });
+    await appendEvent(project, id, "test_accepted", next, { actor, acceptanceMode, afterHash: meta.afterHash,
+      verificationMode: meta.verificationMode, evidenceHash: sha256(evidence), localRuntime: stopped });
     return next;
-  }));
+  })));
 }
 
 export async function rollback(projectPath, id, actor) {
@@ -1356,7 +1370,6 @@ export async function observeRelease(projectPath, id, actor, evidence) {
 export async function archiveTestOnly(projectPath, id, actor) {
   requireActor(actor);
   const project = await loadProject(projectPath);
-  if (project.config.productionDeployment.kind !== "none") throw new Error("Production deployment is enabled; use the release workflow");
   return withLock(path.join(taskPath(project, id), "task.lock"), async () => {
     const { meta, directory, events } = await readTask(project, id);
     const acceptedLocal = meta.state === "test_accepted";

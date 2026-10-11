@@ -4,6 +4,7 @@ import { createWriteStream } from "node:fs";
 import { connect } from "node:net";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 import { childEnvironment } from "./execution-env.js";
 
 const runtimes = new Map();
@@ -46,12 +47,11 @@ export async function stopAllLocalRuntimes() {
   for (const key of runtimes.keys()) await stopLocalRuntime(key);
 }
 
-export async function startLocalRuntime(key, workspace, startup, directory, environment, timeoutMs = 30000) {
+export async function startLocalRuntime(key, workspace, startup, directory, environment, timeoutMs = 30000, values = {}, serviceValues = null) {
   assertExecutionActive();
   if (localRuntimeStatus(key).status === "running") return localRuntimeStatus(key);
   await stopLocalRuntime(key);
   if (!startup.length) return { status: "not_applicable", services: [] };
-  const env = childEnvironment(environment, true);
   for (const service of startup) {
     const url = new URL(service.url);
     await new Promise((resolve, reject) => {
@@ -67,6 +67,10 @@ export async function startLocalRuntime(key, workspace, startup, directory, envi
   for (const service of startup) {
     const logFile = path.join(directory, `local-${randomUUID()}.log`);
     const log = createWriteStream(logFile, { flags: "wx", mode: 0o600 });
+    const injected = serviceValues === null ? values : serviceValues[service.name];
+    if (!injected) throw new Error(`${service.name} 缺少已检查的私有配置。`);
+    const names = serviceValues === null ? environment : Object.keys(injected);
+    const env = childEnvironment(names, true, injected);
     const child = spawn(service.command[0], service.command.slice(1), { cwd: workspace, env,
       detached: process.platform !== "win32", stdio: ["ignore", "pipe", "pipe"] });
     const record = { ...service, child, logFile, log, tail: "", bytes: 0, exited: false, ready: false, error: null };
@@ -75,12 +79,21 @@ export async function startLocalRuntime(key, workspace, startup, directory, envi
     }));
     child.once("error", error => { record.error = error.message; });
     log.once("error", error => { record.error = error.message; child.kill("SIGTERM"); });
-    const capture = data => {
-      record.tail = (record.tail + data.toString()).slice(-4000);
-      if (record.bytes < 1024 * 1024) log.write(data.subarray(0, 1024 * 1024 - record.bytes));
-      record.bytes += data.length;
-    };
-    child.stdout.on("data", capture); child.stderr.on("data", capture);
+    const secrets = names.map(name => env[name]).filter(value => value.length).sort((a, b) => b.length - a.length);
+    const retained = Math.max(0, ...secrets.map(value => value.length));
+    for (const stream of [child.stdout, child.stderr]) {
+      const decoder = new StringDecoder("utf8"); let pending = "";
+      const capture = (data, end = false) => {
+        pending += end ? decoder.end() : decoder.write(data);
+        for (const secret of secrets) pending = pending.split(secret).join("[REDACTED]");
+        const length = end ? pending.length : Math.max(0, pending.length - retained);
+        const output = Buffer.from(pending.slice(0, length)); pending = pending.slice(length);
+        record.tail = (record.tail + output.toString()).slice(-4000);
+        if (record.bytes < 1024 * 1024) log.write(output.subarray(0, 1024 * 1024 - record.bytes));
+        record.bytes += output.length;
+      };
+      stream.on("data", capture); stream.once("end", () => capture(null, true));
+    }
     runtime.services.push(record);
   }
   try {

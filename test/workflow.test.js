@@ -28,6 +28,8 @@ import { configureExecution, readExecutionSetup } from "../src/project-execution
 import { configureModels, readModelSettings } from "../src/model-settings.js";
 import { discussPlan } from "../src/plan-conversation.js";
 import { localValidation } from "../src/git-delivery.js";
+import { configureLocalEnvironment } from "../src/local-environment.js";
+import { scanLocalEnvironment } from "../src/environment-scan.js";
 import { stopLocalRuntime } from "../src/local-runtime.js";
 import { acceptTest, approveChanges, approvePlan, approveRelease, archiveTestOnly, deployTest, implement, observeRelease, plan, pollRelease, release, revisePlan, rollback, verify, verifyCandidate } from "../src/workflow.js";
 
@@ -46,7 +48,8 @@ for (const phase of ["plan", "review", "implement", "intake", "dialogue"]) test(
     if((await fs.readFile(${JSON.stringify(marker)},'utf8'))===phase){
       if(process.env.REQFLOW_PHASE==='implement')await fs.appendFile('src/calculator.mjs','\\n// Retained partial edit\\n');
       spawn(process.execPath,['-e',${JSON.stringify(`require('node:fs').appendFileSync(${JSON.stringify(pulse)},'x');setInterval(()=>require('node:fs').appendFileSync(${JSON.stringify(pulse)},'x'),30)`) }],{stdio:'ignore'});
-      process.on('SIGTERM',()=>{});await fs.writeFile(${JSON.stringify(entered)},phase);setInterval(()=>{},1000);
+       process.on('SIGTERM',()=>{});await fs.writeFile(${JSON.stringify(`${entered}.tmp`)},phase);
+       await fs.rename(${JSON.stringify(`${entered}.tmp`)},${JSON.stringify(entered)});setInterval(()=>{},1000);
     }else await import(${JSON.stringify(fakePi)});`);
   const { temporary, projectRoot, project } = await fixture(false, executable);
   t.after(() => fs.rm(temporary, { recursive: true, force: true }));
@@ -81,7 +84,7 @@ for (const phase of ["plan", "review", "implement", "intake", "dialogue"]) test(
   const deadline = Date.now() + 8000;
   while (!(await fs.readdir(control)).includes("entered") && Date.now() < deadline) await pauseDelay(20);
   assert.equal(await fs.readFile(entered, "utf8"), phase);
-  while (!(await fs.readdir(control)).includes("pulse") && Date.now() < deadline) await pauseDelay(20);
+  while (Date.now() < deadline && (!(await fs.readdir(control)).includes("pulse") || (await fs.stat(pulse)).size === 0)) await pauseDelay(20);
   assert.ok((await fs.stat(pulse)).size > 0, "descendant must be running before the pause");
   const key = path.join(project.archive, "tasks", id);
   assert.equal(executionStatus(key).status, "running");
@@ -308,7 +311,15 @@ test("isolated planning and implementation run installed Node tools without shar
 });
 
 test("approved plan selects checks without manual commands or shared deployment configuration", async (t) => {
-  const { projectRoot, project } = await analysisFixture(t, [], { checks: [], testDeployment: { kind: "unconfigured" } });
+  const { projectRoot, project } = await analysisFixture(t, [[
+    '  if (prompt.includes("Out-of-scope probe"))',
+    `  const { manifest, manifestHash } = await import(${JSON.stringify(new URL("../src/files.js", import.meta.url).href)});
+  const hash = manifestHash(await manifest(process.cwd(), [], 1000000));
+  process.stdout.write(JSON.stringify({ type: "entry_appended", entry: { customType: "reqflow_development_check", data: {
+    attempt: 1, status: "manual_pending", beforeHash: hash, afterHash: hash, checks: [], formalVerificationRequired: true
+  } } }) + "\\n");
+  if (prompt.includes("Out-of-scope probe"))`,
+  ]], { checks: [], testDeployment: { kind: "unconfigured" } });
   await fs.writeFile(path.join(projectRoot, "package.json"), JSON.stringify({ scripts: {
     test: 'echo "Error: no test specified" && exit 1' } }));
   await fs.writeFile(path.join(projectRoot, "src/package.json"), JSON.stringify({ scripts: { test: "node --test", build: "node build.mjs" } }));
@@ -328,6 +339,11 @@ test("approved plan selects checks without manual commands or shared deployment 
   await approvePlan(projectRoot, "REQ-001", "reviewer", undefined, undefined, input.expectedPlanHash);
   assert.deepEqual((await loadProject(projectRoot)).config.checks, []);
   await implement(projectRoot, "REQ-001");
+  const implemented = await readTask(project, "REQ-001");
+  const checkEvidence = implemented.events.findLast(event => event.type === "implemented").detail.telemetry.developmentChecks;
+  assert.equal(implemented.meta.state, "implemented");
+  assert.deepEqual(checkEvidence.map(check => check.status), ["manual_pending"]);
+  assert.equal(checkEvidence[0].formalVerificationRequired, true);
   const result = await verify(projectRoot, "REQ-001");
   assert.equal(result.state, "verified");
   assert.deepEqual(result.developmentChecks, []);
@@ -340,28 +356,120 @@ test("approved plan selects checks without manual commands or shared deployment 
   await approveChanges(projectRoot, "REQ-001", "reviewer", "Checked isolated changes and tests");
 });
 
-test("approved startup starts local services and preserves rollback without automatic tests", async t => {
+test("approved startup uses the root command catalogue for a nested frontend and preserves rollback", async t => {
   const listener = createServer();
   await new Promise(resolve => listener.listen(0, "127.0.0.1", resolve));
   const port = listener.address().port;
   await new Promise(resolve => listener.close(resolve));
   const url = `http://127.0.0.1:${port}/`;
-  const command = [process.execPath, "-e", `require('node:http').createServer((req,res)=>res.end('working project')).listen(${port},'127.0.0.1')`];
   const { projectRoot, project } = await analysisFixture(t, [["  analysis.changes =", `
-  analysis.validation.startup = ${JSON.stringify([{ name: "app", command, url }])};
+  const commandCatalogue = JSON.parse(prompt.match(/^项目根目录命令目录：(.*)。复用/m)[1]);
+  const frontendCommand = commandCatalogue.find(row => row.id === 'frontend/package.json#serve');
+  if (!frontendCommand || frontendCommand.cwd !== '.') throw new Error('Missing root-scoped frontend command');
+  analysis.validation.startup = [{ name: 'frontend', command: frontendCommand.argv, url: ${JSON.stringify(url)} }];
   analysis.changes =`]], { checks: [] });
+  await fs.mkdir(path.join(projectRoot, "frontend"));
+  await fs.writeFile(path.join(projectRoot, "frontend/package.json"), JSON.stringify({ scripts: { serve: "node service.cjs" } }));
+  await fs.writeFile(path.join(projectRoot, "frontend/service.cjs"),
+    `require('node:http').createServer((req,res)=>res.end(process.env.LOCAL_MESSAGE)).listen(${port},'127.0.0.1')`);
+  await refreshProjectBaseline(project);
   await plan(projectRoot, "REQ-001"); await approvePlan(projectRoot, "REQ-001", "reviewer");
   await implement(projectRoot, "REQ-001"); await verify(projectRoot, "REQ-001");
   const task = await readTask(project, "REQ-001");
   const input = { expectedAfterHash: task.meta.afterHash, expectedPlanHash: task.meta.planHash };
+  const missing = await localValidation(projectRoot, "REQ-001", "reviewer", input);
+  assert.equal(missing.status, "blocked");
+  assert.equal((await readTask(project, "REQ-001")).meta.state, "verified");
+  await assert.rejects(fetch(url), /fetch failed/);
+  const environmentFile = path.join(path.dirname(projectRoot), "local.env");
+  await fs.writeFile(environmentFile, "LOCAL_MESSAGE=working project\n");
+  const scan = await scanLocalEnvironment(project);
+  const settings = { expectedRevision: null, expectedScanHash: scan.hash, environmentFile: "", target: "frontend",
+    decisions: { "app:frontend/LOCAL_MESSAGE": "enabled" }, values: {} };
+  const configured = await configureLocalEnvironment(project, "reviewer", settings);
+  const unavailable = await localValidation(projectRoot, "REQ-001", "reviewer", input);
+  assert.equal(unavailable.status, "blocked");
+  assert.match(unavailable.prerequisites.items.at(-1).message, /缺少必需/);
+  await assert.rejects(fetch(url), /fetch failed/);
+  const readySetup = await configureLocalEnvironment(project, "reviewer", { ...settings, expectedRevision: configured.revision, environmentFile });
   const result = await localValidation(projectRoot, "REQ-001", "reviewer", input);
   t.after(() => stopLocalRuntime(task.directory));
   assert.equal(result.status, "running");
+  assert.deepEqual(result.validation.startup[0].command, ["npm", "--prefix", "frontend", "run", "serve"]);
   assert.equal(await (await fetch(url)).text(), "working project");
+  await assert.rejects(configureLocalEnvironment(project, "reviewer", { ...settings,
+    expectedRevision: readySetup.revision }), /仍在运行/);
   assert.equal((await readTask(project, "REQ-001")).meta.verificationMode, "manual_pending");
+  await approveChanges(projectRoot, "REQ-001", "reviewer", "Checked current code and local behavior");
+  await localValidation(projectRoot, "REQ-001", "reviewer", { ...input, operation: "stop" });
+  await configureLocalEnvironment(project, "reviewer", { ...settings, expectedRevision: readySetup.revision });
+  await assert.rejects(acceptTest(projectRoot, "REQ-001", "reviewer", "Earlier environment was tested", "local"), /环境配置已改变/);
+  await acceptTest(projectRoot, "REQ-001", "reviewer", "重新核对当前代码，人工确认交付；不采用旧环境的验证结果。", "manual");
+  assert.equal((await readTask(project, "REQ-001")).meta.acceptanceMode, "manual");
   await rollback(projectRoot, "REQ-001", "reviewer");
   await assert.rejects(fetch(url), /fetch failed/);
   assert.equal((await readTask(project, "REQ-001")).meta.state, "rolled_back");
+});
+
+test("manual acceptance archives verified code without configuring or starting an environment", async t => {
+  const { projectRoot, project } = await analysisFixture(t, [], { testDeployment: { kind: "unconfigured" } });
+  const actor = { id: "reviewer", roles: ["developer"] };
+  await plan(projectRoot, "REQ-001");
+  await approvePlan(projectRoot, "REQ-001", actor.id); await implement(projectRoot, "REQ-001");
+  await assert.rejects(acceptTest(projectRoot, "REQ-001", actor.id, "Not checked yet", "manual"), /expected verified/);
+  await verify(projectRoot, "REQ-001");
+  const task = await readTask(project, "REQ-001");
+  assert.ok(task.meta.checks.length > 0); assert.ok(task.meta.checks.every(check => check.code === 0));
+  assert.equal(task.meta.localValidation, undefined);
+  const input = { action: "accept-test", acceptanceMode: "manual", expectedAfterHash: task.meta.afterHash,
+    expectedPlanHash: task.meta.planHash, evidence: "已核对需求、乘法和原加法用例及代码差异，确认交付。" };
+  await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", { ...input, expectedAfterHash: "old" }, actor), /代码或方案已改变/);
+  await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", input, { id: "stranger", roles: ["developer"] }), /not assigned/);
+  await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", input, { id: "product", roles: ["product"] }), /assigned developer/);
+  const log = task.meta.checks[0].logFile, original = await fs.readFile(log, "utf8");
+  await fs.appendFile(log, "tampered evidence");
+  await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", input, actor), /Changed.*check log/);
+  await fs.writeFile(log, original);
+  const source = path.join(task.meta.workspace, "src/calculator.mjs"), code = await fs.readFile(source, "utf8");
+  await fs.appendFile(source, "\n// changed since verification\n");
+  await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", input, actor), /changed|改变/);
+  await fs.writeFile(source, code);
+  const archived = await executeRequirementAction(projectRoot, "REQ-001", input, actor);
+  assert.equal(archived.state, "archived_test_only"); assert.equal(archived.acceptanceMode, "manual");
+  assert.equal(archived.acceptedBy, actor.id); assert.equal(archived.changeApproval.actor, actor.id);
+  assert.equal(archived.testDeployment, undefined); assert.equal(archived.localValidation, undefined);
+  const saved = await readTask(project, "REQ-001"), event = saved.events.find(event => event.type === "test_accepted");
+  assert.equal(event.detail.acceptanceMode, "manual"); assert.equal(event.detail.afterHash, task.meta.afterHash);
+  assert.match(await fs.readFile(path.join(task.directory, "result.md"), "utf8"), /人工确认研发交付[\s\S]*相关检查已通过[\s\S]*测试环境版本：未发布/);
+  assert.equal(saved.events.some(event => ["local_validation_requested", "test_deployed"].includes(event.type)), false);
+});
+
+test("database initialization cannot start without confirmation of the checked environment version", async t => {
+  const dependency = createServer();
+  await new Promise(resolve => dependency.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => dependency.close(resolve)));
+  const port = dependency.address().port;
+  const { projectRoot, project } = await analysisFixture(t, [["  analysis.changes =", `
+  analysis.validation.startup=[{name:'backend',command:['mvn','spring-boot:run'],url:'http://127.0.0.1:9/'}];
+  analysis.changes =`]], { checks: [] });
+  await fs.writeFile(path.join(projectRoot, "pom.xml"), "<project>spring-boot</project>");
+  await fs.mkdir(path.join(projectRoot, "src/main/resources"), { recursive: true });
+  await fs.writeFile(path.join(projectRoot, "src/main/resources/application.properties"),
+    `spring.datasource.url=jdbc:mysql://127.0.0.1:${port}/fixture\nspring.datasource.password=source-fixture-secret\nspring.sql.init.mode=always\n`);
+  await refreshProjectBaseline(project);
+  await plan(projectRoot, "REQ-001"); await approvePlan(projectRoot, "REQ-001", "reviewer");
+  await implement(projectRoot, "REQ-001"); await verify(projectRoot, "REQ-001");
+  const task = await readTask(project, "REQ-001"); const scan = await scanLocalEnvironment(project, task.meta.workspace);
+  const setup = await configureLocalEnvironment(project, "reviewer", { expectedRevision: null, expectedScanHash: scan.hash,
+    target: "all", environmentFile: "", decisions: {}, values: { "mysql:./host": "127.0.0.1", "mysql:./port": String(port),
+      "mysql:./database": "fixture", "mysql:./username": "test", "mysql:./password": "private-test" } }, task.meta.workspace);
+  const input = { expectedAfterHash: task.meta.afterHash, expectedPlanHash: task.meta.planHash };
+  await assert.rejects(localValidation(projectRoot, "REQ-001", "reviewer", input), /确认当前环境版本的启动影响/);
+  await assert.rejects(localValidation(projectRoot, "REQ-001", "reviewer", { ...input, confirmStartupEffects: true,
+    expectedEnvironmentRevision: "stale-revision" }), /确认当前环境版本的启动影响/);
+  assert.equal((await readTask(project, "REQ-001")).meta.state, "verified");
+  assert.equal((await readTask(project, "REQ-001")).meta.localValidation, undefined);
+  assert.equal(setup.version, 1);
 });
 
 test("local startup failure preserves reviewed code and adds an explicit failure audit", async t => {
@@ -377,6 +485,9 @@ test("local startup failure preserves reviewed code and adds an explicit failure
   await plan(projectRoot, "REQ-001"); await approvePlan(projectRoot, "REQ-001", "reviewer");
   await implement(projectRoot, "REQ-001"); await verify(projectRoot, "REQ-001");
   const before = await readTask(project, "REQ-001");
+  const scan = await scanLocalEnvironment(project, before.meta.workspace);
+  await configureLocalEnvironment(project, "reviewer", { expectedRevision: null, expectedScanHash: scan.hash,
+    environmentFile: "", target: "all", decisions: {}, values: {} }, before.meta.workspace);
   await assert.rejects(localValidation(projectRoot, "REQ-001", "reviewer", {
     expectedAfterHash: before.meta.afterHash, expectedPlanHash: before.meta.planHash,
   }), /local dependency missing/);
@@ -410,6 +521,9 @@ createServer((req,res)=>res.end(String(multiply(2,3)))).listen(${port},'127.0.0.
   const task = await readTask(project, "REQ-001");
   t.after(() => stopLocalRuntime(task.directory));
   assert.ok(task.meta.developmentFiles.includes("src/local-server.mjs"));
+  const scan = await scanLocalEnvironment(project, task.meta.workspace);
+  await configureLocalEnvironment(project, "reviewer", { expectedRevision: null, expectedScanHash: scan.hash,
+    environmentFile: "", target: "all", decisions: {}, values: {} }, task.meta.workspace);
   await localValidation(projectRoot, "REQ-001", "reviewer", {
     expectedAfterHash: task.meta.afterHash, expectedPlanHash: task.meta.planHash,
   });
@@ -1362,6 +1476,8 @@ test("verification repair retains failed evidence and uses distinct logs through
   await assert.rejects(verify(projectRoot, "REQ-001"), /failed/);
   const failed = await readTask(project, "REQ-001");
   const firstLog = await fs.readFile(path.join(failed.directory, "check-1.log"), "utf8");
+  await assert.rejects(acceptTest(projectRoot, "REQ-001", "reviewer", "Skip failed tests", "manual"), /expected verified/);
+  assert.equal((await readTask(project, "REQ-001")).meta.state, "verification_failed");
   const script = await fs.readFile(project.config.piExecutable, "utf8");
   const repair = 'if (phase === "implement") { const filename = path.join(process.cwd(), "src/calculator.mjs"); await fs.writeFile(filename, (await fs.readFile(filename, "utf8")).replace("export function multiply(left, right) {\\n  return left + right;", "export function multiply(left, right) {\\n  return left * right;")); }\n';
   await fs.writeFile(project.config.piExecutable, script.replace('if (phase === "implement") {', repair + 'if (false) {'));
@@ -1379,7 +1495,7 @@ test("verification repair retains failed evidence and uses distinct logs through
   assert.match(await fs.readFile(path.join(evidence.implementationAttempts[0].retained, "after/src/calculator.mjs"), "utf8"), /return left \+ right/);
   await approveChanges(projectRoot, "REQ-001", "reviewer", "Reviewed exact repair and passing regression.");
   await deployTest(projectRoot, "REQ-001");
-  await acceptTest(projectRoot, "REQ-001", "reviewer", "Verified multiplication and existing addition.");
+  await acceptTest(projectRoot, "REQ-001", "reviewer", "Verified multiplication and existing addition.", "deployed");
   await verifyCandidate(projectRoot, "REQ-001");
   await archiveTestOnly(projectRoot, "REQ-001", "reviewer", "Test-only delivery accepted; no production release.");
   assert.equal((await readTask(project, "REQ-001")).events.filter(row => row.type === "verification_failed").length, 1);
@@ -1462,7 +1578,7 @@ test("human plan confirmation and a chosen deployment deliver the changed versio
   assert.deepEqual(await (await fetch(url)).json(), { add: 5, multiply: 6 });
   assert.equal(await fs.readFile(path.join(projectRoot, "src/calculator.mjs"), "utf8"), source);
   assert.equal(task.events.some(event => event.type === "changes_approved"), false);
-  await executeRequirementAction(projectRoot, "REQ-001", { action: "accept-test", evidence: "HTTP preview confirms 2×3=6 and existing addition=5." },
+  await executeRequirementAction(projectRoot, "REQ-001", { action: "accept-test", acceptanceMode: "deployed", evidence: "HTTP preview confirms 2×3=6 and existing addition=5." },
     { id: "product", roles: ["product"] });
   assert.equal((await readTask(project, "REQ-001")).meta.state, "archived_test_only");
 });
@@ -2079,7 +2195,7 @@ test("Docker sandbox configuration reaches every project check phase", async (t)
     assert.deepEqual(verified.checks.map((check) => check.sandboxImage), [image]);
     await approveChanges(projectRoot, "REQ-001", "reviewer", "Reviewed the changed files and regression tests.");
     await deployTest(projectRoot, "REQ-001");
-    await acceptTest(projectRoot, "REQ-001", "developer", "Confirmed multiplication and addition.");
+    await acceptTest(projectRoot, "REQ-001", "developer", "Confirmed multiplication and addition.", "deployed");
     const candidate = await verifyCandidate(projectRoot, "REQ-001");
     assert.deepEqual(candidate.mergeChecks.map((check) => check.sandboxImage), [image]);
     const events = (await readTask(project, "REQ-001")).events;
@@ -2090,22 +2206,20 @@ test("Docker sandbox configuration reaches every project check phase", async (t)
   }
 });
 
-test("time extension requires the assigned developer and current audit head without changing prior usage", async t => {
+test("planning retries after long historical runs preserve usage without a cumulative deadline", async t => {
   const { projectRoot, project } = await analysisFixture(t);
+  const initial = await readTask(project, "REQ-001");
+  await appendEvent(project, "REQ-001", "plan_attempt_failed", initial.meta, { modelRun: true,
+    telemetry: { tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 }, durationMs: 3600000, assistantMessages: 1 } });
   const before = await readTask(project, "REQ-001");
-  const body = { action: "extend-execution-budget", expectedAuditHead: before.lastHash,
-    additionalModelMs: 60000, reason: "User authorized a bounded retry after diagnosing the timeout." };
-  await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", body, { id: "unassigned", roles: ["developer"] }), /not assigned/);
-  await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", { ...body, expectedAuditHead: "stale" },
-    { id: "reviewer", roles: ["developer"] }), /记录已改变/);
-  await executeRequirementAction(projectRoot, "REQ-001", body, { id: "reviewer", roles: ["developer"] });
+  await executeRequirementAction(projectRoot, "REQ-001", { action: "plan" }, { id: "reviewer", roles: ["developer"] });
   const after = await readTask(project, "REQ-001");
-  assert.equal(after.events.length, before.events.length + 1);
-  assert.deepEqual(executionUsage(after.events), executionUsage(before.events));
-  assert.equal(after.events.at(-1).detail.additionalModelMs, 60000);
-  assert.equal(after.events.at(-1).detail.priorAuditHead, before.lastHash);
-  await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", body,
-    { id: "reviewer", roles: ["developer"] }), /记录已改变/);
+  assert.equal(after.meta.state, "plan_review");
+  assert.deepEqual(after.events.slice(0, before.events.length), before.events);
+  assert.ok(executionUsage(after.events).modelMs >= 3600000);
+  assert.equal(after.events.some(event => event.type === "execution_boundary_stopped"), false);
+  assert.deepEqual(after.events.findLast(event => event.type === "plan_draft_completed").detail.telemetry.timeouts,
+    { requestMs: project.config.maxPiMs, mode: "per_request" });
 });
 
 test("rollback reopens the same requirement through HTTP and retains every development round", async t => {
@@ -2142,9 +2256,6 @@ test("rollback reopens the same requirement through HTTP and retains every devel
         { id: "reviewer", roles: ["developer"] }), /snapshots changed/);
       await fs.writeFile(snapshot, saved);
       assert.equal((await readTask(project, "REQ-001")).lastHash, rolled.lastHash);
-      await executeRequirementAction(projectRoot, "REQ-001", { action: "extend-execution-budget", expectedAuditHead: rolled.lastHash,
-        additionalModelMs: 60000, reason: "Explicit fixture restart allowance" }, { id: "reviewer", roles: ["developer"] });
-      rolled = await readTask(project, "REQ-001"); input.expectedAuditHead = rolled.lastHash;
     }
     await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", input, { id: "other", roles: ["developer"] }), /not assigned/);
     await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", { ...input, expectedAuditHead: "stale" },
@@ -2246,7 +2357,7 @@ test("approved plan gates implementation, verification, acceptance and rollback"
     await fs.writeFile(changedFile, approvedSource);
     const deployed = await deployTest(projectRoot, "REQ-001");
     assert.equal(deployed.state, "test_deployed");
-    const accepted = await acceptTest(projectRoot, "REQ-001", "developer", "2 × 3 = 6; 2 + 3 = 5.");
+    const accepted = await acceptTest(projectRoot, "REQ-001", "developer", "2 × 3 = 6; 2 + 3 = 5.", "deployed");
     assert.equal(accepted.state, "test_accepted");
     const original = await fs.readFile(path.join(implemented.workspace, "src", "calculator.mjs"), "utf8");
     assert.match(original, /multiply/);
@@ -2451,7 +2562,7 @@ for (const unknownPricing of [false, true]) test(`test-only archive preserves ve
     await verify(projectRoot, "REQ-001");
     await approveChanges(projectRoot, "REQ-001", "reviewer", "Reviewed exact verified changes before testing.");
     await deployTest(projectRoot, "REQ-001");
-    await acceptTest(projectRoot, "REQ-001", "developer", "Manual smoke check passed.");
+    await acceptTest(projectRoot, "REQ-001", "developer", "Manual smoke check passed.", "deployed");
     assert.equal((await searchProjectHistory(project, { query: "multiplication", reason: "existing_feature" })).results.length, 0,
       "Unarchived and unaccepted work must not be retrieved as long-term delivery evidence");
     assert.equal((await verifyCandidate(projectRoot, "REQ-001")).state, "merge_verified");
@@ -2510,7 +2621,7 @@ test("release requires separate approval and observation", async () => {
     await verify(projectRoot, "REQ-001");
     await approveChanges(projectRoot, "REQ-001", "reviewer", "Reviewed exact verified changes before testing.");
     await deployTest(projectRoot, "REQ-001");
-    await acceptTest(projectRoot, "REQ-001", "developer", "Manual acceptance passed.");
+    await acceptTest(projectRoot, "REQ-001", "developer", "Manual acceptance passed.", "deployed");
     await verifyCandidate(projectRoot, "REQ-001");
     await assert.rejects(release(projectRoot, "REQ-001"), /expected release_approved/);
     const mergeLog = path.join(project.archive, "tasks", "REQ-001", "merge-check-1.log");
@@ -2553,7 +2664,7 @@ test("custom release adapter retains separate approval and polls the approved ca
   await plan(projectRoot, "REQ-001");
   await approvePlan(projectRoot, "REQ-001", "reviewer");
   await implement(projectRoot, "REQ-001"); await verify(projectRoot, "REQ-001");
-  await deployTest(projectRoot, "REQ-001"); await acceptTest(projectRoot, "REQ-001", "developer", "Fixture acceptance");
+  await deployTest(projectRoot, "REQ-001"); await acceptTest(projectRoot, "REQ-001", "developer", "Fixture acceptance", "deployed");
   candidate = await verifyCandidate(projectRoot, "REQ-001");
   await assert.rejects(release(projectRoot, "REQ-001"), /expected release_approved/);
   assert.equal(submissions, 0);
@@ -2573,7 +2684,7 @@ test("release approval and execution reject candidate drift", async () => {
     await verify(projectRoot, "REQ-001");
     await approveChanges(projectRoot, "REQ-001", "reviewer", "Reviewed exact verified changes before testing.");
     await deployTest(projectRoot, "REQ-001");
-    await acceptTest(projectRoot, "REQ-001", "developer", "Manual smoke check passed.");
+    await acceptTest(projectRoot, "REQ-001", "developer", "Manual smoke check passed.", "deployed");
     const candidate = await verifyCandidate(projectRoot, "REQ-001");
     const source = path.join(candidate.candidateWorkspace, "src", "calculator.mjs");
     const verified = await fs.readFile(source, "utf8");
@@ -2600,7 +2711,7 @@ test("production command failure never reports a successful release", async () =
     await verify(projectRoot, "REQ-001");
     await approveChanges(projectRoot, "REQ-001", "reviewer", "Reviewed exact verified changes before testing.");
     await deployTest(projectRoot, "REQ-001");
-    await acceptTest(projectRoot, "REQ-001", "developer", "Checked multiplication and addition.");
+    await acceptTest(projectRoot, "REQ-001", "developer", "Checked multiplication and addition.", "deployed");
     await verifyCandidate(projectRoot, "REQ-001");
     await approveRelease(projectRoot, "REQ-001", "owner");
     await assert.rejects(release(projectRoot, "REQ-001"), /Local test deployment failed/);

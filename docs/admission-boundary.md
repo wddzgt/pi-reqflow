@@ -31,7 +31,6 @@
 | maxModelCalls | 36 | adaptive 为累计响应目标及每阶段分配上限；strict 为累计响应硬限额 |
 | maxTotalTokens | 200000 | adaptive 时为项目用量目标；strict 时为累计 token 硬限额 |
 | budgetMode | adaptive | 按复杂度估算并记录超出目标；strict 启用硬 token 门禁 |
-| maxModelMs | 1200000 | 累计研发 Pi 执行时间，含同会话内部检查；不含独立检查及等待人工时间 |
 | restrictedPaths | [] | 额外需人工主导的项目相对目录或文件 |
 
 ## 执行门禁
@@ -46,7 +45,7 @@
 
 编码结束后在同一 Pi 会话运行项目配置的检查。小需求允许最多两轮局部修复，标准需求三轮、有界复杂需求四轮；全部在同一批准范围内，不重新规划或创建工作区。失败后没有源码变更、达到修复次数、检查修改项目文件或检查自身出错即停止。独立的正式验证和实际差异审批仍必需。方案输出违反完整 schema 时最多在原会话纠正两次，不能省略风险或验收项。
 
-默认 adaptive 根据文件数、模块数和估算变更行数提供 3万/6万/12万 token 阶段目标；方案分析目标6万。请求需要更多额度时审计记录目标扩展，实际用量完整累计，超过 token 或累计响应目标不直接终止需求。strict 才按剩余累计 token 与响应次数拦截。每阶段仍受 `modelUsage.maxRequests`、累计执行时间、上下文、工具及权限门禁约束，用量未知停止；自动修复有次数限制，方案修订硬限制适用于 strict 及委托自动修订，adaptive 允许责任人显式继续收敛。初始化单独计量，失败与重试不重置用量。
+默认 adaptive 根据文件数、模块数和估算变更行数提供 3万/6万/12万 token 阶段目标；方案分析目标6万。请求需要更多额度时审计记录目标扩展，实际用量完整累计，超过 token 或累计响应目标不直接终止需求。strict 才按剩余累计 token 与响应次数拦截。只读阶段仍受 `modelUsage.maxRequests`、上下文、工具及权限门禁约束；所有阶段都限制单次模型请求时间，不设阶段或需求累计时间上限。用量未知时 strict 停止，adaptive 保留未知标记后允许继续；自动修复有次数限制，方案修订硬限制适用于 strict 及委托自动修订，adaptive 允许责任人显式继续收敛。初始化单独计量，失败与重试不重置用量。
 
 ### 负责人诊断后续执行
 
@@ -79,7 +78,7 @@ JSON 包含 `implementationGuidance` 和 `items`。每项包含 `findingId`（`�
   "maxFiles": 12, "maxAcceptance": 8, "maxBusinessModules": 2,
   "maxDeliveryUnits": 1, "maxEstimatedChangedLines": 1000,
   "maxChangedBytes": 250000, "maxPlanAttempts": 3, "maxModelCalls": 36,
-  "maxTotalTokens": 200000, "maxModelMs": 1200000,
+  "maxTotalTokens": 200000,
   "budgetMode": "adaptive",
   "restrictedPaths": ["src/auth", "database/schema.sql"]
 }

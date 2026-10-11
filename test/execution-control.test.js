@@ -65,7 +65,7 @@ test("real Pi pause closes the provider connection without another model request
     compatibleProviders: [{ name: "local-pause", baseUrl: `http://127.0.0.1:${provider.address().port}/v1`, apiKeyEnv: "PAUSE_PROVIDER_KEY",
       models: [{ id: "local", input: ["text"], contextWindow: 65536, maxTokens: 16384 }] }] };
   const running = controlledExecution(root, "implement", "dev", () => runPi({ config }, root, "implement", "Read the current project.",
-    path.join(root, "events.jsonl"), 1, null, [], { maxTokens: 100000, maxMs: 30000, approvedFiles: ["app.js"] }));
+    path.join(root, "events.jsonl"), 1, null, [], { maxTokens: 100000, approvedFiles: ["app.js"] }));
   const rejected = assert.rejects(running, error => error.code === "EXECUTION_PAUSED"
     && error.telemetry.requestTimings.some(request => request.status === "interrupted"));
   await dispatched; pauseExecution(root, "dev"); await rejected;

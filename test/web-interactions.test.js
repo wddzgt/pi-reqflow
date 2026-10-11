@@ -5,6 +5,7 @@ import vm from "node:vm";
 import { safeId } from "../src/files.js";
 
 const source = await readFile(new URL("../web/app.js", import.meta.url), "utf8");
+const environmentSource = await readFile(new URL("../web/environment.js", import.meta.url), "utf8");
 
 test("busy and refreshed executions have an enabled pause button and saved pauses offer continuation", () => {
   const { run } = workbench();
@@ -57,8 +58,11 @@ test("large-file review renders the actual changed context rather than omitting 
   assert.equal(run("root.children[0].children[2].children[2].className"), "diff-line unified added");
 });
 
-test("test-only archive marks publication unexecuted and archive completed", () => {
+test("test acceptance and archive complete the delivery track", () => {
   const { context, run } = workbench();
+  assert.equal(run("statusInfo('verified')[0]"), "待人工确认");
+  assert.equal(run("statusInfo('verified')[2]"), 5);
+  assert.equal(run("statusInfo('test_accepted')[2]"), 6);
   const track = source.slice(source.indexOf('const track = element("div", "stage-track")'),
     source.indexOf("panel.append(track);"));
   for (const stateName of ["archived_test_only", "archived"]) {
@@ -67,9 +71,8 @@ test("test-only archive marks publication unexecuted and archive completed", () 
       ${track} globalThis.stages=track.children; }`);
     assert.equal(context.stages[5].className, "stage complete");
     assert.equal(context.stages[5].children[0].textContent, "✓");
-    assert.equal(context.stages[4].className, stateName === "archived_test_only" ? "stage skipped" : "stage complete");
-    assert.equal(context.stages[4].children[1].textContent,
-      stateName === "archived_test_only" ? "发布观察（未执行）" : "发布观察");
+    assert.equal(context.stages[4].className, "stage complete");
+    assert.equal(context.stages[4].children[1].textContent, "人工验收");
   }
 });
 
@@ -176,9 +179,10 @@ function workbench() {
   const modal = node();
   modal.hidden = true;
   const context = vm.createContext({ setInterval, clearInterval, URL, document: {
-    createElement: node, querySelector: () => modal,
+    createElement: node, createTextNode: text => ({ ...node("#text"), textContent: text }), querySelector: () => modal,
   } });
   vm.runInContext(source.slice(0, source.indexOf('document.querySelectorAll("[data-nav], [data-filter]")')), context);
+  vm.runInContext(environmentSource, context);
   vm.runInContext(`
     state.principal = { id: "dev", roles: ["developer"] };
     state.actions = new Set(["develop", "plan", "approve-changes", "approve-release"]);
@@ -224,23 +228,10 @@ test("login still rejects revoked authentication instead of treating it as a wor
   assert.equal(run("refreshed"), false);
 });
 
-test("explicit time extension preserves the displayed audit version and does not execute the requirement", async () => {
+test("execution boundaries stop the workflow without offering time extensions", () => {
   const { run } = workbench();
-  run(`state.detail.auditHead='displayed-audit-head';
-    structuredModal=(title,description,build,submit)=>{globalThis.fields=build(document.createElement('form'));globalThis.submit=submit;};
-    globalThis.sent=[];sendAction=async(...args)=>sent.push(args);
-    openModal('extend-execution-budget');fields.minutes.value='30';fields.reason.value=' 已定位超时根因，继续当前需求 ';`);
-  assert.equal(run("fields.minutes.min"), 1); assert.equal(run("fields.minutes.max"), 60);
-  await run("submit(fields)");
-  assert.equal(run("sent.length"), 1);
-  assert.equal(run("sent[0][0]"), "extend-execution-budget");
-  assert.equal(run("sent[0][1].expectedAuditHead"), "displayed-audit-head");
-  assert.equal(run("sent[0][1].additionalModelMs"), 1800000);
-  assert.equal(run("sent[0][1].reason"), "已定位超时根因，继续当前需求");
-  run(`state.overview.project.admission.budgetMode='adaptive';
-    globalThis.meta={state:'contract_confirmed',executionBoundary:['Requirement execution budget exhausted; hand off to the responsible developer']};`);
-  assert.equal(run("nextStep(meta)[3][0][0]"), "extend-execution-budget");
-  run("meta.executionBoundary=['Unmeasured execution duration']");
+  run(`globalThis.meta={state:'contract_confirmed',executionBoundary:['Requirement execution budget exhausted; hand off to the responsible developer']};`);
+  assert.equal(run("nextStep(meta)[0]"), "自动执行已停止");
   assert.equal(run("nextStep(meta)[3].length"), 0);
 });
 
@@ -607,8 +598,8 @@ test("development entry respects assignment and retains manual review boundaries
   assert.equal(run("canUseAction(meta, 'develop')"), false);
   run("meta.assignments.developer.status = 'accepted'; state.principal.id = 'other'");
   assert.equal(run("canUseAction(meta, 'develop')"), false);
-  assert.equal(run("nextStep({ state: 'verified' })[3][0][0]"), "local-validation");
-  assert.equal(run("nextStep({ state: 'merge_verified' })[3][0][0]"), "approve-release");
+  assert.equal(run("nextStep({ state: 'verified' })[3][0][0]"), "accept-test");
+  assert.equal(run("nextStep({ state: 'merge_verified' })[3][0][0]"), "archive-test-only");
   assert.equal(run("nextStep({ state: 'plan_review', admission: { status: 'out_of_scope' } })[3].some(a => a[0] === 'develop' || a[0] === 'approve-plan')"), false);
 });
 
@@ -633,20 +624,40 @@ test("failed plan generation shows its retained cause and clears after a new pla
 test("validation choice uses project mode without assuming a particular CI provider", () => {
   const { run } = workbench();
   run("state.overview.project.testDeployment = 'company-ci'; state.overview.project.deploymentRequiresPublishedRevision = true");
-  assert.equal(run("nextStep({ state: 'verified' })[3][0][0]"), "local-validation");
+  assert.equal(run("nextStep({ state: 'verified' })[3][0][0]"), "accept-test");
   run("state.overview.project.mode = 'git'");
-  assert.equal(run("nextStep({ state: 'verified' })[3][1][0]"), "publish-test");
+  assert.equal(run("nextStep({ state: 'verified' })[3][2][0]"), "publish-test");
   assert.equal(run("nextStep({ state: 'test_deploy_running' })[1].includes('Jenkins')"), false);
 });
 
-test("verified local environment exposes acceptance without requiring a CI deployment", () => {
+test("manual archive remains available without an environment and with stale or blocked local validation", () => {
   const { run } = workbench();
   run(`state.overview={project:{mode:'local',executionReady:false}};
     state.detail={meta:{state:'verified',afterHash:'verified-hash',localValidation:{
       status:'running',afterHash:'verified-hash',environment:{url:'http://localhost:4180',instructions:''}}}};`);
   assert.equal(run("nextStep(state.detail.meta)[3].some(row=>row[0]==='accept-test')"), true);
   run("state.detail.meta.localValidation.afterHash='old-hash'");
-  assert.equal(run("nextStep(state.detail.meta)[3].some(row=>row[0]==='accept-test')"), false);
+  assert.equal(run("nextStep(state.detail.meta)[3].some(row=>row[0]==='accept-test')"), true);
+  run("state.detail.meta.localValidation.status='blocked';state.overview.project.localEnvironment={status:'blocked'}");
+  assert.equal(run("nextStep(state.detail.meta)[3][0][0]"), "accept-test");
+  assert.match(run("nextStep(state.detail.meta)[1]"), /不配置环境也可归档/);
+  run("delete state.detail.meta.localValidation");
+  assert.equal(run("nextStep(state.detail.meta)[3][0][0]"), "accept-test");
+});
+
+test("manual archive dialog submits the displayed version and explicit acceptance method", async () => {
+  const { context, modal, run } = workbench();
+  run(`state.detail.meta={state:'verified',planHash:'shown-plan',afterHash:'shown-code',verificationMode:'automated'};
+    globalThis.sent=[];sendAction=async(...args)=>sent.push(args);openModal('accept-test');`);
+  const card = modal.children[0];
+  assert.equal(card.children[0].textContent, "人工确认并归档");
+  card.children.find(node => node.tagName === "TEXTAREA").value = "已核对需求、代码和相关测试结果，确认交付。";
+  run("state.detail.meta.afterHash='new-code'");
+  await card.children.at(-1).children[1].listeners.click();
+  assert.equal(context.sent[0][0], "accept-test");
+  assert.equal(context.sent[0][1].acceptanceMode, "manual");
+  assert.equal(context.sent[0][1].expectedAfterHash, "shown-code");
+  assert.equal(context.sent[0][1].expectedPlanHash, "shown-plan");
 });
 
 test("Git delivery offers optional local verification and explicit commit authorization", async () => {
@@ -654,8 +665,9 @@ test("Git delivery offers optional local verification and explicit commit author
   run(`state.overview.project.mode = "git"; state.overview.project.gitDelivery = {testMode:"merge",testBranch:"integration"};
     state.detail = {meta:{state:"verified",branch:"devsail/REQ-1",afterHash:"reviewed-hash",planHash:"plan-hash",checks:[{code:0}]},changes:{changes:[]}};
     api = async () => ({testMode:"merge",testBranch:"integration"}); globalThis.sent=[]; sendAction=async(...args)=>sent.push(args);`);
-  assert.equal(run("nextStep(state.detail.meta)[3][0][0]"), "local-validation");
-  assert.equal(run("nextStep(state.detail.meta)[3][1][0]"), "publish-test");
+  assert.equal(run("nextStep(state.detail.meta)[3][0][0]"), "accept-test");
+  assert.equal(run("nextStep(state.detail.meta)[3][1][0]"), "local-validation");
+  assert.equal(run("nextStep(state.detail.meta)[3][2][0]"), "publish-test");
   await run("openGitDelivery('publish-test')");
   assert.equal(context.sent.length, 0);
   await modal.children[0].listeners.submit({ preventDefault() {} });
@@ -752,7 +764,7 @@ test("missing fixed environment or checks keeps developer preparation available"
   run("state.overview.project.executionReady = false; state.overview.project.checksConfigured = false");
   assert.equal(run("nextStep({state:'contract_confirmed',assignments:{developer:{status:'accepted'}}})[3][0][0]"), "plan");
   assert.equal(run("nextStep({state:'plan_review',admission:{status:'eligible'},planAttempts:1,planBlockers:[]})[3].some(a=>a[0]==='approve-plan')"), true);
-  assert.equal(run("nextStep({state:'verified'})[3][0][0]"), "local-validation");
+  assert.equal(run("nextStep({state:'verified'})[3][0][0]"), "accept-test");
   assert.equal(run("nextStep({state:'verified'})[3].some(a=>a[0]==='deploy-test')"), false);
   assert.equal(run("nextStep({state:'intake_ready'})[3][0][0]"), "confirm-contract");
 });
@@ -834,8 +846,8 @@ test("project settings keeps fixed environment optional and saves automatic chec
     checksEnvironment:[],deploymentEnvironment:[],timeoutMs:30000});
     structuredModal=(title,description,build,submit)=>{globalThis.title=title;globalThis.fields=build(document.createElement('form'));globalThis.submit=submit;};
     globalThis.requests=[];refresh=async()=>{};`);
-  await run("openProjectSettings()");
-  assert.equal(context.title, "项目设置");
+  await run("openTestEnvironmentSettings()");
+  assert.equal(context.title, "测试环境配置");
   assert.equal(run("fields.kind.value"), "unconfigured");
   assert.equal(run("fields.url.parentElement.hidden"), true);
   assert.equal(run("fields.url.required"), false);
@@ -856,7 +868,7 @@ test("Git project settings preserves delivery rules without a fixed deployment e
     {kind:'unconfigured',mode:'git',configHash:'shown-config',checksText:'npm test',url:'',
      gitDelivery:{testMode:'merge',testBranch:'integration'},checksEnvironment:[],deploymentEnvironment:[],timeoutMs:30000};
     structuredModal=(title,description,build)=>{globalThis.fields=build(document.createElement('form'));};`);
-  await run("openProjectSettings()");
+  await run("openTestEnvironmentSettings()");
   assert.equal(run("fields.testMode.value"), "merge");
   assert.notEqual(run("fields.testMode.parentElement.parentElement.hidden"), true);
   assert.equal(run("fields.testBranch.value"), "integration");
@@ -869,7 +881,8 @@ test("local validation opens automatically started services without an editable 
   const { context, run } = workbench();
   run(`state.detail.meta={state:'verified',afterHash:'shown-code',planHash:'shown-plan'};
     globalThis.form=document.createElement('form');
-    api=async(url,options)=>{globalThis.started=JSON.parse(options.body);return {workspace:'/isolated/work',patch:null,status:'running',
+    api=async(url,options)=>{if(url.startsWith('/api/local-environment-scan'))return {setup:{settings:null}};
+      globalThis.started=JSON.parse(options.body);return {workspace:'/isolated/work',patch:null,status:'running',
       services:[{name:'前端',url:'http://127.0.0.1:9000/',tail:'Ready'}]};};
     structuredModal=(title,description,build,submit)=>{globalThis.fields=build(form);globalThis.submit=submit;};
     globalThis.sent=[];sendAction=async(action,input,returnResult)=>{
@@ -886,6 +899,55 @@ test("local validation opens automatically started services without an editable 
   assert.equal(context.sent[0][1].operation, "stop");
   assert.equal(context.sent[0][1].expectedAfterHash, "shown-code");
   assert.equal(context.sent.length, 1);
+});
+
+test("database startup effects require confirmation tied to the displayed environment revision", async () => {
+  const { run } = workbench();
+  run(`state.detail.meta={state:'verified',afterHash:'code',planHash:'plan'};
+    api=async()=>({setup:{revision:'environment-revision',version:2,settings:{scan:{},target:'all'}},
+      scan:{services:[{id:'app:backend',kind:'application',effects:['启动会更新数据库']} ]}});
+    globalThis.form=document.createElement('form');globalThis.sent=[];
+    structuredModal=(title,description,build,submit)=>{globalThis.fields=build(form);globalThis.submit=submit;};
+    sendAction=async(action,input)=>{sent.push(input);return null;};`);
+  await run("openGitDelivery('local-validation')");
+  assert.equal(run("sent.length"), 0);
+  await assert.rejects(run("submit(fields)"), /重新确认/);
+  await run("fields.consent.checked=true;submit(fields)");
+  assert.equal(run("sent[0].confirmStartupEffects"), true);
+  assert.equal(run("sent[0].expectedEnvironmentRevision"), "environment-revision");
+});
+
+test("service forms preserve drafts across target changes and require confirming rescan differences", async () => {
+  const { run } = workbench();
+  run(`state.environmentRequest=1;globalThis.root=document.createElement('div');
+    globalThis.allNodes=node=>[node,...node.children.flatMap(allNodes)];
+    globalThis.apps=[{id:'app:frontend',name:'前端',kind:'application',role:'frontend',requirement:'required',effects:[],evidence:[],
+      fields:[{key:'HOST',label:'地址',type:'input',secret:false,requirement:'required'}]},
+      {id:'app:backend',name:'后端',kind:'application',role:'backend',requirement:'required',effects:[],evidence:[],
+      fields:[{key:'TOKEN',label:'密码',type:'password',secret:true,requirement:'required'}]}];
+    globalThis.setup={revision:'saved',version:1,values:{'app:frontend/HOST':'old.local'},secretConfigured:{'app:backend/TOKEN':true},
+      settings:{target:'all',decisions:{},scan:{hash:'old',services:apps}}};
+    globalThis.scan={hash:'old',services:apps,pipelines:[],warnings:[],scannedAt:'2026-10-11T00:00:00Z'};
+    globalThis.posts=[];refresh=async()=>{};
+    api=async(url,options)=>{if(options){posts.push(JSON.parse(options.body));return {};}
+      return {setup,scan,scanTaskId:null,sources:[{id:'',name:'项目源码'}],diff:{added:['新增配置'],removed:[],changed:['前端']}};};`);
+  await run("renderScannedEnvironment(root,'demo',1)");
+  assert.equal(run("allNodes(root).find(node=>node.type==='password').value"), "");
+  assert.equal(run("allNodes(root).find(node=>node.type==='password').placeholder"), "已配置，留空保持");
+  run(`allNodes(root).find(node=>node.type==='text').value='draft.local';
+    globalThis.target=allNodes(root).find(node=>node.tagName==='SELECT'&&node.children.some(option=>option.value==='frontend'));
+    target.value='frontend';target.listeners.change();`);
+  assert.equal(run("allNodes(root).find(node=>node.type==='text').value"), "draft.local");
+  run("scan={...scan,hash:'new'}");
+  await run("allNodes(root).find(node=>node.textContent==='重新扫描').listeners.click()");
+  await run("root.children[0].onsubmit({preventDefault(){}})");
+  assert.equal(run("posts.length"), 0); assert.match(run("messages.at(-1)"), /确认扫描差异/);
+  run("allNodes(root).find(node=>node.type==='checkbox').checked=true");
+  await run("root.children[0].onsubmit({preventDefault(){}})");
+  assert.equal(run("posts[0].target"), "frontend");
+  assert.equal(run("posts[0].values['app:frontend/HOST']"), "draft.local");
+  assert.equal(run("posts[0].values['app:backend/TOKEN']"), "");
+  assert.equal(run("posts[0].expectedRevision"), "saved"); assert.equal(run("posts[0].acceptScanChanges"), true);
 });
 
 test("root import submits the whole project rather than assigning it to one frontend folder", async () => {

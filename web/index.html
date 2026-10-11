@@ -7,6 +7,7 @@
   <title>pi-reqflow · 需求交付工作台</title>
   <link rel="stylesheet" href="/styles.css">
   <script src="/mermaid.js" defer></script>
+  <script src="/environment.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -19,6 +20,7 @@
         <button class="nav-item" type="button" data-nav="review"><span class="nav-icon">◇</span>待我审核<span class="nav-count" id="navReview">0</span></button>
         <button class="nav-item" type="button" data-nav="active"><span class="nav-icon">↗</span>进行中</button>
         <button class="nav-item" type="button" data-nav="done"><span class="nav-icon">✓</span>已归档</button>
+        <button class="nav-item" type="button" id="environmentNavButton"><span class="nav-icon">⚙</span>环境配置</button>
         <button class="nav-item" type="button" id="adminNavButton" hidden><span class="nav-icon">⚙</span>用户管理</button>
       </nav>
       <div class="sidebar-bottom">
@@ -40,7 +42,6 @@
           <span class="mode-pill" id="projectMode">LOCAL</span>
           <span class="actor-field"><span>当前用户</span><strong id="identityName">未登录</strong></span>
           <button id="projectRefButton" class="button" type="button" hidden>项目文档</button>
-          <button id="projectSettingsButton" class="button" type="button" hidden>项目设置</button>
           <button id="modelSettingsButton" class="button" type="button" hidden>模型设置</button>
           <button id="adminReportButton" class="button" type="button" hidden>审计报告</button>
           <button id="refreshButton" class="icon-button" type="button" aria-label="刷新数据" title="刷新数据">↻</button>
@@ -49,6 +50,8 @@
         </div>
       </header>
       <div class="page-content">
+        <section id="environmentPage" hidden aria-label="项目环境配置"></section>
+        <div id="requirementPage">
         <section class="page-heading">
           <div><p class="eyebrow">REQUIREMENT DELIVERY</p><h1>需求工作台<span class="heading-dot">.</span></h1><p class="page-subtitle">每一步都有依据，每次修改都能回看。</p></div>
           <div class="today-block"><span>当前项目</span><strong id="projectName">—</strong><small id="projectPath">—</small></div>
@@ -76,6 +79,7 @@
           <div id="detailPanel" class="detail-panel"><div class="empty-state"><span class="empty-icon">◇</span><h2>选择一条需求</h2><p>查看方案、验证记录与完整进度。</p></div></div>
         </section>
         <footer class="page-footer">pi-reqflow · 从明确需求到可验证交付</footer>
+        </div>
       </div>
     </main>
   </div>

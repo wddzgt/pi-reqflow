@@ -434,3 +434,41 @@ label .optional { font-weight: 400; color: #a0aec0; font-size: 11px; }
 .model-capability { display: flex; align-items: center; gap: 10px; margin: 12px 0; }
 .model-capability input { width: auto; flex: 0 0 auto; }
 .model-custom[hidden] { display: none; }
+/* Project environment configuration is shared by every requirement. */
+.environment-grid { display: grid; grid-template-columns: minmax(0, 2.3fr) minmax(260px, 1fr); align-items: start; gap: 24px; margin: 24px 0; }
+.environment-card { background: white; border: 1px solid #e4e7ef; border-radius: 16px; padding: 24px; }
+.environment-card h2 { margin-top: 0; }
+.environment-card .button { margin: 8px 12px 0 0; }
+.environment-card .plain-copy, #environmentPage > .plain-copy { background: none; border: 0; padding: 0; margin: 10px 0; }
+.environment-card .status-chip { background: #edf0ff; color: #6573d8; }
+.environment-editor { border-top: 1px solid #edf0f4; margin-top: 20px; padding-top: 10px; }
+.environment-blocked { color: #b44351; overflow-wrap: anywhere; }
+.environment-toolbar { display: grid; grid-template-columns: 1fr 1fr auto; align-items: end; gap: 14px; }
+.environment-toolbar .button { margin-bottom: 13px; white-space: nowrap; }
+.environment-service-list { display: grid; gap: 16px; margin: 20px 0; }
+.environment-service { border: 1px solid #e4e7ef; border-radius: 12px; padding: 18px; background: #fcfdff; }
+.environment-service-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.environment-service-heading h3 { margin: 0; color: #26344c; font-size: 15px; }
+.environment-necessity { padding: 4px 9px; border-radius: 20px; font-size: 11px; white-space: nowrap; }
+.environment-necessity.required { color: #5355b7; background: #eeeeff; }
+.environment-necessity.optional { color: #567261; background: #edf6ef; }
+.environment-necessity.unknown { color: #97652c; background: #fff3df; }
+.environment-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
+.environment-fields[hidden] { display: none; }
+.environment-field { min-width: 0; }
+.environment-reference { background: none; border: 0; padding: 0; color: #6868bf; text-align: left; font-size: 11px; cursor: pointer; overflow-wrap: anywhere; }
+.environment-evidence { color: #8a94a7; margin: 8px 0 12px; font-size: 11px; }
+.environment-evidence summary, .environment-optional summary, .environment-advanced summary { cursor: pointer; }
+.environment-source { overflow-wrap: anywhere; margin: 5px 0; font-size: 11px; }
+.environment-effect { background: #fff5e7; border-radius: 8px; padding: 10px 12px; color: #91662e; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.environment-optional, .environment-advanced { padding: 12px 0; color: #6b7689; font-size: 12px; }
+.environment-diff { background: #f2f2ff; border: 1px solid #deddfb; border-radius: 10px; padding: 16px; }
+.environment-diff h3 { margin: 0; font-size: 14px; }
+.environment-confirm { display: flex; gap: 8px; align-items: center; font-size: 12px; color: #56637a; }
+.environment-confirm input { width: auto; }
+.environment-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+@media (max-width: 1100px) { .environment-grid { grid-template-columns: 1fr; } }
+@media (max-width: 650px) { .environment-fields, .environment-toolbar { grid-template-columns: 1fr; } }
+.environment-summary { border: 1px solid #e4e7ef; border-radius: 12px; padding: 16px; margin: 18px 0; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; }
+.environment-summary p { flex-basis: 100%; margin: 0; }
+@media (max-width: 900px) { .environment-grid { grid-template-columns: 1fr; } }

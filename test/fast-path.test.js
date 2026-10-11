@@ -117,7 +117,8 @@ test("fast path verifies a comment-only change with existing unchanged regressio
   assert.deepEqual(task.events.find(event => event.type === "implemented").detail.changes.map(row => row.file), ["src/calculator.mjs"]);
   assert.equal(task.events.filter((event) => event.type === "role_review_submitted").length, 0);
   await assert.rejects(executeRequirementAction(root, "REQ-FAST", { action: "accept-test",
-    evidence: "未设置本地验证环境" }, reviewer), /本地测试设置/);
+    acceptanceMode: "local", expectedAfterHash: task.meta.afterHash, expectedPlanHash: task.meta.planHash,
+    evidence: "未设置本地验证环境" }, reviewer), /本地验证/);
 });
 
 test("historical behavior changes leave the fast path for responsible human review", async (t) => {
@@ -168,6 +169,7 @@ test("directory projects without a fixed environment can develop and request loc
   assert.equal(current.events.at(-1).type, "local_validation_requested");
   assert.equal(current.events.at(-1).detail.actor, "reviewer");
   const archived = await executeRequirementAction(root, "REQ-FAST", { action: "accept-test",
+    acceptanceMode: "local", expectedAfterHash: current.meta.afterHash, expectedPlanHash: current.meta.planHash,
     evidence: "已查看代码差异，本地验证乘法与原加法结果正确。" }, reviewer);
   assert.equal(archived.state, "archived_test_only");
   assert.equal(archived.acceptanceMode, "local");
@@ -184,4 +186,10 @@ test("no automated checks leaves manual acceptance pending without blocking impl
   assert.equal(task.meta.state, "verified");
   assert.equal(task.meta.verificationMode, "manual_pending");
   assert.deepEqual(task.meta.checks, []);
+  const archived = await executeRequirementAction(root, "REQ-FAST", { action: "accept-test", acceptanceMode: "manual",
+    expectedAfterHash: task.meta.afterHash, expectedPlanHash: task.meta.planHash,
+    evidence: "已人工核对乘法实现与原加法，没有执行自动测试，确认交付。" }, reviewer);
+  assert.equal(archived.state, "archived_test_only"); assert.equal(archived.verificationMode, "manual_pending");
+  assert.equal(archived.acceptanceMode, "manual"); assert.equal(archived.localValidation, undefined);
+  assert.match(await fs.readFile(path.join(task.directory, "result.md"), "utf8"), /不代表自动测试通过/);
 });

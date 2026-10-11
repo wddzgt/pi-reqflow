@@ -36,7 +36,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   const result = await runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } },
     directory, phase, `Current requirement: ${JSON.stringify(contract)}`, path.join(directory, "events.jsonl"), 1, phase === "review" ? "qa" : null, [],
-    { maxTokens: 1000, maxMs: 3000, authoritativeContext: { contract, currentState: "exact_current_state" } });
+    { maxTokens: 1000, authoritativeContext: { contract, currentState: "exact_current_state" } });
   assert.equal(result.text, "done");
   const events = (await fs.readFile(path.join(directory, "events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
   assert.ok(events.some(event => event.entry?.customType === "reqflow_context_prepared" && event.entry.data.inlineFields.includes("contract")));
@@ -46,32 +46,33 @@ import { runPi } from "../src/pi-runner.js";
 import { validateConfig } from "../src/config.js";
 import { admissionDefaults, modelAllowance } from "../src/admission.js";
 
-test("adaptive requests have separate timeouts and retain a cumulative stage deadline", async t => {
+test("each model request has its own timeout without a cumulative phase deadline", async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-request-timeout-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const executable = path.join(directory, "pi.mjs");
   await fs.writeFile(executable, `const slow=process.argv.at(-1)==='slow';
 for(let request=1;request<=2;request++){
- console.log(JSON.stringify({type:'entry_appended',entry:{customType:'reqflow_request_budget',data:{
-  provider:'fake',model:'fake',estimationMethod:'wire_bytes',request,inputReserve:1,contextBytes:1,remainingTokens:100,tokensUsed:request-1}}}));
+  const native=process.env.REQFLOW_PHASE==='implement';
+  console.log(JSON.stringify({type:'entry_appended',entry:{customType:native?'reqflow_provider_request':'reqflow_request_budget',data:{
+   ...(native?{executionMode:'native'}:{estimationMethod:'wire_bytes',inputReserve:1,remainingTokens:100,tokensUsed:request-1}),
+   provider:'fake',model:'fake',request,contextBytes:1}}}));
  await new Promise(resolve=>setTimeout(resolve,slow?600:250));
  console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'done'}],
   stopReason:request===2?'stop':'toolUse',usage:{input:1,output:1,cacheRead:0,cacheWrite:0,cost:{total:0}}}}));
-}console.log(JSON.stringify({type:'agent_settled'}));`);
+ if(request===1&&!slow)await new Promise(resolve=>setTimeout(resolve,500));
+ }console.log(JSON.stringify({type:'agent_settled'}));`);
   const project = { config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 400, maxToolCalls: 10, maxEventBytes: 10000 } };
-  const allowance = { maxTokens: 100, maxMs: 1600, budget: { mode: "adaptive" } };
-  const result = await runPi(project, directory, "plan", "normal", path.join(directory, "adaptive.log"), 1, null, [], allowance);
-  assert.ok(result.telemetry.durationMs > 400);
-  assert.equal(result.telemetry.requestTimings.length, 2);
-  assert.equal(result.telemetry.unmeasuredRequests, 0);
-  assert.equal(result.telemetry.timeouts.stageMs, 1600);
-  for (const [name, prompt, limit, scope] of [
-    ["strict", "normal", { ...allowance, budget: { mode: "strict" } }, "stage"],
-    ["slow", "slow", allowance, "request"], ["remaining", "normal", { ...allowance, maxMs: 450 }, "stage"]]) {
-    await assert.rejects(runPi(project, directory, "plan", prompt, path.join(directory, name + ".log"), 1, null, [], limit), error => {
+  for (const phase of ["plan", "implement"]) for (const mode of ["adaptive", "strict"]) {
+    const allowance = { maxTokens: 100, budget: { mode } };
+    const result = await runPi(project, directory, phase, "normal", path.join(directory, phase + "-" + mode + ".log"), 1, null, [], allowance);
+    assert.ok(result.telemetry.durationMs > project.config.maxPiMs);
+    assert.equal(result.telemetry.requestTimings.length, 2);
+    assert.equal(result.telemetry.unmeasuredRequests, 0);
+    assert.deepEqual(result.telemetry.timeouts, { requestMs: 400, mode: "per_request" });
+    await assert.rejects(runPi(project, directory, phase, "slow", path.join(directory, phase + "-" + mode + "-slow.log"), 1, null, [], allowance), error => {
       assert.equal(error.code, "PI_TIMEOUT");
-      assert.equal(error.timeoutScope, scope);
+      assert.equal(error.timeoutScope, "request");
       assert.equal(error.telemetry.unmeasuredRequests, 1);
       const events = [{ type: "plan_attempt_failed", detail: { telemetry: error.telemetry } }];
       assert.throws(() => modelAllowance(events, { ...admissionDefaults, budgetMode: "strict" }), /unmeasured/);
@@ -79,6 +80,24 @@ for(let request=1;request<=2;request++){
       return true;
     });
   }
+});
+
+test("native compaction keeps an independent timeout after a completed response", async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-compaction-timeout-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const executable = path.join(directory, "pi.mjs");
+  await fs.writeFile(executable, `console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[],stopReason:'toolUse',
+    usage:{input:1,output:1,cacheRead:0,cacheWrite:0,cost:{total:0}}}}));
+    console.log(JSON.stringify({type:'entry_appended',entry:{customType:'reqflow_compaction_started',data:{requests:1}}}));
+    setInterval(()=>{},1000);`);
+  const project = { config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
+    environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 400, maxToolCalls: 10, maxEventBytes: 10000 } };
+  await assert.rejects(runPi(project, directory, "implement", "compact", path.join(directory, "events.jsonl"), 1), error => {
+    assert.equal(error.code, "PI_TIMEOUT");
+    assert.equal(error.telemetry.unmeasuredRequests, 1);
+    assert.deepEqual(error.telemetry.timeouts, { requestMs: 400, mode: "per_request" });
+    return true;
+  });
 });
 
 test("model usage defaults are explicit and invalid policies are rejected", async () => {
@@ -160,7 +179,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   assert.equal(changed.telemetry.sourceEvidence.invalidated[0].reason, "source changed");
   assert.equal(changed.telemetry.sourceEvidence.reused.length, 0);
   const complete = await runPi(project, directory, "implement", "use approved files", path.join(directory, "complete.jsonl"), 1,
-    null, [], { maxTokens: 100, maxMs: 3000, approvedFiles: ["source.py"] });
+    null, [], { maxTokens: 100, approvedFiles: ["source.py"] });
   assert.equal(complete.telemetry.sourceEvidence.completeFiles.length, 1);
   const fullPrompt = await fs.readFile(path.join(directory, "actual-prompt.txt"), "utf8");
   assert.match(fullPrompt, /source\.py sha256=.*\(complete file\)/);
@@ -187,7 +206,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } };
   for (const [file, expected] of [["small.py", 1], ["large.py", 1], ["new.py", 1], ["tests.py", 1]]) {
     const result = await runPi(project, directory, "implement", "approved change", path.join(directory, `${file}.jsonl`), 1, null, [],
-      { maxTokens: 100, maxMs: 3000, approvedFiles: [file], researchRequests: 1,
+      { maxTokens: 100, approvedFiles: [file], researchRequests: 1,
         sourceQuery: file === "tests.py" ? "Modify list_datasets_cmd; add regression coverage" : "Modify existing" });
     const args = JSON.parse(await fs.readFile(path.join(directory, "arguments.json"), "utf8"));
     assert.equal(args.policy.implementationResearchRequests, expected);
@@ -231,7 +250,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   assert.equal(second.telemetry.sourceEvidence.reused.length, 0);
   assert.equal(second.telemetry.sourceEvidence.indexed.length, 1);
   const focused = await runPi(project, directory, "review", "check app", path.join(b, "focused.jsonl"), 1, "backend", [],
-    { maxTokens: 100, maxMs: 3000, contextFiles: ["app.js"] });
+    { maxTokens: 100, contextFiles: ["app.js"] });
   assert.deepEqual(focused.telemetry.sourceEvidence.reusedFiles, ["app.js"]);
   await fs.appendFile(path.join(archive, "source-evidence", first.telemetry.sourceEvidence.captured[0]), " ");
   await assert.rejects(runPi(project, directory, "plan", "prompt", path.join(b, "tampered.jsonl"), 1), /integrity failed/);
@@ -255,7 +274,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } };
   await runPi(project, directory, "plan", "find functions", path.join(directory, "plan.jsonl"), 1);
   const result = await runPi(project, directory, "review", "review target", path.join(directory, "review.jsonl"), 1, "qa", [],
-    { maxTokens: 100, maxMs: 3000, contextFiles: ["cli.py"], sourceQuery: "cli.py:101" });
+    { maxTokens: 100, contextFiles: ["cli.py"], sourceQuery: "cli.py:101" });
   const prompt = await fs.readFile(path.join(directory, "actual-prompt.txt"), "utf8");
   assert.match(prompt, /101: def target/);
   assert.ok(!prompt.includes("def unrelated"));
@@ -275,7 +294,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   const project = { config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local", environment: { pi: [] },
     allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } };
   const result = await runPi(project, directory, "implement", "Keep original acceptance", path.join(directory, "events.jsonl"), 1, null, [],
-    { maxTokens: 100, maxMs: 3000, approvedFiles: ["tests.py"], researchRequests: 0,
+    { maxTokens: 100, approvedFiles: ["tests.py"], researchRequests: 0,
       sourceQuery: "Repair test_output_fields using the actual output" });
   const prompt = await fs.readFile(path.join(directory, "prompt.txt"), "utf8");
   assert.match(prompt, /501: def test_output_fields/);
@@ -283,11 +302,11 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   assert.ok(Buffer.byteLength(prompt) < 1500);
   assert.equal(result.telemetry.sourceEvidence.focusedFiles.length, 1);
   await assert.rejects(runPi(project, directory, "implement", "repair", path.join(directory, "missing-context.jsonl"), 1, null, [],
-    { maxTokens: 100, maxMs: 3000, approvedFiles: ["tests.py"], researchRequests: 0 }), /requires verified source context/);
+    { maxTokens: 100, approvedFiles: ["tests.py"], researchRequests: 0 }), /requires verified source context/);
   assert.equal(result.telemetry.sourceEvidence.completeFiles.length, 0);
   assert.ok(result.telemetry.sourceEvidence.selectedBytes < 12000);
   await assert.rejects(runPi(project, directory, "review", "prompt", path.join(directory, "bad.jsonl"), 1, null, [],
-    { maxTokens: 100, maxMs: 3000, contextFiles: ["../tests.py"] }), /Context files/);
+    { maxTokens: 100, contextFiles: ["../tests.py"] }), /Context files/);
 });
 
 test("diagnosed file and line references work for large files without Python or JavaScript symbols", async t => {
@@ -303,7 +322,7 @@ console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content
 console.log(JSON.stringify({type:'agent_settled'}));`);
   const project = { config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local", environment: { pi: [] },
     allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } };
-  const limit = { maxTokens: 100, maxMs: 3000, approvedFiles: ["Service.java"], researchRequests: 0, sourceQuery: "Repair Service.java:501" };
+  const limit = { maxTokens: 100, approvedFiles: ["Service.java"], researchRequests: 0, sourceQuery: "Repair Service.java:501" };
   const result = await runPi(project, directory, "implement", "repair", path.join(directory, "events.jsonl"), 1, null, [], limit);
   assert.equal(result.telemetry.sourceEvidence.focusedFiles.length, 1);
   assert.ok(result.telemetry.sourceEvidence.selectedBytes < 12000);
@@ -517,7 +536,7 @@ await before({payload:{messages:[]}},{});throw new Error('A second request must 
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000,
     modelFallbacks: [{ provider: "fake", model: "other" }] } },
     directory, "plan", "prompt", path.join(directory, "events.jsonl"), 1, null, [],
-    { maxTokens: 100, maxMs: 3000, maxRequests: 1 }), /remaining requirement provider request limit reached/);
+    { maxTokens: 100, maxRequests: 1 }), /remaining requirement provider request limit reached/);
 });
 
 test("a guard rejection before the first dispatch records zero usage, not unknown provider spend", async t => {
@@ -531,7 +550,7 @@ await handlers.get('before_provider_request')({payload:{messages:[{role:'user',c
   await assert.rejects(runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } },
     directory, "plan", "prompt", path.join(directory, "events.jsonl"), 1, null, [],
-    { maxTokens: 100, maxMs: 3000 }), error => {
+    { maxTokens: 100 }), error => {
     assert.match(error.message, /remaining tokens cannot fund request context/);
     assert.equal(error.telemetry.assistantMessages, 0);
     assert.equal(error.telemetry.requestRejectedBeforeDispatch, true);
@@ -556,7 +575,7 @@ throw new Error('Unaffordable request reached provider');`);
   await assert.rejects(runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } },
     directory, "plan", "prompt", path.join(directory, "events.jsonl"), 1, null, [],
-    { maxTokens: 1000, maxMs: 3000 }), /remaining tokens cannot fund request context/);
+    { maxTokens: 1000 }), /remaining tokens cannot fund request context/);
 });
 
 test("native coding delegates input and output capacity to Pi rather than advisory byte estimates", async t => {
@@ -571,7 +590,7 @@ console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content
 console.log(JSON.stringify({type:'agent_settled'}));`);
   const result = await runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } },
-    directory, "implement", "prompt", path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 1000, maxMs: 3000 });
+    directory, "implement", "prompt", path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 1000 });
   assert.equal(result.telemetry.executionMode, "native");
   assert.deepEqual(result.telemetry.tokens, { input: 10, output: 1, cacheRead: 0, cacheWrite: 0 });
 });
@@ -599,7 +618,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   const result = await runPi({ config: { piExecutable: executable, provider: "fake", model: "model", mode: "local",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000,
     modelUsage: { maxRequests: 5, readOnlyMaxRequests: 5 } } },
-    directory, "plan", "plan", path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 1000, maxMs: 3000, maxRequests: 5 });
+    directory, "plan", "plan", path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 1000, maxRequests: 5 });
   assert.deepEqual(result.telemetry.requestEstimates.map(row => row.estimationMethod), ["wire_bytes", "measured_prefix", "wire_bytes", "wire_bytes", "wire_bytes"]);
   assert.equal(result.telemetry.requestEstimates[1].tokensUsed, 220);
 });
@@ -633,7 +652,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   const result = await runPi({ config: { piExecutable: executable, provider: "fake", model: "model", mode: "local",
     structuredOutput: true, environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000,
     maxToolCalls: 10, maxEventBytes: 10000, modelUsage: { maxRequests: 3, readOnlyMaxRequests: 3, maxContextBytes: 7000 } } },
-    directory, "plan", "JSON", path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 24000, maxMs: 3000,
+    directory, "plan", "JSON", path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 24000,
       budget: { mode: "adaptive", complexity: "planning" }, outputSchema: { name: "frozen", strict: true,
         schema: { type: "object", properties: { AC1: { type: "string", description: "Existing behavior must remain" } }, required: ["AC1"] } } });
   assert.deepEqual(result.telemetry.requestEstimates.map(row => row.estimationMethod), ["wire_bytes", "measured_prefix", "measured_prefix"]);
@@ -683,7 +702,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   const result = await runPi({ config: { piExecutable: executable, provider: "fake", model: "model", mode: "local",
     structuredOutput: true, environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [],
     maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 20000 } }, directory, "plan", "prompt",
-  path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 10000, maxMs: 3000, authoritativeContext: { contract: "frozen-business" } });
+  path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 10000, authoritativeContext: { contract: "frozen-business" } });
   assert.equal(result.telemetry.requestEstimates[0].tokensUsed, 165);
   assert.equal(result.telemetry.tokens.input, 250);
   assert.equal(result.telemetry.compactions.length, 1);
@@ -717,7 +736,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   await runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local", environment: { pi: [] },
     allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } },
     directory, "implement", "prompt", path.join(directory, "events.jsonl"), 1, null, [],
-    { maxTokens: 1000, maxMs: 3000, approvedFiles: ["source.py"] });
+    { maxTokens: 1000, approvedFiles: ["source.py"] });
 });
 
 test("native coding does not stop investigation at the former request ceiling", async t => {
@@ -740,7 +759,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   const result = await runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10,
     maxEventBytes: 10000, modelUsage: { maxRequests: 1 } } }, directory, "implement", "prompt",
-    path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 24000, maxMs: 3000,
+    path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 24000,
       approvedFiles: ["source.py"], budget: { mode: "adaptive", complexity: "small" } });
   assert.equal(result.telemetry.requestBudgetExpansions.length, 0);
   assert.equal(result.telemetry.requestTimings.length, 3);
@@ -781,7 +800,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   const operation = runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10,
     maxEventBytes: 20000, modelUsage: { maxRequests: 4 } } }, directory, "implement", "prompt", logFile, 1, null, [],
-    { maxTokens: 24000, maxMs: 3000, approvedFiles: ["source.py"], budget: { mode: scenario === "strict" ? "strict" : "adaptive", complexity: "small" } });
+    { maxTokens: 24000, approvedFiles: ["source.py"], budget: { mode: scenario === "strict" ? "strict" : "adaptive", complexity: "small" } });
     const result = await operation;
     assert.deepEqual(result.telemetry.requestBudgetExpansions, []);
     assert.equal(result.telemetry.compactions[0].requests, 2);

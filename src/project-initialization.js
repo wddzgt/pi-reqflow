@@ -8,7 +8,7 @@ import { withLock } from "./store.js";
 import { executionContext } from "./action-progress.js";
 
 const version = 1;
-const analysisVersion = 3;
+const analysisVersion = 4;
 const documentNames = ["PROJECT_REFERENCE.md", "agent.md"];
 
 export function initializationCommands(baseline) {
@@ -22,8 +22,9 @@ export function initializationCommands(baseline) {
     const managers = { "pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn", "bun.lock": "bun", "bun.lockb": "bun", "package-lock.json": "npm" };
     const manager = pkg.packageManager ? pkg.packageManager.split("@")[0] : locks.length ? managers[locks[0]] : "npm";
     if (!["npm", "pnpm", "yarn", "bun"].includes(manager)) throw new Error(`Unsupported declared package manager: ${manager}`);
-    return { id: `${pkg.path}#${script}`, name: script, cwd,
-      argv: [manager, "run", script], evidence: pkg.path };
+    const directoryFlag = { npm: "--prefix", pnpm: "--dir", yarn: "--cwd", bun: "--cwd" }[manager];
+    return { id: `${pkg.path}#${script}`, name: script, cwd: ".",
+      argv: [manager, ...(cwd === "." ? [] : [directoryFlag, cwd]), "run", script], evidence: pkg.path };
   }));
   return [...baseline.checks.map((argv, index) => ({ id: `check:${index}`, name: "项目检查",
     cwd: ".", argv, evidence: "项目执行配置" })), ...commands.slice(0, 60)];
@@ -232,7 +233,7 @@ async function analyzeSnapshot(project, baseline, commands, attemptsRoot, cacheK
         items: { type: "string", pattern: evidencePattern } } } };
     result = await runPi(project, workspace, "initialize", initializationPrompt(baseline, commands, excerpts, limits),
       path.join(attemptDir, "events.jsonl"), remaining, null, [], {
-        maxTokens: project.config.modelUsage.maxTokens, maxMs: project.config.maxPiMs,
+        maxTokens: project.config.modelUsage.maxTokens,
         outputSchema: { name: "project_understanding", strict: true, schema: {
           type: "object", additionalProperties: false,
           required: ["schemaVersion", "overview", "architecture", "workflows", "conventions", "notes", "commandIds"],

@@ -12,9 +12,11 @@ import { admissionPolicy } from "./admission.js";
 import { readProjectBaseline, renderProjectBaseline } from "./baseline.js";
 import { readInitialization } from "./project-initialization.js";
 import { readGitSetup, candidateReview } from "./git-delivery.js";
-import { configureExecution, readExecutionSetup, verifyDeploymentConnection } from "./project-execution.js";
+import { configureExecution, readExecutionSetup, verifyDeploymentConnection, executionConfigurationHistory } from "./project-execution.js";
 import { readModelSettings, configureModels, testModelConnection } from "./model-settings.js";
-import { allowedActions, authenticate, authenticateByUsername, authorize, canReadTask, changePassword, listUsers, loadCredentials, resetPassword, updateUserRoles, validSessionPrincipal } from "./auth.js";
+import { allowedActions, authenticate, authenticateByUsername, authorize, canReadTask, canConfigureEnvironment, changePassword, listUsers, loadCredentials, resetPassword, updateUserRoles, validSessionPrincipal } from "./auth.js";
+import { readLocalEnvironment, configureLocalEnvironment, checkLocalEnvironment, localEnvironmentReport } from "./local-environment.js";
+import { scanLocalEnvironment, environmentScanDiff } from "./environment-scan.js";
 import { readJson, sha256, writeJson } from "./files.js";
 import { actionAuditContext, readTask, taskPath } from "./store.js";
 import { createRequirement, executeRequirementAction, getAuditReport, getAuthenticationHistory, getChangedFile,
@@ -25,6 +27,7 @@ const publicRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..",
 const staticFiles = new Map([
   ["/", ["index.html", "text/html; charset=utf-8"]],
   ["/app.js", ["app.js", "text/javascript; charset=utf-8"]],
+  ["/environment.js", ["environment.js", "text/javascript; charset=utf-8"]],
   ["/styles.css", ["styles.css", "text/css; charset=utf-8"]],
   ["/mermaid.js", ["../node_modules/@mermaid-js/tiny/dist/mermaid.tiny.js", "text/javascript; charset=utf-8"]],
 ]);
@@ -88,6 +91,8 @@ async function overview(project, projectName, principal, offset, limit) {
       testDeployment: project.config.testDeployment.kind, productionDeployment: project.config.productionDeployment.kind,
       executionReady: project.config.testDeployment.kind !== "unconfigured",
       checksConfigured: project.config.checks.length > 0,
+      canConfigureEnvironment: canConfigureEnvironment(principal, index),
+      localEnvironment: await localEnvironmentReport(project),
       deploymentRequiresPublishedRevision: deploymentRequiresPublishedRevision(project.config.testDeployment),
       gitDelivery: project.config.mode === "git" ? { testMode: project.config.gitDelivery?.testMode ?? "branch",
         testBranch: project.config.gitDelivery?.testBranch ?? null } : null,
@@ -344,8 +349,54 @@ export async function startWebServer(projectPath, port = 4173, options = {}) {
         return send(res, 200, await overview(project, projectName, session.principal, offset, limit));
       }
       if (req.method === "GET" && pathname === "/api/project-git") return send(res, 200, await readGitSetup(project.root));
+      if (pathname === "/api/environment-status" && req.method === "GET") {
+        const setup = await readLocalEnvironment(project);
+        const rows = await readJson(path.join(project.archive, "index.json"));
+        const visible = rows.filter(row => canReadTask(session.principal, row));
+        return send(res, 200, { local: { configured: setup.configured, version: setup.version,
+          report: await localEnvironmentReport(project), history: setup.history.map(event => ({ ...event,
+            affectedRequirements: event.affectedRequirements.filter(id => visible.some(row => row.id === id)) })) },
+          test: { kind: project.config.testDeployment.kind, url: project.config.testDeployment.url ?? "",
+            history: (await executionConfigurationHistory(project)).map(({ actor, at, configHash }) => ({ actor, at, configHash })) },
+          canConfigure: canConfigureEnvironment(session.principal, rows),
+          affectedRequirements: visible.filter(row => !doneStates.has(row.state)).map(row => ({ id: row.id, title: row.title })) });
+      }
+      if (["/api/local-environment", "/api/local-environment-scan"].includes(pathname) && ["GET", "POST"].includes(req.method)
+          || pathname === "/api/local-environment-check" && req.method === "POST") {
+        authorize(session.principal, "configure-environment");
+        if (!canConfigureEnvironment(session.principal, await readJson(path.join(project.archive, "index.json"))))
+          return send(res, 403, { error: "仅管理员和已接受当前项目需求分工的研发可以配置环境。" });
+        const setup = await readLocalEnvironment(project);
+        const sourceRoot = async taskId => {
+          if (!taskId) return project.root;
+          const task = await readTask(project, taskId);
+          if (!canReadTask(session.principal, task.meta) || !task.meta.workspace) throw new Error("当前需求没有可扫描的研发工作目录。");
+          return task.meta.workspace;
+        };
+        if (req.method === "GET") {
+          if (pathname === "/api/local-environment") return send(res, 200, setup);
+          const taskId = requestUrl.searchParams.get("taskId") ?? setup.settings?.scanTaskId ?? "";
+          const scan = await scanLocalEnvironment(project, await sourceRoot(taskId));
+          const rows = await readJson(path.join(project.archive, "index.json"));
+          const sources = [{ id: "", name: "项目源码" }];
+          for (const row of rows.filter(row => canReadTask(session.principal, row))) {
+            const { meta } = await readTask(project, row.id);
+            if (meta.workspace) sources.push({ id: row.id, name: `需求 ${row.id} · ${row.title}` });
+          }
+          return send(res, 200, { setup, scan, scanTaskId: taskId || null, sources, diff: environmentScanDiff(setup.settings?.scan, scan) });
+        }
+        if (!sameOrigin(req, allowedOrigins) || req.headers["x-reqflow-token"] !== session.csrf) return send(res, 403, { error: "Session token or origin is invalid" });
+        if (!req.headers["content-type"]?.startsWith("application/json")) return send(res, 415, { error: "JSON body is required" });
+        const input = await readBody(req);
+        if (pathname === "/api/local-environment-scan") return send(res, 405, { error: "扫描接口只接受 GET。" });
+        return send(res, 200, pathname === "/api/local-environment-check"
+          ? await checkLocalEnvironment(project, session.principal.id, await sourceRoot(setup.settings?.scanTaskId))
+          : await configureLocalEnvironment(project, session.principal.id, input, await sourceRoot(input.scanTaskId)));
+      }
       if (pathname === "/api/deployment-connection" && req.method === "POST") {
-        authorize(session.principal, "configure-project");
+        authorize(session.principal, "configure-environment");
+        if (!canConfigureEnvironment(session.principal, await readJson(path.join(project.archive, "index.json"))))
+          return send(res, 403, { error: "当前账号未参与该项目的研发。" });
         if (!sameOrigin(req, allowedOrigins) || req.headers["x-reqflow-token"] !== session.csrf) return send(res, 403, { error: "Session token or origin is invalid" });
         if (!req.headers["content-type"]?.startsWith("application/json")) return send(res, 415, { error: "JSON body is required" });
         return send(res, 200, await verifyDeploymentConnection(project.root, await readBody(req)));
@@ -361,7 +412,9 @@ export async function startWebServer(projectPath, port = 4173, options = {}) {
           : await testModelConnection(project.root, input));
       }
       if (pathname === "/api/project-execution" && ["GET", "POST"].includes(req.method)) {
-        authorize(session.principal, "configure-project");
+        authorize(session.principal, "configure-environment");
+        if (!canConfigureEnvironment(session.principal, await readJson(path.join(project.archive, "index.json"))))
+          return send(res, 403, { error: "当前账号未参与该项目的研发。" });
         if (req.method === "GET") return send(res, 200, await readExecutionSetup(project.root));
         if (!sameOrigin(req, allowedOrigins) || req.headers["x-reqflow-token"] !== session.csrf) return send(res, 403, { error: "Session token or origin is invalid" });
         if (!req.headers["content-type"]?.startsWith("application/json")) return send(res, 415, { error: "JSON body is required" });

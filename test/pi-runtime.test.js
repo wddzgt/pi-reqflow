@@ -46,14 +46,14 @@ test("real Pi repeated resumes replace controller prompts and preserve source ev
   const padding = `${"current specification ".repeat(1500)}\nFrozen requirement: ${JSON.stringify(protectedContract)}`;
   const checkpoints = [];
   let result = await runPi({ config }, directory, "plan", `OLD_STAGE_INSTRUCTIONS\n${padding}`,
-    path.join(directory, "plan.events.jsonl"), 1, null, [], { developerSession: true, maxTokens: 60000, maxMs: 10000,
+    path.join(directory, "plan.events.jsonl"), 1, null, [], { developerSession: true, maxTokens: 60000,
       authoritativeContext: { contract: protectedContract, currentState: "planning" } });
   for (let attempt = 1; attempt <= 3; attempt++) {
     checkpoints.push({ file: result.telemetry.sessionCheckpoint.file,
       content: await fs.readFile(result.telemetry.sessionCheckpoint.file, "utf8") });
     result = await runPi({ config }, directory, "plan", `LATEST_PLAN_INSTRUCTIONS\n${padding}`,
       path.join(directory, `resume-${attempt}.events.jsonl`), 1, null, [], { developerSession: true,
-        maxTokens: 60000, maxMs: 10000, resumeSession: result.telemetry.sessionCheckpoint,
+        maxTokens: 60000, resumeSession: result.telemetry.sessionCheckpoint,
         authoritativeContext: { contract: protectedContract, currentState: "planning" } });
     assert.equal(result.telemetry.requestEstimates[0].estimationMethod, "measured_retained", "resume reuses hash-bound provider input evidence");
   }
@@ -68,7 +68,7 @@ test("real Pi repeated resumes replace controller prompts and preserve source ev
   await fs.writeFile(feedbackSession, feedbackContent);
   const implementationLog = path.join(directory, "implement.events.jsonl");
   result = await runPi({ config }, directory, "implement", `CURRENT_IMPLEMENTATION\n${padding}`, implementationLog,
-    1, null, [], { maxTokens: 60000, maxMs: 10000, approvedFiles: ["source.py"],
+    1, null, [], { maxTokens: 60000, approvedFiles: ["source.py"],
       budget: { mode: "adaptive", complexity: "small" }, resumeSession: { file: feedbackSession,
         hash: createHash("sha256").update(feedbackContent).digest("hex") },
       authoritativeContext: { contract: protectedContract, currentState: "approved" } });
@@ -250,7 +250,7 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
     await fs.writeFile(draftFile, JSON.stringify(draft));
     config.modelUsage.maxRequests = 4;
     config.modelUsage.readOnlyMaxRequests = 4;
-    localCorrection = { maxTokens: 24000, maxMs: 10000, planContract: contract, discussionTask: "REQ-1",
+    localCorrection = { maxTokens: 24000, planContract: contract, discussionTask: "REQ-1",
       planCorrection: { draftFile, draftHash: createHash("sha256").update(JSON.stringify(draft)).digest("hex") },
       budget: { mode: "adaptive", complexity: "small", maxRepairAttempts: 2 },
       outputSchema: { name: "local_correction", strict: true, schema: { type: "object", additionalProperties: false,
@@ -261,23 +261,23 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
   const progress = [];
   const run = progressContext.run(update => progress.push(update), () => runPi({ config, archive: ["plan-settings", "plan-local-correction"].includes(scenario) ? directory : undefined }, directory, phase,
     "Read evidence.txt then return JSON with verified=true.", logFile, 1,
-    null, [], localCorrection ?? (["plan-continuity", "plan-workspace-continuity"].includes(scenario) ? { developerSession: true, maxTokens: 24000, maxMs: 10000,
-      authoritativeContext: { contract, currentState: "contract_confirmed" } } : scenario.startsWith("plan-schema") ? { maxTokens: 24000, maxMs: 10000, outputSchema: { name: "verified_result", strict: true,
+    null, [], localCorrection ?? (["plan-continuity", "plan-workspace-continuity"].includes(scenario) ? { developerSession: true, maxTokens: 24000,
+      authoritativeContext: { contract, currentState: "contract_confirmed" } } : scenario.startsWith("plan-schema") ? { maxTokens: 24000, outputSchema: { name: "verified_result", strict: true,
       schema: { type: "object", additionalProperties: false, required: ["verified"], properties: { verified: { type: "boolean" } } } } }
-      : compactionScenario ? { maxTokens: 64000, maxMs: 10000,
+      : compactionScenario ? { maxTokens: 64000,
         authoritativeContext: { contract, state: "EXACT_REQ_STATE_01" } }
-      : ["plan-correction", "plan-diagram-correction"].includes(scenario) ? { maxTokens: 24000, maxMs: 10000, planContract: contract,
+      : ["plan-correction", "plan-diagram-correction"].includes(scenario) ? { maxTokens: 24000, planContract: contract,
       budget: { mode: "adaptive", complexity: "small", maxRepairAttempts: 2 } }
-      : ["plan-adaptive-context", "plan-adaptive-schema", "plan-context-window"].includes(scenario) ? { maxTokens: 24000, maxMs: 10000,
+      : ["plan-adaptive-context", "plan-adaptive-schema", "plan-context-window"].includes(scenario) ? { maxTokens: 24000,
         budget: { mode: "adaptive", complexity: "planning", maxRepairAttempts: 2 },
         ...(scenario === "plan-adaptive-schema" ? { outputSchema: { name: "verified_result", strict: true,
           schema: { type: "object", additionalProperties: false, required: ["verified"], properties: { verified: { type: "boolean" } } } } } : {}) }
-      : phase === "intake" ? { maxTokens: 24000, maxMs: 10000,
+      : phase === "intake" ? { maxTokens: 24000,
         intakeValidation: { inputHash: "discussion-hash", sourceFiles: ["source.py"] },
         budget: { mode: "adaptive", complexity: "small", maxRepairAttempts: 2 } } : phase === "implement" ? { maxTokens: scenario === "adaptive" ? 100 : 24000,
       ...(["adaptive", "short-output", "request-progress"].includes(scenario) ? { budget: { mode: "adaptive", complexity: "small", maxRepairAttempts: 2 } } : {}),
       ...(scenario === "repair-adaptive" ? { budget: { mode: "adaptive", complexity: "standard", maxRepairAttempts: 3 } } : {}),
-      maxMs: 10000, ...(scenario === "read-budget-retry" || scenario.startsWith("grep-path") ? {} : { approvedFiles: ["source.py"] }) } : null)));
+      ...(scenario === "read-budget-retry" || scenario.startsWith("grep-path") ? {} : { approvedFiles: ["source.py"] }) } : null)));
   if (["plan-continuity", "plan-workspace-continuity"].includes(scenario)) {
     const planned = await run;
     assert.equal(planned.telemetry.agent, "development");
@@ -293,7 +293,7 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
         environment: { ...config.environment, checks: [] },
         checks: [[process.execPath, "-e", 'require("node:assert/strict").equal(require("node:fs").readFileSync("source.py","utf8"),"value = 42\\n")']] } },
       workspace, "implement", "Approved implementation in a different isolated workspace.", path.join(directory, "continued.jsonl"),
-      1, null, [], { maxTokens: 24000, maxMs: 10000, approvedFiles: ["source.py"],
+      1, null, [], { maxTokens: 24000, approvedFiles: ["source.py"],
         resumeSession: planned.telemetry.sessionCheckpoint, authoritativeContext: { contract, currentState: "approved" } });
       assert.equal(payloads.length, 5);
       assert.match(JSON.stringify(payloads[3].messages), /value = 41/);
@@ -307,7 +307,7 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
       return;
     }
     const continued = await runPi({ config }, directory, "implement", "Approved implementation; retain verified evidence.",
-      path.join(directory, "continued.jsonl"), 1, null, [], { maxTokens: 24000, maxMs: 10000,
+      path.join(directory, "continued.jsonl"), 1, null, [], { maxTokens: 24000,
         approvedFiles: ["source.py"], resumeSession: planned.telemetry.sessionCheckpoint,
         authoritativeContext: { contract, currentState: "approved", approvedFiles: ["source.py"] } });
     assert.equal(continued.telemetry.agent, "development");
@@ -491,7 +491,7 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
       assert.deepEqual(result.telemetry.requestBudgetExpansions, []);
       const resumed = await runPi({ config: { ...config, modelUsage: { ...config.modelUsage,
         maxRequests: 8, maxContextBytes: 10000 } } }, directory, "implement", "Continue retained edits.",
-        path.join(directory, "resumed.events.jsonl"), 1, null, [], { maxTokens: 64000, maxMs: 10000,
+        path.join(directory, "resumed.events.jsonl"), 1, null, [], { maxTokens: 64000,
           budget: { mode: "adaptive", complexity: "small" }, approvedFiles: ["source.py"],
           resumeSession: result.telemetry.sessionCheckpoint,
           authoritativeContext: { contract, state: "EXACT_RESUMED_STATE" } });
