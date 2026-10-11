@@ -9,7 +9,94 @@ import { runPi } from "../src/pi-runner.js";
 import { saveModelCredential } from "../src/model-credentials.js";
 import { progressContext } from "../src/action-progress.js";
 
-for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-compaction", "plan-compaction-failure", "plan-read-budget", "plan-schema", "plan-schema-unsupported", "plan-reasoning", "plan-truncated", "plan-correction", "plan-diagram-correction", "plan-timeout", "plan-adaptive-context", "plan-adaptive-schema", "plan-context-window", "intake-correction", "implement", "adaptive", "short-output", "request-progress", "read-budget-retry", "grep-path-retry", "grep-path-exhausted", "edit-retry", "edit-ambiguous-retry", "edit-limit-retry", "edit-noop-retry", "repair", "repair-adaptive", "repair-failed", "repair-budget", "check-mutation"]) test(`real Pi ${scenario} preserves budget evidence and explicit completion`, {
+test("real Pi repeated resumes replace controller prompts and preserve source evidence and archives", {
+  skip: !process.env.REQFLOW_TEST_PI,
+}, async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-resume-context-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  await fs.writeFile(path.join(directory, "source.py"), "value = 1\n");
+  await fs.writeFile(path.join(directory, "evidence.txt"), "VERIFIED_SOURCE_FACT\n" + "source evidence\n".repeat(300));
+  const protectedContract = { objective: "FROZEN_ACCEPTANCE", acceptance: [{ id: "AC1", text: "Preserve user decisions. ".repeat(20) }] };
+  const payloads = [];
+  const server = createServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    payloads.push(JSON.parse(body));
+    const delta = payloads.length <= 2 ? { role: "assistant", tool_calls: [{ index: 0, id: `read-evidence-${payloads.length}`,
+      type: "function", function: { name: "read", arguments: JSON.stringify({ path: "evidence.txt" }) } }] }
+      : payloads.length === 7 ? { role: "assistant", content: "REQFLOW_EDITS_COMPLETE", tool_calls: [{ index: 0,
+        id: "edit-current", type: "function", function: { name: "edit", arguments: JSON.stringify({ path: "source.py",
+          edits: [{ oldText: "value = 1", newText: "value = 2" }] }) } }] }
+      : { role: "assistant", content: payloads.length < 7 ? '{"verified":true}' : "Controller checks required." };
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(`data: ${JSON.stringify({ id: "local", object: "chat.completion.chunk", choices: [{ index: 0, delta,
+      finish_reason: delta.tool_calls ? "tool_calls" : "stop" }], usage: { prompt_tokens: 1000, completion_tokens: 10 } })}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const previous = process.env.RESUME_MODEL_KEY;
+  process.env.RESUME_MODEL_KEY = "local-fixture";
+  t.after(() => { if (previous === undefined) delete process.env.RESUME_MODEL_KEY; else process.env.RESUME_MODEL_KEY = previous; });
+  const config = { piExecutable: process.env.REQFLOW_TEST_PI, provider: "local-resume", model: "local",
+    mode: "local", thinking: "off", environment: { pi: ["RESUME_MODEL_KEY"] }, allowedPaths: ["."], excludedPaths: [],
+    maxPiMs: 10000, maxToolCalls: 4, maxEventBytes: 1000000,
+    modelUsage: { maxRequests: 3, readOnlyMaxRequests: 3, maxTokens: 60000, maxContextBytes: 64000, maxToolResultBytes: 8000 },
+    compatibleProviders: [{ name: "local-resume", baseUrl: `http://127.0.0.1:${server.address().port}/v1`, apiKeyEnv: "RESUME_MODEL_KEY",
+      models: [{ id: "local", input: ["text"], contextWindow: 65536, maxTokens: 16384 }] }] };
+  const padding = `${"current specification ".repeat(1500)}\nFrozen requirement: ${JSON.stringify(protectedContract)}`;
+  const checkpoints = [];
+  let result = await runPi({ config }, directory, "plan", `OLD_STAGE_INSTRUCTIONS\n${padding}`,
+    path.join(directory, "plan.events.jsonl"), 1, null, [], { developerSession: true, maxTokens: 60000, maxMs: 10000,
+      authoritativeContext: { contract: protectedContract, currentState: "planning" } });
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    checkpoints.push({ file: result.telemetry.sessionCheckpoint.file,
+      content: await fs.readFile(result.telemetry.sessionCheckpoint.file, "utf8") });
+    result = await runPi({ config }, directory, "plan", `LATEST_PLAN_INSTRUCTIONS\n${padding}`,
+      path.join(directory, `resume-${attempt}.events.jsonl`), 1, null, [], { developerSession: true,
+        maxTokens: 60000, maxMs: 10000, resumeSession: result.telemetry.sessionCheckpoint,
+        authoritativeContext: { contract: protectedContract, currentState: "planning" } });
+    assert.equal(result.telemetry.requestEstimates[0].estimationMethod, "measured_retained", "resume reuses hash-bound provider input evidence");
+  }
+  checkpoints.push({ file: result.telemetry.sessionCheckpoint.file,
+    content: await fs.readFile(result.telemetry.sessionCheckpoint.file, "utf8") });
+  assert.ok(Buffer.byteLength(checkpoints.at(-1).content) > 132377, "archive retains all repeated stage prompts");
+  const entries = checkpoints.at(-1).content.trim().split("\n").map(JSON.parse);
+  const feedbackSession = path.join(directory, "feedback.session.jsonl");
+  const feedbackContent = `${checkpoints.at(-1).content}${JSON.stringify({ type: "custom_message", id: "feedback1",
+    parentId: entries.at(-1).id, timestamp: new Date().toISOString(), customType: "reqflow_verification_failure",
+    content: "CHECK_FAILURE_PRESERVED: existing regression assertion failed; do not claim success.", display: true })}\n`;
+  await fs.writeFile(feedbackSession, feedbackContent);
+  const implementationLog = path.join(directory, "implement.events.jsonl");
+  result = await runPi({ config }, directory, "implement", `CURRENT_IMPLEMENTATION\n${padding}`, implementationLog,
+    1, null, [], { maxTokens: 60000, maxMs: 10000, approvedFiles: ["source.py"],
+      budget: { mode: "adaptive", complexity: "small" }, resumeSession: { file: feedbackSession,
+        hash: createHash("sha256").update(feedbackContent).digest("hex") },
+      authoritativeContext: { contract: protectedContract, currentState: "approved" } });
+  assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 2\n");
+  assert.equal(payloads.length, 8);
+  assert.equal(JSON.stringify(payloads[0].messages).match(/FROZEN_ACCEPTANCE/g).length, 1, "first request carries the full contract once");
+  assert.equal(JSON.stringify(payloads[2].messages).match(/VERIFIED_SOURCE_FACT/g).length, 1, "duplicate reads keep one exact result");
+  assert.match(JSON.stringify(payloads[2].messages), /Exact evidence retained in later tool result read-evidence-2/);
+  for (const payload of payloads.slice(3, 7)) {
+    assert.doesNotMatch(JSON.stringify(payload.messages), /OLD_STAGE_INSTRUCTIONS/);
+    assert.match(JSON.stringify(payload.messages), /VERIFIED_SOURCE_FACT/);
+    assert.match(JSON.stringify(payload.messages), /FROZEN_ACCEPTANCE/);
+  }
+  assert.equal(payloads[5].messages.filter(message => JSON.stringify(message.content)
+    .includes("LATEST_PLAN_INSTRUCTIONS")).length, 1, "identical resumes retain only the latest instruction");
+  assert.doesNotMatch(JSON.stringify(payloads[6].messages), /LATEST_PLAN_INSTRUCTIONS/);
+  assert.match(JSON.stringify(payloads[6].messages), /CURRENT_IMPLEMENTATION/);
+  assert.match(JSON.stringify(payloads[6].messages), /CHECK_FAILURE_PRESERVED/);
+  assert.equal(await fs.readFile(feedbackSession, "utf8"), feedbackContent);
+  assert.ok(result.telemetry.requestEstimates.every(row => row.contextBytes < 64000));
+  for (const checkpoint of checkpoints) assert.equal(await fs.readFile(checkpoint.file, "utf8"), checkpoint.content);
+  const events = (await fs.readFile(implementationLog, "utf8")).trim().split("\n").map(JSON.parse);
+  const replacement = events.find(event => event.type === "entry_appended" && event.entry.customType === "reqflow_context_replaced");
+  assert.equal(replacement.entry.data.replaced.length, 4);
+  assert.ok(replacement.entry.data.replaced.reduce((bytes, row) => bytes + row.bytes, 0) > 132377);
+});
+
+for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-workspace-continuity", "plan-settings", "plan-compaction", "plan-compaction-failure", "plan-read-budget", "plan-schema", "plan-schema-unsupported", "plan-reasoning", "plan-truncated", "plan-correction", "plan-local-correction", "plan-diagram-correction", "plan-timeout", "plan-adaptive-context", "plan-adaptive-schema", "plan-context-window", "intake-correction", "implement", "adaptive", "short-output", "request-progress", "read-budget-retry", "grep-path-retry", "grep-path-exhausted", "edit-retry", "edit-ambiguous-retry", "edit-limit-retry", "edit-noop-retry", "repair", "repair-adaptive", "repair-failed", "repair-budget", "check-mutation"]) test(`real Pi ${scenario} preserves budget evidence and explicit completion`, {
   skip: !process.env.REQFLOW_TEST_PI,
 }, async t => {
   const phase = scenario.startsWith("plan") ? "plan" : scenario === "intake-correction" ? "intake" : "implement";
@@ -18,6 +105,7 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-real-pi-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   await fs.writeFile(path.join(directory, "evidence.txt"), ["plan-adaptive-context", "plan-adaptive-schema", "plan-context-window"].includes(scenario) ? "Evidence ".repeat(1000) : "Original evidence.\n");
+  if (compactionScenario) await fs.writeFile(path.join(directory, "evidence.txt"), "Compaction source evidence. ".repeat(800));
   if (scenario === "read-budget-retry") await fs.writeFile(path.join(directory, "evidence.txt"), "Oversized evidence ".repeat(300));
   if (scenario === "plan-read-budget") await fs.writeFile(path.join(directory, "evidence.txt"), "Verified first line.\n" + "Additional source line.\n".repeat(100));
   await fs.writeFile(path.join(directory, "source.py"), scenario === "edit-ambiguous-retry" ? "value = 1\nvalue = 1\n" : "value = 1\n");
@@ -30,6 +118,7 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
     affectedFiles: ["source.py"], changes: [{ file: "source.py", description: "Update value" }], domains: ["backend"],
     impacts: Object.fromEntries(["existingBehavior", "interfaces", "data"].map(key => [key, { status: "none", evidence: "Local isolated value" }])),
     verification: [{ acceptanceId: "AC1", scenario: "Check value", regression: "Existing tests" }], openQuestions: [],
+    validation: { checks: [], skipped: [], manualReason: "调用当前函数并核对验收结果", startup: [] },
     boundaries: { modules: [{ name: "value", files: ["source.py"], evidence: "Source evidence" }],
       deliveryUnits: [{ name: "app", evidence: "One app" }], designStages: 1, estimatedChangedLines: 1,
       coordination: { status: "none", evidence: "Local" }, verification: { status: "ready", evidence: "Configured checks" },
@@ -49,15 +138,24 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
       response.writeHead(200, { "Content-Type": "text/event-stream" }); response.flushHeaders(); return;
     }
     const first = payloads.length === 1;
-    const editing = phase === "implement" && (scenario.startsWith("grep-path") ? payloads.length === 3 : payloads.length <= 2 || (checkScenario && payloads.length === 4));
+    const editing = phase === "implement" && (scenario.startsWith("grep-path") ? payloads.length === (scenario === "grep-path-exhausted" ? 4 : 3) : payloads.length <= 2 || (checkScenario && payloads.length === 4));
     const summarizing = compactionScenario && payloads.length === 2;
     if (summarizing && scenario.endsWith("failure")) {
       response.writeHead(400, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ error: { message: "Injected summarization rejection", type: "invalid_request_error" } }));
       return;
     }
-    const delta = summarizing ? { role: "assistant", content: "Research confirms evidence.txt; frozen requirement remains unchanged." }
-      : scenario.startsWith("grep-path") && (payloads.length <= 2 || scenario === "grep-path-exhausted")
+    const delta = scenario === "plan-workspace-continuity" && payloads.length >= 3
+      ? payloads.length === 3 ? { role: "assistant", tool_calls: [{ index: 0, id: "read-current-workspace", type: "function",
+        function: { name: "read", arguments: JSON.stringify({ path: "source.py", limit: 1 }) } }] }
+      : payloads.length === 4 ? { role: "assistant", content: "REQFLOW_EDITS_COMPLETE", tool_calls: [{ index: 0,
+        id: "edit-current-workspace", type: "function", function: { name: "edit", arguments: JSON.stringify({ path: "source.py",
+          edits: [{ oldText: "value = 41", newText: "value = 42" }] }) } }] }
+      : { role: "assistant", content: "Current workspace edited; controller checks required." }
+      : summarizing ? { role: "assistant", content: "Research confirms evidence.txt; frozen requirement remains unchanged." }
+      : checkScenario && [3, 5].includes(payloads.length) ? { role: "assistant", tool_calls: [{ index: 0,
+        id: `checks-${payloads.length}`, type: "function", function: { name: "run_checks", arguments: "{}" } }] }
+      : scenario.startsWith("grep-path") && payloads.length <= (scenario === "grep-path-exhausted" ? 3 : 2)
       ? { role: "assistant", tool_calls: [{ index: 0, id: `grep-${payloads.length}`, type: "function", function: {
         name: "grep", arguments: JSON.stringify({ path: first || scenario === "grep-path-exhausted" ? "missing.py" : "source.py", pattern: "value", context: 0 }) } }] }
       : ["read-budget-retry", "dependency-research"].includes(scenario) && first ? { role: "assistant", tool_calls: [{ index: 0,
@@ -66,16 +164,18 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
       tool_calls: [{ index: 0, id: `edit-${payloads.length}`, type: "function", function: { name: "edit",
         arguments: JSON.stringify({ path: "source.py", edits: [{ oldText: scenario === "edit-ambiguous-retry"
           ? first ? "value = 1" : "value = 1\nvalue = 1"
-          : scenario === "edit-retry" && first ? "not the original source" : `value = ${["dependency-research", "edit-retry", "edit-limit-retry", "edit-noop-retry", "read-budget-retry", "grep-path-retry"].includes(scenario) ? 1 : payloads.length === 4 ? 3 : payloads.length}`,
+          : scenario === "edit-retry" && first ? "not the original source" : `value = ${["dependency-research", "edit-retry", "edit-limit-retry", "edit-noop-retry", "read-budget-retry", "grep-path-retry", "grep-path-exhausted"].includes(scenario) ? 1 : payloads.length === 4 ? 3 : payloads.length}`,
           newText: scenario === "edit-noop-retry" && first ? "value = 1"
             : scenario === "edit-limit-retry" && first ? "oversized\n".repeat(51)
-            : `value = ${scenario === "grep-path-retry" ? 3 : payloads.length === 4 ? 4 : payloads.length + 1}` }] }) } }] }
+             : `value = ${scenario.startsWith("grep-path") ? 3 : payloads.length === 4 ? 4 : payloads.length + 1}` }] }) } }] }
       : phase === "implement" ? { role: "assistant", content: "External verification pending." }
       : phase === "intake" ? { role: "assistant", content: JSON.stringify({ ...analysis,
         reply: first ? "Implement `source.py` to add the feature." : analysis.reply }) }
-      : first || (scenario === "plan-read-budget" && payloads.length === 2) ? { role: "assistant", tool_calls: [{ index: 0, id: `read-${payloads.length}`, type: "function",
+      : first || (scenario === "plan-read-budget" && payloads.length === 2) || (scenario === "plan-local-correction" && payloads.length === 3) ? { role: "assistant", tool_calls: [{ index: 0, id: `read-${payloads.length}`, type: "function",
       function: { name: "read", arguments: JSON.stringify({ path: "evidence.txt", ...(scenario === "plan-read-budget" && !first ? { limit: 1 } : {}) }) } }] }
-      : { role: "assistant", content: scenario === "plan-diagram-correction"
+      : { role: "assistant", content: scenario === "plan-local-correction"
+        ? JSON.stringify(payloads.length === 2 ? [] : Object.fromEntries(["affectedFiles", "changes", "domains", "impacts", "verification", "validation", "openQuestions", "boundaries", "design"].map(key => [key, null])))
+        : scenario === "plan-diagram-correction"
         ? JSON.stringify({ ...draft, design: { ...draft.design, diagrams: [{ ...draft.design.diagrams[0],
           source: payloads.length === 2 ? "A --> B" : "flowchart TD\nA --> B" }] } }) : scenario === "plan-correction"
         ? JSON.stringify({ ...draft, boundaries: { ...draft.boundaries, modules: payloads.length === 2 ? [] : draft.boundaries.modules } })
@@ -89,7 +189,7 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
     response.write(`data: ${JSON.stringify({ id: "local-fixture", object: "chat.completion.chunk",
       choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`);
     response.write(`data: ${JSON.stringify({ id: "local-fixture", object: "chat.completion.chunk",
-      choices: [{ index: 0, delta: {}, finish_reason: editing || (phase === "plan" && first) ? "tool_calls" : scenario === "plan-truncated" ? "length" : "stop" }],
+        choices: [{ index: 0, delta: {}, finish_reason: delta.tool_calls ? "tool_calls" : scenario === "plan-truncated" ? "length" : "stop" }],
       usage: { prompt_tokens: compactionScenario && first ? 30000 : scenario === "request-progress" ? 3000 : first ? 200 : 230, completion_tokens: 10,
         total_tokens: compactionScenario && first ? 30010 : first ? 210 : 240 } })}\n\n`);
     response.end("data: [DONE]\n\n");
@@ -117,6 +217,7 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
     environment: { pi: ["SMOKE_MODEL_KEY", "PI_CODING_AGENT_DIR"] }, allowedPaths: ["."], excludedPaths: [],
     maxPiMs: 10000, maxToolCalls: 4, maxEventBytes: 1000000,
     modelUsage: { maxRequests: scenario.startsWith("grep-path") ? 4 : scenario === "request-progress" ? 1 : checkScenario && !["repair-budget", "repair-adaptive"].includes(scenario) ? 5 : 3, readOnlyMaxRequests: compactionScenario || scenario === "plan-read-budget" ? 3 : 2, maxTokens: compactionScenario ? 64000 : 24000,
+      ...(compactionScenario ? { maxToolResultBytes: 32000 } : {}),
       ...(["plan-adaptive-context", "plan-adaptive-schema", "plan-context-window"].includes(scenario) ? { maxContextBytes: 10000, maxToolResultBytes: 16000 } : {}),
       ...(["read-budget-retry", "plan-read-budget"].includes(scenario) ? { maxToolResultBytes: 512 } : {}) },
     compatibleProviders: [{ name: "local-fixture", baseUrl: `http://127.0.0.1:${server.address().port}/v1`,
@@ -127,21 +228,41 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
   if (checkScenario) {
     config.environment.checks = ["CHECK_FIXTURE_VALUE"];
     config.maxSnapshotBytes = 1000000;
-    config.excludedPaths = ["home", "events.jsonl", ...Array.from({ length: 2 }, (_, i) => `events.jsonl.internal-${i + 1}-1.log`)];
+    config.excludedPaths = ["home", "events.jsonl", "events.jsonl.session.jsonl", "events.jsonl.pi-home",
+      ...Array.from({ length: 2 }, (_, i) => `events.jsonl.internal-development-${i + 1}-1.log`)];
     config.checks = [[process.execPath, "-e", scenario === "check-mutation"
       ? 'require("fs").writeFileSync("source.py", "value = 99\\n")'
       : `if(process.env.CHECK_FIXTURE_VALUE!=="check-only"||process.env.SMOKE_MODEL_KEY) throw new Error("Invalid check environment"); const text=require("fs").readFileSync("source.py","utf8"); if(text!=="value = ${scenario === "repair-failed" ? 5 : 4}\\n") { console.error("Expected verified value, got: "+text); process.exit(1); }`]];
   }
   if (scenario === "plan-settings") {
     config.compatibleProviders[0].credentialId = await saveModelCredential(directory, "encrypted-only-key");
-    config.agentModels = { plan: { provider: "local-fixture", model: "local", modelParameters: { temperature: 0.3, topP: 0.8, maxOutputTokens: 512 },
+    config.agentModels = { development: { provider: "local-fixture", model: "local", modelParameters: { temperature: 0.3, topP: 0.8, maxOutputTokens: 512 },
       modelUsage: { maxRequests: 2 }, maxPiMs: 5000 } };
   }
   const logFile = path.join(directory, "events.jsonl");
+  let localCorrection;
+  if (scenario === "plan-local-correction") {
+    draft.schemaVersion = 2;
+    draft.design = { approach: "Reuse existing code", frontend: "", backend: "Update the value", data: "No persisted changes", interfaces: [],
+      components: [{ file: "source.py", domain: "backend", location: "value", pseudocode: "" }], diagrams: [] };
+    const draftFile = path.join(directory, "tasks", "REQ-1", "draft.json");
+    await fs.mkdir(path.dirname(draftFile), { recursive: true });
+    await fs.writeFile(draftFile, JSON.stringify(draft));
+    config.modelUsage.maxRequests = 4;
+    config.modelUsage.readOnlyMaxRequests = 4;
+    localCorrection = { maxTokens: 24000, maxMs: 10000, planContract: contract, discussionTask: "REQ-1",
+      planCorrection: { draftFile, draftHash: createHash("sha256").update(JSON.stringify(draft)).digest("hex") },
+      budget: { mode: "adaptive", complexity: "small", maxRepairAttempts: 2 },
+      outputSchema: { name: "local_correction", strict: true, schema: { type: "object", additionalProperties: false,
+        required: ["affectedFiles", "changes", "domains", "impacts", "verification", "validation", "openQuestions", "boundaries", "design"],
+        properties: Object.fromEntries(["affectedFiles", "changes", "domains", "impacts", "verification", "validation", "openQuestions", "boundaries", "design"].map(key => [key, { type: "null" }])) } } };
+  }
   if (scenario === "plan-timeout") config.maxPiMs = 1000;
   const progress = [];
-  const run = progressContext.run(update => progress.push(update), () => runPi({ config, archive: scenario === "plan-settings" ? directory : undefined }, directory, phase, "Read evidence.txt then return JSON with verified=true.", logFile, 1,
-    null, [], scenario.startsWith("plan-schema") ? { maxTokens: 24000, maxMs: 10000, outputSchema: { name: "verified_result", strict: true,
+  const run = progressContext.run(update => progress.push(update), () => runPi({ config, archive: ["plan-settings", "plan-local-correction"].includes(scenario) ? directory : undefined }, directory, phase,
+    "Read evidence.txt then return JSON with verified=true.", logFile, 1,
+    null, [], localCorrection ?? (["plan-continuity", "plan-workspace-continuity"].includes(scenario) ? { developerSession: true, maxTokens: 24000, maxMs: 10000,
+      authoritativeContext: { contract, currentState: "contract_confirmed" } } : scenario.startsWith("plan-schema") ? { maxTokens: 24000, maxMs: 10000, outputSchema: { name: "verified_result", strict: true,
       schema: { type: "object", additionalProperties: false, required: ["verified"], properties: { verified: { type: "boolean" } } } } }
       : compactionScenario ? { maxTokens: 64000, maxMs: 10000,
         authoritativeContext: { contract, state: "EXACT_REQ_STATE_01" } }
@@ -156,9 +277,58 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
         budget: { mode: "adaptive", complexity: "small", maxRepairAttempts: 2 } } : phase === "implement" ? { maxTokens: scenario === "adaptive" ? 100 : 24000,
       ...(["adaptive", "short-output", "request-progress"].includes(scenario) ? { budget: { mode: "adaptive", complexity: "small", maxRepairAttempts: 2 } } : {}),
       ...(scenario === "repair-adaptive" ? { budget: { mode: "adaptive", complexity: "standard", maxRepairAttempts: 3 } } : {}),
-      maxMs: 10000, ...(scenario === "read-budget-retry" || scenario.startsWith("grep-path") ? {} : { approvedFiles: ["source.py"] }) } : null));
+      maxMs: 10000, ...(scenario === "read-budget-retry" || scenario.startsWith("grep-path") ? {} : { approvedFiles: ["source.py"] }) } : null)));
+  if (["plan-continuity", "plan-workspace-continuity"].includes(scenario)) {
+    const planned = await run;
+    assert.equal(planned.telemetry.agent, "development");
+    assert.equal(planned.telemetry.sessionStatus, "saved");
+    assert.ok(payloads[0].tools.every(tool => !["edit", "write"].includes(tool.function.name)));
+    assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 1\n");
+    if (scenario === "plan-workspace-continuity") {
+      const workspace = path.join(directory, "implementation");
+      await fs.mkdir(workspace);
+      await fs.writeFile(path.join(workspace, "source.py"), "value = 41\n");
+      const originalSession = await fs.readFile(planned.telemetry.sessionCheckpoint.file);
+      const continued = await runPi({ config: { ...config, maxSnapshotBytes: 1000000,
+        environment: { ...config.environment, checks: [] },
+        checks: [[process.execPath, "-e", 'require("node:assert/strict").equal(require("node:fs").readFileSync("source.py","utf8"),"value = 42\\n")']] } },
+      workspace, "implement", "Approved implementation in a different isolated workspace.", path.join(directory, "continued.jsonl"),
+      1, null, [], { maxTokens: 24000, maxMs: 10000, approvedFiles: ["source.py"],
+        resumeSession: planned.telemetry.sessionCheckpoint, authoritativeContext: { contract, currentState: "approved" } });
+      assert.equal(payloads.length, 5);
+      assert.match(JSON.stringify(payloads[3].messages), /value = 41/);
+      assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 1\n");
+      assert.equal(await fs.readFile(path.join(workspace, "source.py"), "utf8"), "value = 42\n");
+      assert.deepEqual(await fs.readFile(planned.telemetry.sessionCheckpoint.file), originalSession);
+      const header = JSON.parse((await fs.readFile(continued.telemetry.sessionCheckpoint.file, "utf8")).split("\n")[0]);
+      assert.equal(header.cwd, await fs.realpath(workspace));
+      assert.equal(header.parentSession, planned.telemetry.sessionCheckpoint.file);
+      assert.equal(Object.hasOwn(continued.telemetry, "internalChecks"), false, "controller verification remains outside native Pi");
+      return;
+    }
+    const continued = await runPi({ config }, directory, "implement", "Approved implementation; retain verified evidence.",
+      path.join(directory, "continued.jsonl"), 1, null, [], { maxTokens: 24000, maxMs: 10000,
+        approvedFiles: ["source.py"], resumeSession: planned.telemetry.sessionCheckpoint,
+        authoritativeContext: { contract, currentState: "approved", approvedFiles: ["source.py"] } });
+    assert.equal(continued.telemetry.agent, "development");
+    assert.equal(payloads.length, 3);
+    assert.ok(payloads[2].tools.some(tool => tool.function.name === "edit"));
+    assert.match(JSON.stringify(payloads[2].messages), /Original evidence/);
+    assert.match(JSON.stringify(payloads[2].messages), /CURRENT workspace/);
+    assert.notEqual(continued.telemetry.sessionCheckpoint.file, planned.telemetry.sessionCheckpoint.file);
+    return;
+  }
+  if (scenario === "plan-local-correction") {
+    const result = await run;
+    assert.equal(payloads.length, 4);
+    assert.ok(payloads[2].tools.some(tool => tool.function.name === "read_plan"), "local correction must retain exact archived evidence tools after invalid JSON");
+    assert.equal(payloads[3].tools, undefined);
+    assert.match(payloads[3].messages.at(-1).content, /one modification JSON object/);
+    assert.deepEqual(Object.values(JSON.parse(result.text)), Array(9).fill(null));
+    return;
+  }
   if (scenario === "plan-context-window") {
-    await assert.rejects(run, /request context byte limit exceeded/);
+    await assert.rejects(run, /native compaction and final response exceed remaining request limit/);
     assert.equal(payloads.length, 1, "oversized input plus output must stop before provider dispatch");
     return;
   }
@@ -179,41 +349,29 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
     assert.equal(payloads.length, 2, "failed compaction must stop before another normal task request");
     return;
   }
-  if (["repair-failed", "repair-budget", "check-mutation"].includes(scenario)) {
-    let failure;
-    await assert.rejects(run, error => {
-      failure = error;
-      assert.match(error.message, scenario === "repair-failed" ? /still fail after one local repair/
-        : scenario === "repair-budget" ? /(?:model|provider) request limit reached/ : /checks modified project files/);
-      return true;
-    });
+  if (["repair-failed", "check-mutation"].includes(scenario)) {
+    if (scenario === "check-mutation") await assert.rejects(run, /checks modified project files/);
+    else {
+      const result = await run;
+      assert.equal(result.telemetry.developmentChecks.at(-1).status, "failed",
+        "diagnostic failure remains explicit; controller formal verification decides the current candidate");
+    }
     const events = (await fs.readFile(logFile, "utf8")).trim().split("\n").map(line => JSON.parse(line));
-    const checks = events.filter(event => event.type === "entry_appended" && event.entry.customType === "reqflow_internal_verification");
+    const checks = events.filter(event => event.type === "entry_appended" && event.entry.customType === "reqflow_development_check");
     assert.equal(checks.length, scenario === "repair-failed" ? 2 : 1);
     assert.equal(checks.at(-1).entry.data.status, scenario === "check-mutation" ? "error" : "failed");
-    assert.equal(payloads.length, scenario === "repair-failed" ? 5 : 3);
-    if (scenario === "repair-budget") {
-      assert.equal(failure.telemetry.assistantMessages, 3);
-      assert.equal(failure.telemetry.requestLimit, 3);
-      assert.equal(failure.telemetry.internalChecks.length, 1);
-    }
+    assert.equal(payloads.length, scenario === "repair-failed" ? 6 : 3);
     return;
   }
   if (scenario.startsWith("grep-path")) {
-    if (scenario === "grep-path-exhausted") {
-      await assert.rejects(run, /REQFLOW_TOOL_STOP: grep failed: Path not found/);
-      assert.equal(payloads.length, 3);
-      assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 1\n");
-    } else {
       const result = await run;
-      assert.equal(payloads.length, 4);
+      assert.equal(payloads.length, scenario === "grep-path-exhausted" ? 5 : 4);
       assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 3\n");
       assert.match(JSON.stringify(payloads[1].messages), /Path not found/);
-      assert.match(JSON.stringify(payloads[2].messages), /value = 1/);
+      assert.match(JSON.stringify(payloads[scenario === "grep-path-exhausted" ? 4 : 2].messages), /value = 1/);
       assert.match(result.text, /External verification pending/);
-    }
     const events = (await fs.readFile(logFile, "utf8")).trim().split("\n").map(line => JSON.parse(line));
-    assert.equal(events.filter(row => row.entry?.customType === "reqflow_tool_retry").length, scenario === "grep-path-exhausted" ? 2 : 1);
+    assert.equal(events.filter(row => row.entry?.customType === "reqflow_tool_retry").length, 0);
     return;
   }
   if (scenario === "plan-truncated") {
@@ -237,7 +395,8 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
     assert.equal(payloads.length, 1); return;
   }
   const result = await run;
-  assert.equal(result.telemetry.requestTimings.length, result.telemetry.requestEstimates.length);
+  if (phase !== "implement") assert.equal(result.telemetry.requestTimings.length, result.telemetry.requestEstimates.length);
+  else assert.equal(result.telemetry.executionMode, "native");
   assert.ok(result.telemetry.requestTimings.every(row => row.status === "completed" && row.durationMs >= 0 && Number.isFinite(row.firstResponseMs)));
   assert.ok(result.telemetry.toolTimings.every(row => ["completed", "failed"].includes(row.status) && row.durationMs >= 0));
   if (scenario === "plan-diagram-correction") {
@@ -262,6 +421,10 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
     assert.equal(result.telemetry.assistantMessages, 2);
     assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 1\n");
     assert.match(await fs.readFile(logFile, "utf8"), /Implement `source.py`/);
+    const audit = await fs.readFile(logFile, "utf8");
+    assert.doesNotMatch(audit, /PRIVATE_REASONING_DO_NOT_DISPLAY/);
+    assert.match(audit, /thinking_reference/);
+    assert.equal(result.telemetry.auditStorage.omittedThinkingBlocks, 2);
     return;
   }
   if (scenario === "plan-correction") {
@@ -274,20 +437,19 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
     assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 1\n");
     return;
   }
-  if (["repair", "repair-adaptive"].includes(scenario)) {
+  if (["repair", "repair-adaptive", "repair-budget"].includes(scenario)) {
     assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 4\n");
-    assert.equal(payloads.length, 5);
+    assert.equal(payloads.length, 6);
     assert.ok(payloads[3].tools.some(tool => tool.function.name === "edit"));
-    assert.match(JSON.stringify(payloads[3].messages), /Configured checks failed/);
+    assert.equal(JSON.parse(payloads[3].messages.findLast(message => message.role === "tool").content).status, "failed");
     assert.match(JSON.stringify(payloads[3].messages), /First partial edit/);
-    assert.equal(result.telemetry.requestEstimates.length, 5);
-    assert.ok(result.telemetry.requestEstimates[3].tokensUsed > result.telemetry.requestEstimates[2].tokensUsed);
+    assert.equal(result.telemetry.requestTimings.length, 6);
     const events = (await fs.readFile(logFile, "utf8")).trim().split("\n").map(line => JSON.parse(line));
-    const checks = events.filter(event => event.type === "entry_appended" && event.entry.customType === "reqflow_internal_verification");
+    const checks = events.filter(event => event.type === "entry_appended" && event.entry.customType === "reqflow_development_check");
     assert.deepEqual(checks.map(event => event.entry.data.status), ["failed", "passed"]);
     assert.ok(checks.every(event => event.entry.data.formalVerificationRequired));
     assert.ok(checks.every(event => event.entry.data.beforeHash === event.entry.data.afterHash));
-    if (scenario === "repair-adaptive") assert.equal(result.telemetry.requestLimit, 6);
+    assert.equal(result.telemetry.requestLimit, null);
     return;
   }
   if (phase === "implement") {
@@ -302,7 +464,7 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
     assert.ok(payloads[1].tools.some(tool => tool.function.name === "edit"), "First write must not close later edits");
     if (["implement", "adaptive"].includes(scenario)) {
       assert.deepEqual(payloads[0].tools.map(tool => tool.function.name).sort(),
-        ["edit", "find", "grep", "ls", "read"], "Complete write targets must not disable dependency investigation");
+         ["bash", "edit", "find", "grep", "ls", "read", "write"], "Native coding tools remain available");
       const committed = JSON.parse(payloads[1].messages.find(message => message.tool_calls)?.tool_calls[0].function.arguments);
       assert.equal(committed.edits[0].oldText, "value = 1");
       assert.equal(committed.edits[0].newText, "value = 2");
@@ -310,50 +472,43 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
         .find(row => row.type === "tool_execution_start");
       assert.equal(original.args.edits[0].oldText, "value = 1");
     }
-    if (scenario !== "read-budget-retry") {
-      assert.equal(payloads[2].tools, undefined);
-      assert.equal(payloads[2].max_tokens, 128);
-      assert.match(payloads[2].messages[0].content, /explicitly declared/);
-    } else {
+    assert.ok(payloads[2].tools.some(tool => tool.function.name === "edit"));
+    if (scenario === "read-budget-retry") {
       const events = (await fs.readFile(logFile, "utf8")).trim().split("\n").map(line => JSON.parse(line));
       const retries = events.filter(row => row.type === "entry_appended" && row.entry.customType === "reqflow_tool_retry");
-      assert.equal(retries.length, 1);
-      assert.equal(retries[0].entry.data.toolName, "read");
-      assert.match(retries[0].entry.data.reason, /limit is 512/);
-      assert.match(JSON.stringify(payloads[1].messages), /Result rejected/);
+      assert.equal(retries.length, 0);
+      assert.match(JSON.stringify(payloads[1].messages), /Oversized evidence/);
     }
-    assert.equal(result.telemetry.requestEstimates.length, 3);
+    assert.equal(result.telemetry.requestTimings.length, 3);
     assert.match(result.text, /External verification pending/);
     if (scenario === "short-output") assert.ok(payloads.slice(0, 2).every(payload => payload.max_tokens === 256));
     if (scenario === "request-progress") {
-      assert.equal(result.telemetry.requestLimit, 1);
+      assert.equal(result.telemetry.requestLimit, null);
       const audited = (await fs.readFile(logFile, "utf8")).trim().split("\n").map(JSON.parse);
       assert.equal(audited.some(event => event.type === "message_update"), false);
       assert.ok(audited.some(event => event.type === "message_end" && event.message.role === "assistant"));
       assert.ok(result.eventBytes < config.maxEventBytes);
-      assert.deepEqual(result.telemetry.requestBudgetExpansions.map(row => [row.previous, row.next]), [[1, 2], [2, 3]]);
-      assert.notEqual(result.telemetry.requestBudgetExpansions[0].afterHash, result.telemetry.requestBudgetExpansions[1].afterHash);
+      assert.deepEqual(result.telemetry.requestBudgetExpansions, []);
       const resumed = await runPi({ config: { ...config, modelUsage: { ...config.modelUsage,
         maxRequests: 8, maxContextBytes: 10000 } } }, directory, "implement", "Continue retained edits.",
         path.join(directory, "resumed.events.jsonl"), 1, null, [], { maxTokens: 64000, maxMs: 10000,
           budget: { mode: "adaptive", complexity: "small" }, approvedFiles: ["source.py"],
           resumeSession: result.telemetry.sessionCheckpoint,
           authoritativeContext: { contract, state: "EXACT_RESUMED_STATE" } });
-      assert.equal(resumed.telemetry.compactions.length, 1, "compact before continuation; defer unnecessary compaction of a completed answer");
-      assert.ok(resumed.telemetry.compactions[0].requests >= 1);
+      assert.equal(resumed.telemetry.compactions.length, 0, "do not compact a short resumed session that fits the model context");
       assert.equal(resumed.telemetry.unmeasuredRequests, 0);
       assert.ok(payloads.slice(3).some(payload => JSON.stringify(payload.messages).includes("EXACT_RESUMED_STATE")),
         "the resumed task request retains exact authoritative state between native summaries");
     }
     if (scenario === "adaptive") {
-      assert.equal(result.telemetry.tokenLimit, 100);
+      assert.equal(result.telemetry.tokenLimit, null);
       assert.ok(result.telemetry.tokens.input > 100);
-      assert.ok(result.telemetry.budgetExpansions.length > 0);
+      assert.equal(result.telemetry.budgetExpansions.length, 0);
       assert.equal(result.telemetry.budget.mode, "adaptive");
     }
     if (["edit-retry", "edit-ambiguous-retry", "edit-limit-retry", "edit-noop-retry"].includes(scenario)) {
       const events = (await fs.readFile(logFile, "utf8")).trim().split("\n").map(line => JSON.parse(line));
-      assert.equal(events.filter(event => event.type === "entry_appended" && event.entry.customType === "reqflow_tool_retry").length, 1);
+      assert.equal(events.filter(event => event.type === "entry_appended" && event.entry.customType === "reqflow_tool_retry").length, 0);
       assert.match(JSON.stringify(payloads[1].messages), scenario === "edit-retry" ? /Could not find the exact text/
         : scenario === "edit-ambiguous-retry" ? /Found 2 occurrences.*text must be unique/
         : scenario === "edit-noop-retry" ? /identical content/ : /at most 50 lines/);
@@ -384,7 +539,7 @@ for (const scenario of ["dependency-research", "plan", "plan-settings", "plan-co
   if (["plan-adaptive-context", "plan-adaptive-schema"].includes(scenario)) {
     assert.equal(result.telemetry.contextExpansions.length, 1);
     const expansion = result.telemetry.contextExpansions[0];
-    assert.equal(expansion.estimationMethod, scenario === "plan-adaptive-schema" ? "wire_bytes" : "measured_prefix");
+    assert.equal(expansion.estimationMethod, "measured_prefix");
     assert.ok(expansion.next > expansion.previous);
     assert.ok(expansion.inputReserve + expansion.requestedOutput <= expansion.contextWindow);
     assert.equal(result.telemetry.requestEstimates[1].contextBytes, expansion.next);

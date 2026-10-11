@@ -108,7 +108,7 @@ async function main() {
     await fs.realpath(projectPath);
     const config = validateConfig(await readJson(required(args, "config")));
     const agent = required(args, "agent");
-    if (!["initialize", "intake", "plan", "implement", "frontendReview", "backendReview", "qaReview"].includes(agent)) throw new Error("Unsupported --agent");
+    if (!["requirement", "development", "review"].includes(agent)) throw new Error("Unsupported --agent");
     const action = required(args, "action");
     const agentModels = { ...config.agentModels };
     if (action === "set") {
@@ -203,7 +203,7 @@ async function main() {
     const project = await loadProject(projectPath);
     const document = await generateProjectReference({ projectDir: project.root, name: path.basename(project.root) }, project);
     result = { reportFile: path.join(project.archive, "PROJECT_REFERENCE.md"), agentFile: document.agentFile,
-      claudeFile: document.claudeFile, snapshotHash: document.snapshotHash, sourceHash: document.sourceHash };
+      snapshotHash: document.snapshotHash, sourceHash: document.sourceHash };
   } else if (command === "baseline-status") {
     const project = await loadProject(projectPath);
     const baseline = await readProjectBaseline(project);

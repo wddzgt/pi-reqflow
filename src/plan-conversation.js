@@ -50,10 +50,17 @@ export async function discussPlan(projectPath, id, actor, input) {
     const allowance = modelAllowance(task.events, admissionPolicy(project.config));
     const remaining = project.config.maxCostUsd - meta.intakeCostUsd - meta.reviewCostUsd - meta.planCostUsd;
     if (remaining <= 0) throw new Error("Requirement cost budget exhausted before plan discussion");
-    const attempt = task.events.filter(event => event.type === "plan_message").length + 1;
-    if (attempt > 30) throw new Error("Plan discussion reached its 30-message limit; hand off unresolved design to a human");
+    const messages = task.events.filter(event => event.type === "plan_message");
+    const attempt = task.events.filter(event => event.type === "plan_context_prepared").length + 1;
+    if (messages.length + (input.retryEventHash ? 0 : 1) > 30) throw new Error("Plan discussion reached its 30-message limit; hand off unresolved design to a human");
     const active = { ...meta, updatedAt: new Date().toISOString() };
-    await appendEvent(project, id, "plan_message", active, { actor, text: input.text, planHash: meta.planHash });
+    if (input.retryEventHash) {
+      const message = messages.at(-1);
+      if (!message || message.hash !== input.retryEventHash || message.detail.actor !== actor
+          || message.detail.text !== input.text || message.detail.planHash !== meta.planHash
+          || task.events.slice(task.events.indexOf(message) + 1).some(event => event.type === "plan_reply"))
+        throw new Error("方案讨论重试必须对应尚未完成回复的最后一条原始问题。");
+    } else await appendEvent(project, id, "plan_message", active, { actor, text: input.text, planHash: meta.planHash });
     const discussion = planDiscussion(task).messages.filter(row => row.planVersion === meta.planVersion);
     const recent = discussion.filter(row => ["plan_message", "plan_reply"].includes(row.type)).slice(-4)
       .map(row => ({ role: row.type === "plan_reply" ? "ai" : "developer", eventHash: row.eventHash,
@@ -96,8 +103,10 @@ pendingQuestions=[]只表示无需人工回答，不表示当前方案已通过�
     let result;
     try {
       const workspace = await preparePlanWorkspace(project, id, `dialogue-${attempt}`, source);
-      result = await runPi(project, workspace, "review", prompt, logFile, remaining, "backend", [],
-        { ...allowance, maxTokens: Math.min(allowance.maxTokens, 12000), maxRequests: 4, discussionTask: id,
+      result = await runPi(project, workspace, "plan", prompt, logFile, remaining, null, [],
+         { ...allowance, developerSession: true,
+           resumeSession: task.events.findLast(event => event.type === "plan_reply" && event.detail.planHash === meta.planHash)?.detail.telemetry.sessionCheckpoint ?? analysis.developerSession,
+           maxTokens: Math.min(allowance.maxTokens, 12000), maxRequests: 4, discussionTask: id,
           authoritativeContext: { contractHash: meta.contractHash, contract, planHash: meta.planHash, planSummary,
             blockers, pending, currentState: "plan_review", materialTool: "read_plan" },
           contextFiles: draft.affectedFiles, outputSchema: { ...replySchema, schema: { ...replySchema.schema,
@@ -114,12 +123,12 @@ pendingQuestions=[]只表示无需人工回答，不表示当前方案已通过�
               typeof row[key] !== "string" || !row[key].trim() || row[key].length > (key === "issue" ? 200 : 500)))) throw new Error("Invalid plan dialogue response");
       const next = { ...active, planCostUsd: meta.planCostUsd + result.costUsd, updatedAt: new Date().toISOString() };
       await appendEvent(project, id, "plan_reply", next, { actor, reply, planHash: meta.planHash,
-        phase: "review", logFile, costUsd: result.costUsd, telemetry: result.telemetry });
+         phase: "plan", logFile, costUsd: result.costUsd, telemetry: result.telemetry });
       return { ...next, reply };
     } catch (error) {
       const costUsd = result?.costUsd ?? error.costUsd ?? 0;
       await appendEvent(project, id, "plan_discussion_failed", { ...active, planCostUsd: meta.planCostUsd + costUsd },
-        { actor, error: error.message, phase: "review", logFile, costUsd, telemetry: result?.telemetry ?? error.telemetry ?? null });
+         { actor, error: error.message, phase: "plan", logFile, costUsd, telemetry: result?.telemetry ?? error.telemetry ?? null });
       throw error;
     }
   });

@@ -7,12 +7,13 @@ import { deploymentAdapter, isRegisteredDeployment, validateDeploymentOptions } 
 import "./ci-deployment-adapters.js";
 
 const reserved = [".git", ".reqflow", ".reqflow-init", "node_modules"];
+export const modelAgents = ["requirement", "development", "review"];
 export const defaultModelUsage = Object.freeze({ maxTokens: 60000, maxContextBytes: 64000,
   maxRequests: 8, readOnlyMaxRequests: 6, maxToolResultBytes: 8000, initializationMaxTokens: 30000,
   initializationMaxRequests: 1, initializationMaxToolCalls: 8 });
 const configFields = new Set(["schemaVersion", "mode", "piExecutable", "provider", "model", "environment",
   "allowedPaths", "excludedPaths", "maxSnapshotBytes", "maxPiMs", "maxToolCalls", "maxEventBytes",
-  "maxCostUsd", "fastPath", "checks", "checkSandbox", "testDeployment", "productionDeployment",
+  "maxCostUsd", "fastPath", "planReview", "checks", "checkSandbox", "testDeployment", "productionDeployment",
   "baseBranch", "releaseBranch", "branchPrefix", "remote", "gitDelivery", "codingStandards", "agentModels", "admission", "modelUsage", "modelParameters", "thinking", "structuredOutput", "modelFallbacks", "compatibleProviders", "implementationScope"]);
 
 function rejectUnknown(value, fields, label) {
@@ -73,6 +74,9 @@ export function validateConfig(config) {
     if (!configFields.has(key)) throw new Error(`Unknown config field: ${key}`);
   }
   if (config.schemaVersion !== 2) throw new Error("config.schemaVersion must be 2");
+  if (config.planReview !== undefined && !["risk-based", "full"].includes(config.planReview)) {
+    throw new Error("config.planReview must be risk-based or full");
+  }
   if (!["git", "local"].includes(config.mode)) throw new Error("config.mode must be git or local");
   if (config.implementationScope !== undefined && !["project", "plan"].includes(config.implementationScope)) {
     throw new Error("config.implementationScope must be project or plan");
@@ -142,7 +146,7 @@ export function validateConfig(config) {
     if (!config.agentModels || typeof config.agentModels !== "object" || Array.isArray(config.agentModels)) {
       throw new Error("config.agentModels must be an object");
     }
-    rejectUnknown(config.agentModels, ["initialize", "intake", "plan", "implement", "frontendReview", "backendReview", "qaReview"], "config.agentModels");
+    rejectUnknown(config.agentModels, modelAgents, "config.agentModels");
     for (const [agent, selection] of Object.entries(config.agentModels)) {
       if (!selection || typeof selection !== "object" || Array.isArray(selection)) throw new Error(`Invalid model selection: ${agent}`);
       rejectUnknown(selection, ["provider", "model", "thinking", "modelParameters", "modelUsage", "maxPiMs", "maxToolCalls"], `config.agentModels.${agent}`);
@@ -360,9 +364,9 @@ export function validateConfig(config) {
 
 export function resolveAgentModel(config, phase, role = null) {
   if (!["initialize", "intake", "plan", "implement", "review"].includes(phase)) throw new Error(`Unsupported model phase: ${phase}`);
-  if (phase === "review" && !["frontend", "backend", "qa"].includes(role)) throw new Error("Review model requires a supported role");
+  if (phase === "review" && !["frontend", "backend", "qa", "all"].includes(role)) throw new Error("Review model requires a supported role");
   if (phase !== "review" && role !== null) throw new Error("Only review runs accept a role");
-  const agent = phase === "review" ? `${role}Review` : phase;
+  const agent = phase === "intake" ? "requirement" : phase === "review" ? "review" : "development";
   const selection = config.agentModels?.[agent];
   const { provider, model } = selection === undefined ? config : selection;
   nonempty(provider, `${agent}.provider`);
@@ -391,7 +395,7 @@ export function describePolicy(input) {
     fixedGates: [
       { id: "contract", rule: "产品定版后统一分析方案，按影响范围开展专项检查" },
       { id: "admission", rule: "自动承接方案明确的初级研发工作；高复杂度、分阶段设计和跨团队协调交由研发主导，改动量仅作规划参考" },
-      { id: "plan-approval", rule: "具名研发可逐次批准方案或明确授权连续开发；可承接方案绑定需求、基线和授权后才实施" },
+      { id: "plan-approval", rule: "具名研发确认方案后授权实施；方案绑定冻结需求、基线和批准记录，专项检查按风险或完整策略执行" },
       { id: "change-approval", rule: "验证后由具名研发核对实际变更，批准后才能测试部署" },
       { id: "scope-and-rollback", rule: "Pi 仅能改允许路径；实施前保存快照，回退前检查冲突" },
       { id: "verification", rule: "基线、实施后和候选版本均运行项目检查并核对日志摘要" },
@@ -403,15 +407,15 @@ export function describePolicy(input) {
         thinking: config.thinking, structuredOutput: config.structuredOutput === true,
         modelParameters: config.modelParameters ?? {},
         modelFallbacks: config.modelFallbacks ?? [], compatibleProviders: config.compatibleProviders ?? [],
-        agentModels: Object.fromEntries(["initialize", "intake", "plan", "implement", "frontendReview", "backendReview", "qaReview"].map((agent) =>
-          [agent, { ...resolveAgentModel(config, agent.endsWith("Review") ? "review" : agent,
-            agent.endsWith("Review") ? agent.slice(0, -6) : null),
-            thinking: config.agentModels?.[agent]?.thinking ?? config.thinking }])) },
+        agentModels: Object.fromEntries(modelAgents.map((agent) =>
+          [agent, { ...resolveAgentModel(config, { requirement: "intake", development: "plan", review: "review" }[agent],
+            agent === "review" ? "all" : null), thinking: config.agentModels?.[agent]?.thinking ?? config.thinking }])) },
       mode: config.mode,
       branchRules: config.mode === "git" ? { baseBranch: config.baseBranch,
         releaseBranch: config.releaseBranch, branchPrefix: config.branchPrefix, remote: config.remote } : null,
       allowedPaths: config.allowedPaths,
       implementationScope: config.implementationScope,
+      planReview: config.planReview ?? "risk-based",
       excludedPaths: config.excludedPaths,
       checks: config.checks,
       checkSandbox: config.checkSandbox ?? { kind: "trusted-host" },

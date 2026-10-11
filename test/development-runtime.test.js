@@ -5,9 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { runPi } from "../src/pi-runner.js";
-import { sha256 } from "../src/files.js";
+import { sha256, manifest, manifestHash } from "../src/files.js";
 
-for (const editAfterCheck of [false, true]) test(`native Pi repairs failed checks and reuses evidence only for unchanged source: later edit=${editAfterCheck}`, {
+for (const { editAfterCheck, recheck } of [{ editAfterCheck: false, recheck: true },
+  { editAfterCheck: true, recheck: true }, { editAfterCheck: false, recheck: false }]) test(`native Pi repairs failed checks and records snapshot evidence: later edit=${editAfterCheck}, recheck=${recheck}`, {
   skip: !process.env.REQFLOW_TEST_PI,
 }, async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-development-"));
@@ -21,7 +22,7 @@ for (const editAfterCheck of [false, true]) test(`native Pi repairs failed check
     ["run_checks", {}], ["read", { path: "dependency.py" }],
     ["write", { path: "support.py", content: "expected = 4\n" }],
     ["edit", { path: "source.py", edits: [{ oldText: "value = 2", newText: "value = 4" }] }],
-    ["run_checks", {}],
+    ...(recheck ? [["run_checks", {}]] : []),
     ...(editAfterCheck ? [["edit", { path: "support.py", edits: [{ oldText: "expected = 4", newText: "expected = 5" }] }]] : []),
   ];
   const payloads = [];
@@ -32,7 +33,7 @@ for (const editAfterCheck of [false, true]) test(`native Pi repairs failed check
     const call = calls[payloads.length - 1];
     const delta = call ? { role: "assistant", tool_calls: [{ index: 0, id: `tool-${payloads.length}`,
       type: "function", function: { name: call[0], arguments: JSON.stringify(call[1]) } }] }
-      : { role: "assistant", content: "Implementation complete; project checks passed; formal verification pending." };
+      : { role: "assistant", content: "Implementation complete; formal verification remains required." };
     response.writeHead(200, { "Content-Type": "text/event-stream" });
     response.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`);
     response.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: call ? "tool_calls" : "stop" }],
@@ -60,11 +61,12 @@ for (const editAfterCheck of [false, true]) test(`native Pi repairs failed check
   const result = await runPi({ config }, workspace, "implement", "Use project checks to verify the required value.",
     path.join(root, "events.jsonl"), 1, null, [], { maxTokens: 100000, maxMs: 15000,
       approvedFiles: ["source.py"], implementationScope: "project" });
-  assert.deepEqual(result.telemetry.developmentChecks.map(row => row.status), ["failed", "passed"]);
-  assert.deepEqual(result.telemetry.internalChecks.map(row => row.status), ["passed"]);
-  assert.equal(result.telemetry.internalChecks[0].reusedDevelopmentCheck, editAfterCheck ? undefined : 2);
+  assert.deepEqual(result.telemetry.developmentChecks.map(row => row.status), recheck ? ["failed", "passed"] : ["failed"]);
+  assert.equal(Object.hasOwn(result.telemetry, "internalChecks"), false, "formal checks are controlled outside coding");
+  const currentHash = manifestHash(await manifest(workspace, [], config.maxSnapshotBytes));
+  assert.equal(result.telemetry.developmentChecks.at(-1).afterHash === currentHash, recheck && !editAfterCheck);
   const logNames = await fs.readdir(root);
-  assert.equal(logNames.includes("events.jsonl.internal-1-1.log"), editAfterCheck, "unchanged passed source must not rerun the same checks at coding completion");
+  assert.equal(logNames.includes("events.jsonl.internal-1-1.log"), false, "coding does not inject another check or repair loop at completion");
   assert.ok(payloads[0].tools.some(tool => tool.function.name === "run_checks"));
   assert.match(JSON.stringify(payloads[2].messages), /Expected value 4/);
   assert.match(JSON.stringify(payloads[3].messages), /expected = 4/);
@@ -75,7 +77,7 @@ for (const editAfterCheck of [false, true]) test(`native Pi repairs failed check
   const checkpoint = result.telemetry.sessionCheckpoint;
   const prior = await fs.readFile(checkpoint.file);
   assert.equal(sha256(prior), checkpoint.hash);
-  if (!editAfterCheck) {
+  if (!editAfterCheck && recheck) {
     const before = payloads.length;
     const resumed = await runPi({ config }, workspace, "implement", "Continue the saved work; no new changes requested.",
       path.join(root, "continued.events.jsonl"), 1, null, [], { maxTokens: 100000, maxMs: 15000,

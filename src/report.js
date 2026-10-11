@@ -24,7 +24,7 @@ function piRuns(events) {
     const detail = event.detail.run ?? event.detail;
     return { eventType: event.type, eventAt: event.at, role: event.detail.role ?? null,
       phase: detail.telemetry?.phase ?? event.detail.phase ?? null,
-      status: ["pi_run_skipped", "pi_budget_exhausted", "plan_draft_reused", "plan_specialist_reused", "plan_correction_reused"].includes(event.type) ? "skipped" : event.detail.error ? "failed" : "succeeded",
+      status: event.detail.executionOutcome === "paused" ? "paused" : ["pi_run_skipped", "pi_budget_exhausted", "plan_draft_reused", "plan_specialist_reused", "plan_correction_reused"].includes(event.type) ? "skipped" : event.detail.error ? "failed" : "succeeded",
       traceId: detail.telemetry?.traceId ?? null, telemetry: detail.telemetry ?? null,
       costUsd: detail.costUsd ?? detail.telemetry?.costUsd ?? null,
       error: event.detail.error ?? null, reason: event.detail.reason ?? null,
@@ -35,6 +35,8 @@ function piRuns(events) {
 function usageSummary(runs) {
   const attempts = runs.filter((run) => run.status !== "skipped");
   const measured = attempts.filter((run) => run.telemetry);
+  const incomplete = new Set(attempts.filter(run => !run.telemetry || run.telemetry.unmeasuredRequests > 0
+    || run.telemetry.requestTimings?.some(row => row.usageMeasured === false || ["running", "timed_out", "interrupted"].includes(row.status))));
   const knownCosts = attempts.filter((run) => typeof run.costUsd === "number" && run.telemetry?.pricingKnown !== false);
   const tokens = Object.fromEntries(["input", "output", "cacheRead", "cacheWrite"].map((key) => {
     const values = measured.map((run) => run.telemetry.tokens[key]).filter((value) => value !== null);
@@ -42,14 +44,15 @@ function usageSummary(runs) {
       measuredRuns: values.length }];
   }));
   return { attempts: attempts.length, skippedCalls: runs.length - attempts.length,
-    providerRequests: measured.length === attempts.length && measured.every(run => Number.isSafeInteger(run.telemetry.assistantMessages))
+    providerRequests: incomplete.size === 0 && measured.every(run => Number.isSafeInteger(run.telemetry.assistantMessages))
       ? measured.reduce((sum, run) => sum + run.telemetry.assistantMessages, 0) : null,
     quotaSwitches: measured.length === attempts.length && measured.every(run => Array.isArray(run.telemetry.modelSwitches))
       ? measured.reduce((sum, run) => sum + run.telemetry.modelSwitches.length, 0) : null,
-    measuredRuns: measured.length, unmeasuredAttempts: attempts.length - measured.length,
+    measuredRuns: measured.length, unmeasuredAttempts: incomplete.size,
     failedAttempts: attempts.filter((run) => run.status === "failed").length,
+    pausedAttempts: attempts.filter((run) => run.status === "paused").length,
     costMeasuredAttempts: knownCosts.length,
-    costUsd: knownCosts.length === attempts.length
+    costUsd: incomplete.size === 0 && knownCosts.length === attempts.length
       ? knownCosts.reduce((sum, run) => sum + run.costUsd, 0) : null,
     knownCostUsd: knownCosts.reduce((sum, run) => sum + run.costUsd, 0),
     durationMs: measured.length || !attempts.length ? measured.reduce((sum, run) => sum + run.telemetry.durationMs, 0) : null,
@@ -58,8 +61,8 @@ function usageSummary(runs) {
 }
 
 function workflowFailures(events) {
-  return events.filter((event) => event.type.endsWith("_failed") || event.type.endsWith("_outcome_unknown")
-    || event.type === "rollback_rejected" || event.type === "execution_boundary_stopped" || event.detail.outcome === "failed")
+  return events.filter((event) => event.detail.executionOutcome !== "paused" && (event.type.endsWith("_failed") || event.type.endsWith("_outcome_unknown")
+    || event.type === "rollback_rejected" || event.type === "execution_boundary_stopped" || event.detail.outcome === "failed"))
     .map((event) => ({ at: event.at, stage: event.type,
       reason: event.detail.error ?? event.detail.deployment?.result ?? event.detail.deployment?.evidence ?? event.detail.evidence ?? null,
       traceId: event.detail.telemetry?.traceId ?? event.detail.run?.telemetry?.traceId ?? null,

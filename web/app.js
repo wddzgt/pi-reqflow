@@ -13,7 +13,7 @@ const states = {
   approved: ["方案已批准", "active", 2], implementing: ["实施中", "active", 3],
   implementation_failed: ["实施失败", "error", 3], implementation_inspection_failed: ["需检查变更", "error", 3],
   implementation_interrupted: ["实施已中断", "error", 3], implemented: ["待验证", "active", 3],
-  verification_failed: ["验证失败", "error", 4], verified: ["验证通过", "active", 4],
+  verification_failed: ["验证失败", "error", 4], verified: ["待人工验证", "active", 4],
   test_deploy_submitting: ["正在提交测试部署", "active", 4],
   test_deploy_outcome_unknown: ["测试部署结果待核实", "error", 4],
   test_deploy_running: ["测试部署中", "active", 4], test_deploy_failed: ["测试部署失败", "error", 4],
@@ -24,11 +24,14 @@ const states = {
   release_outcome_unknown: ["发布结果待核实", "error", 5],
   release_running: ["发布中", "active", 5], release_failed: ["发布失败", "error", 5],
   released: ["待发布观察", "review", 5], archived: ["已归档", "done", 6],
-  archived_test_only: ["已归档", "done", 6], rolled_back: ["已回退", "done", 3],
+  archived_test_only: ["已归档", "done", 6], rolled_back: ["已回退·待重新开始", "review", 3],
 };
 const eventNames = {
   execution_binding_updated: "执行规则绑定已更新，原方案保留",
+  execution_budget_extended: "负责人已追加执行时长，历史消耗保留",
+  execution_continued: "已从暂停现场继续", execution_paused: "用户已暂停，现场保留",
   development_authorized: "已授权自动开发",
+  development_restarted: "回退后已返回研发方案，上一轮证据保留",
   intake_draft: "需求草稿已创建", development_feedback: "研发反馈已提交", contract_confirmed: "产品已确认需求契约",
   contract_revised: "产品已修订需求契约", role_review_blocked: "角色评审发现分歧",
   intake_message: "产品补充或修订需求", intake_analysis_started: "AI 研发开始分析",
@@ -46,7 +49,7 @@ const eventNames = {
   plan_specialist_completed: "方案专项检查完成", plan_specialist_failed: "方案专项检查失败",
   plan_revision_requested: "请求修订方案", plan_approved: "方案已批准", changes_approved: "实际变更已审核", workspace_prepared: "开始代码实施",
   implemented: "代码修改完成", implementation_failed: "实施失败", implementation_interrupted: "实施中断",
-  implementation_inspection_failed: "变更检查失败", verified: "检查通过", verification_failed: "检查失败",
+  implementation_inspection_failed: "变更检查失败", verified: "代码检查已完成", verification_failed: "检查失败",
   development_paused: "执行已暂停，现场已保存", implementation_resumed: "从保存的现场继续执行",
   revision_published: "需求分支已发布", test_deployed: "测试环境就绪", test_deploy_running: "测试部署中",
   local_validation_requested: "研发获取本地验证代码", local_validation_changes_retained: "本地修改前证据已保留",
@@ -74,8 +77,9 @@ const actionRoles = {
   "discuss-plan": "developer", "edit-plan": "developer",
   "local-validation": "developer", "recheck-local": "developer", "publish-test": "developer",
   "redeploy-test": "developer",
-  "approve-plan": "developer", "approve-changes": "developer", rollback: "developer", "archive-test-only": "developer",
+  "approve-plan": "developer", "approve-changes": "developer", rollback: "developer", "restart-development": "developer", "archive-test-only": "developer",
   "run-review": "developer", plan: "developer", develop: "developer", "fast-track": "developer",
+  "extend-execution-budget": "developer",
   implement: "developer", verify: "developer",
   "inspect-interrupted": "developer", "recover-lock": "developer", "record-published": "developer",
   "deploy-test": "developer", "poll-deploy": "developer", "verify-candidate": "developer",
@@ -203,7 +207,7 @@ async function refresh(preferredId = state.selectedId) {
 }
 
 function matchesFilter(task) {
-  const tone = statusInfo(task.state)[1];
+  const tone = task.executionPaused ? "review" : statusInfo(task.state)[1];
   if (state.filter === "all") return true;
   if (state.filter === "active") return tone === "active" || tone === "error";
   return tone === state.filter;
@@ -220,7 +224,7 @@ function renderList() {
   const list = clear($("#taskList"));
   if (!tasks.length) return list.append(element("div", "task-list-empty", "没有符合条件的需求"));
   for (const task of tasks) {
-    const [label, tone] = statusInfo(task.state);
+    const [label, tone] = task.executionPaused ? ["已暂停", "review"] : statusInfo(task.state);
     const button = element("button", `task-item${state.selectedId === task.id ? " selected" : ""}`);
     button.type = "button"; button.setAttribute("role", "listitem"); button.dataset.id = task.id;
     const top = element("div", "task-item-top");
@@ -242,7 +246,14 @@ function renderList() {
 }
 
 function nextStep(meta) {
-  if (meta.executionBoundary?.length) return ["自动执行已停止", "已达到承接或执行预算边界，请指定研发负责人评估后续人工处理。详情保留在审计中。", "error", []];
+  if (meta.executionBoundary?.length) {
+    const timeExhausted = state.overview.project.admission.budgetMode === "adaptive"
+      && meta.executionBoundary.includes("Requirement execution budget exhausted; hand off to the responsible developer");
+    return ["自动执行已停止", timeExhausted
+      ? "已达到累计执行时限。负责人可以明确追加时长，历史消耗和未知用量全部保留；追加后需主动重试。"
+      : "已达到承接或执行预算边界，请研发负责人查看流程记录并处理具体原因。未知用量或范围限制不能通过追加时长绕过。", "error",
+      timeExhausted ? [["extend-execution-budget", "追加执行时长", "secondary"]] : []];
+  }
   switch (meta.state) {
     case "intake_draft": return ["开始需求沟通", "AI 研发根据现有项目和图片提出分析、建议及必要问题。", "active", [["analyze-intake", "让 AI 研发分析", "primary"]]];
     case "intake_clarifying": return ["与 AI 研发对齐需求", "在下方补充说明或图片，AI 会核对最新决定；原始需求和每轮沟通都会保留。", "review", [["analyze-intake", "继续 / 重试分析", "secondary"]]];
@@ -264,6 +275,17 @@ function nextStep(meta) {
         const retry = state.overview.project.admission.budgetMode === "adaptive" || meta.planAttempts < state.overview.project.admission.maxPlanAttempts;
         return ["方案更新未完成", "原方案、沟通和修改意见均已保留。可以按已保存意见直接重试，也可在下方继续沟通；新版完成后再审核。", "error",
           retry ? [["revise-plan", "按已保存意见重试更新", "primary"], ["edit-plan", "调整修改提案", "secondary"]] : []];
+      }
+      const latestPlanning = meta === state.detail?.meta ? state.detail.events?.find(event =>
+        ["plan_attempt_failed", "plan_analysis_started", "plan_created", "contract_confirmed", "contract_revised"].includes(event.type)) : null;
+      if (latestPlanning?.type === "plan_analysis_started") return ["正在生成研发方案",
+        "方案分析和专项评审正在进行，完成后会保存结果。请勿重复提交；重新加载页面后仍可查看本轮状态。", "active", []];
+      if (latestPlanning?.type === "plan_attempt_failed") {
+        const retry = state.overview.project.admission.budgetMode === "adaptive" || meta.planAttempts < state.overview.project.admission.maxPlanAttempts;
+        const diagnostic = state.principal.roles.some(role => ["developer", "admin"].includes(role))
+          ? `失败原因：${latestPlanning.error}` : "请研发负责人查看流程记录中的失败原因并处理。";
+        return ["研发方案生成失败", `本次分析已停止，尚未生成可审核的方案。${diagnostic}`, "error",
+          [...(retry ? [["plan", "重试生成研发方案", "primary"]] : []), ["revise-contract", "修订需求", "secondary"]]];
       }
       return ["等待 Agent 设计方案", "Agent 根据产品确认的需求设计方案，研发确认后开始开发。高复杂度任务交由研发主导设计。", "active",
          [["plan", "生成研发方案", "primary"], ["assign-team", "调整研发分工", "secondary"], ["revise-contract", "修订需求", "secondary"]]];
@@ -288,7 +310,7 @@ function nextStep(meta) {
       ? ["方案存在待解决问题", revision.length ? "请查看阻断原因并填写修改意见；解决后才能批准。" : "分析次数已用尽，请研发负责人接手；需求调整不会重置累计预算。", "error", [...revision, ["revise-contract", "修订需求", "secondary"]]]
       : [teamReview?.mode === "split" ? "分工审核完成，等待交付负责人启动开发" : "等待研发确认方案",
         state.overview.project.checksConfigured === false
-          ? "方案检查已通过。点击确认后，选择项目已有检查脚本或填写本次需求的检查命令，再开始开发；固定测试环境可以暂不连接。"
+          ? "方案已包含影响范围内的检查与启动方式，确认后开始开发；完成后可选择本地验证或发布测试环境。"
           : "确认后由 Pi 开发并运行测试；通过后由交付负责人选择本地人工验证或发布到固定测试环境。",
         "review", [["approve-plan", "确认方案并开发", "primary"], ...revision, ["revise-contract", "修订需求", "secondary"]]];
     }
@@ -308,11 +330,11 @@ function nextStep(meta) {
       const git = state.overview.project.mode === "git";
       const publish = git ? ["publish-test", state.overview.project.gitDelivery?.testMode === "merge"
         ? "合并并发布测试环境" : "发布需求分支到测试环境", "secondary"] : ["deploy-test", "发布到测试环境", "secondary"];
-      return ["开发测试通过，选择人工验证方式", meta.gitDeliveryError || (configured
+      return [meta.verificationMode === "manual_pending" ? "代码已就绪，待人工验证" : "范围内检查通过，选择人工验证方式", meta.gitDeliveryError || (configured
         ? "先查看代码差异，再选择本地人工验证或发布到项目的固定测试环境。本地验证后仍可继续发布。"
         : "可先在本地人工验证。项目未连接固定测试环境，暂不能自动发布；连接后再继续发布。"), "review",
-        [["local-validation", meta.localValidation?.environment ? "查看本地测试设置" : "本地测试", "primary"],
-           ...(meta.localValidation?.environment && meta.localValidation.afterHash === meta.afterHash
+        [["local-validation", meta.localValidation?.status === "running" ? "查看本地环境" : "启动本地验证", "primary"],
+           ...(meta.localValidation?.environment && ["running", "not_applicable", "stopped"].includes(meta.localValidation.status) && meta.localValidation.afterHash === meta.afterHash
              ? [["accept-test", "确认代码与本地验证并归档", "primary"]] : []), ...(configured ? [publish] : []),
            ["recheck-local", "重新检查本地修改", "secondary"],
           ...(!configured && state.actions.has("configure-project") ? [["configure-project", "连接固定测试环境", "secondary"]] : [])]];
@@ -334,7 +356,7 @@ function nextStep(meta) {
       return ["发布结果待核实", "先核对生产环境实际版本，再由发布审批人通过 CLI 记录结果；不要重试发布。", "error", []];
     case "released": return ["等待发布观察", "确认上线后关键功能和健康状态，留下观察结论。", "review", [["observe-release", "记录观察并归档", "primary"]]];
     case "archived": case "archived_test_only": return ["交付已归档", "方案、变更、验证与人工确认均保留在项目归档中。", "done", []];
-    case "rolled_back": return ["工作区已回退", "此次修改已恢复到实施前的文件状态。", "done", []];
+    case "rolled_back": return ["代码已回退，可以重新开始", "已恢复到实施前的文件状态。返回研发方案后，沿用已确认需求与研发分工，生成并确认新方案再开发；上一轮代码差异、审批和用量记录保留。", "review", [["restart-development", "返回研发方案", "primary"]]];
     case "test_deploy_failed": case "merge_verification_failed": case "release_failed":
       return ["流程已停止", "请查看验证或部署记录，处理根因后再继续。", "error", []];
     default: throw new Error(`未定义的下一步：${meta.state}`);
@@ -354,6 +376,27 @@ async function loadDetail(id, preserveTab = false) {
   }
   renderList();
   renderDetail();
+  if (detail.execution) pollExecution();
+}
+
+let executionPoll = null;
+function pollExecution() {
+  if (executionPoll) return;
+  executionPoll = setInterval(async () => {
+    const id = state.selectedId, projectId = state.currentProjectId;
+    if (!id || !state.principal) { clearInterval(executionPoll); executionPoll = null; return; }
+    try {
+      const status = await api(`/api/tasks/${encodeURIComponent(id)}/execution`);
+      if (id !== state.selectedId || projectId !== state.currentProjectId) return;
+      state.detail.execution = status.execution;
+      if (!status.execution) {
+        clearInterval(executionPoll); executionPoll = null;
+        if (!state.busy) await refresh(id);
+      } else renderDetail();
+    } catch (error) {
+      clearInterval(executionPoll); executionPoll = null; toast(`执行状态读取失败：${error.message}`, true);
+    }
+  }, 2000);
 }
 
 function captureReadingPosition() {
@@ -382,7 +425,8 @@ function renderDetail() {
   const reading = captureReadingPosition();
   const { meta } = state.detail;
   const productView = state.principal.roles.includes("product") && !state.principal.roles.some((role) => ["developer", "admin"].includes(role));
-  const [label, tone, stateStage] = statusInfo(meta.state);
+  const paused = meta.executionPause && state.detail.events[0]?.type === "execution_paused";
+  const [label, tone, stateStage] = paused ? ["已暂停", "review", statusInfo(meta.state)[2]] : statusInfo(meta.state);
   const isArchived = ["archived", "archived_test_only"].includes(meta.state);
   const stageIndex = meta.state === "assignment_pending" && meta.contractVersion ? 1 : stateStage >= 2 ? stateStage - 1 : stateStage;
   const panel = clear($("#detailPanel"));
@@ -411,19 +455,36 @@ function renderDetail() {
   panel.append(track);
 
   let [attentionTitle, description, attentionTone, actions] = nextStep(meta);
-  if (state.busy && state.runningTask === meta.id) {
+  const execution = state.detail.execution;
+  if (execution) {
+    attentionTitle = execution.status === "pausing" ? "正在停止并保存现场" : "任务正在执行";
+    description = `${execution.progress?.message || "正在准备本轮任务"} · 已用 ${Math.round(execution.elapsedMs / 1000)} 秒`;
+    attentionTone = "active"; actions = [];
+  } else if (meta.executionPause && state.detail.events[0]?.type === "execution_paused") {
+    attentionTitle = "执行已暂停，现场已保存";
+    description = "已有代码、已完成阶段和审计记录均保留。继续会核对当前现场，未完成的模型回复需重新生成。";
+    attentionTone = "review";
+    actions = [["continue-execution", "继续执行", "primary"], ...actions.filter(([name]) => name === "rollback")];
+  }
+  if (state.busy && state.runningTask === meta.id && !execution) {
     attentionTitle = "AI 正在处理本轮任务";
     attentionTone = "active";
   }
   const attention = element("div", `attention-card ${attentionTone}`);
   attention.append(element("span", "attention-icon", attentionTone === "error" ? "!" : attentionTone === "done" ? "✓" : "◇"));
   const copy = element("div", "attention-copy");
-  const visibleDescription = productView && stageIndex >= 1 && meta.state !== "test_deployed" && meta.assignments?.developer?.status === "accepted" && !isArchived
+  const visibleDescription = !execution && !meta.executionPause && productView && stageIndex >= 1 && meta.state !== "test_deployed" && meta.assignments?.developer?.status === "accepted" && !isArchived
     ? `需求已定版，当前由研发负责人 ${meta.assignments.developer.userId} 推进。可在流程记录中查看进展和各阶段的责任人。`
     : description;
   copy.append(element("strong", "", attentionTitle), element("p", "", visibleDescription));
   if (state.busy && state.runningTask === meta.id) {
     copy.append(element("p", "plain-copy", "正在执行，阶段记录会自动更新。请勿重复提交。"));
+  }
+  if ((execution || (state.busy && state.runningTask === meta.id)) && state.actions.has("pause-execution")) {
+    const pause = element("button", "button danger", execution?.status === "pausing" ? "正在暂停…" : "暂停执行");
+    pause.type = "button"; pause.dataset.action = "pause-execution";
+    pause.disabled = execution?.status === "pausing";
+    copy.append(pause);
   }
   if (actions.length) {
     const row = element("div", "attention-actions");
@@ -751,7 +812,7 @@ function renderTab(container) {
       for (const warning of decision.warnings ?? []) container.append(element("p", "plain-copy", warning));
       const evidence = element("details", "audit-diagnostics");
       evidence.append(element("summary", "", "影响依据与专项建议"));
-      evidence.append(boundary, element("p", "plain-copy", `拟改 ${analysis.draft.affectedFiles.length} 个文件 · ${analysis.specialists.length ? `已完成 ${analysis.specialists.map((row) => ({ frontend: "前端", backend: "后端", qa: "测试" })[row.role]).join("、")} 专项检查` : "单次方案分析"} · 验收场景待执行`));
+      evidence.append(boundary, element("p", "plain-copy", `拟改 ${analysis.draft.affectedFiles.length} 个文件 · ${analysis.specialists.length ? `已完成 ${analysis.specialists.map((row) => ({ all: "前后端与测试" })[row.role]).join("、")} 专项检查` : "单次方案分析"} · 验收场景待执行`));
       for (const unit of analysis.draft.boundaries.modules) evidence.append(element("p", "plain-copy", `业务模块 ${unit.name} · ${unit.evidence}`));
       for (const [key, title] of [["coordination", "协调"], ["verification", "验证依据"], ["recovery", "恢复依据"], ["externalEffects", "外部影响"]]) evidence.append(element("p", "plain-copy", `${title} · ${analysis.draft.boundaries[key].evidence}`));
       const policy = analysis.admissionPolicy;
@@ -833,6 +894,14 @@ function renderTab(container) {
       const record = element("details", "audit-event-detail");
       record.append(element("summary", "", `${dateText(event.at)} · ${eventNames[event.type] ?? event.type} · ${Math.round(timing.durationMs / 1000)} 秒`));
       record.append(element("p", "plain-copy", `模型 ${timing.model} · 工具调用 ${timing.toolCalls} 次`));
+      if (timing.timeouts) record.append(element("p", "plain-copy", timing.timeouts.mode === "per_request"
+        ? `单次模型请求时限 ${timing.timeouts.requestMs / 1000} 秒 · 本阶段累计时限 ${timing.timeouts.stageMs / 1000} 秒`
+        : `本阶段累计时限 ${timing.timeouts.stageMs / 1000} 秒`));
+      if (timing.tokens) record.append(element("p", "plain-copy", `已计量 Token：输入 ${timing.tokens.input ?? "未知"} · 输出 ${timing.tokens.output ?? "未知"}`
+        + ` · 缓存读取 ${timing.tokens.cacheRead ?? "未知"} · 缓存写入 ${timing.tokens.cacheWrite ?? "未知"}`
+        + (timing.unmeasuredRequests > 0 ? `；另有 ${timing.unmeasuredRequests} 次请求未返回完整计量，最终用量未知。` : "")));
+      if (timing.handoff) record.append(element("p", "plain-copy", `方案交接正文 ${(timing.handoff.inlineBytes / 1000).toFixed(1)} KB`
+        + ` · 完整结构化方案 ${(timing.handoff.fullPlanBytes / 1000).toFixed(1)} KB · 省略章节可按版本读取`));
       if (timing.requestTimings) for (const request of timing.requestTimings) {
         record.append(element("p", "plain-copy", `第 ${request.request} 次模型请求：${(request.durationMs / 1000).toFixed(1)} 秒`
           + ` · 首个响应 ${request.firstResponseMs === null ? "未收到" : `${(request.firstResponseMs / 1000).toFixed(1)} 秒`}`
@@ -1106,7 +1175,7 @@ function renderIntakeAgreement(container, meta, discussion, contract, feedback, 
   }
 }
 
-async function sendAction(action, extra = {}) {
+async function sendAction(action, extra = {}, returnResult = false) {
   if (state.busy) return false;
   if (!state.actions.has(action)) { toast("当前身份没有执行此操作的权限。", true); return false; }
   const taskId = state.selectedId;
@@ -1122,9 +1191,10 @@ async function sendAction(action, extra = {}) {
     });
     state.progress = null; state.newResult = taskId;
     if (state.principal && state.currentProjectId === projectId && state.selectedId === taskId) await refresh(taskId);
+    if (result?.paused) { toast("执行已暂停，现场已保存，可以稍后继续。"); return false; }
     if (result?.ok === false) { toast(`执行已暂停，现场已保存：${result.error}`, true); return false; }
     toast("操作已完成，流程记录已更新。");
-    return true;
+    return returnResult ? result : true;
   } catch (error) {
     if (error.status === 401) showLogin();
     else if (state.principal && state.currentProjectId === projectId && state.selectedId === taskId) {
@@ -1150,12 +1220,14 @@ async function runIntakeAnalysis(id, message = null) {
   state.runningTask = id; state.progress = null; state.newResult = null;
   for (const control of $("#detailPanel").querySelectorAll("button, input, textarea")) control.disabled = true;
   if ($("#intakeStatus")) $("#intakeStatus").textContent = "AI 研发正在阅读项目并核对需求…";
+  renderDetail();
   try {
     const post = (body) => api(`/api/tasks/${encodeURIComponent(id)}/actions`, { method: "POST",
       headers: { "Content-Type": "application/json", "X-Reqflow-Token": state.token }, body: JSON.stringify(body),
       ...(body.action === "analyze-intake" ? { onProgress: update => receiveProgress(id, projectId, update) } : {}) });
     if (message) { await post({ action: "intake-message", message }); saved = true; }
-    await post({ action: "analyze-intake" });
+    const result = await post({ action: "analyze-intake" });
+    if (result?.paused) { toast("需求分析已暂停，补充资料仍保留。"); return saved; }
     toast("AI 研发反馈已保存，请查看问题或待定版的需求共识。");
     return true;
   } catch (error) {
@@ -1426,8 +1498,21 @@ async function openAdminEvents(kind, id, offset, limit = 50) {
   for (const event of data.events) {
     const item = element("details", "audit-event-detail");
     const summary = element("summary", "", `${dateText(event.at)} · ${eventNames[event.type] || event.type}${event.detail.initiatedBy ? ` · 发起 ${event.detail.initiatedBy}` : ""}`);
-    const detail = element("pre", "", JSON.stringify(event, null, 2));
-    item.append(summary, detail); card.append(item);
+    item.append(summary);
+    let rendered = false;
+    item.addEventListener("toggle", () => {
+      if (!item.open || rendered) return;
+      rendered = true;
+      item.append(element("p", "plain-copy", `操作者 ${event.detail.actor ?? event.detail.initiatedBy ?? "未记录"} · 状态 ${event.meta?.state ?? "身份变更"}`));
+      if (event.detail.error) item.append(element("p", "error-copy", event.detail.error));
+      const evidence = element("details", "audit-diagnostics");
+      evidence.append(element("summary", "", "查看原始审计元数据与哈希"));
+      evidence.addEventListener("toggle", () => {
+        if (evidence.open && evidence.children.length === 1) evidence.append(element("pre", "", JSON.stringify(event, null, 2)));
+      });
+      item.append(evidence);
+    });
+    card.append(item);
   }
   auditPager(card, offset, limit, data.total,
     (page) => openAdminEvents(kind, id, page, limit).catch((error) => toast(error.message, true)));
@@ -1444,15 +1529,36 @@ async function openDiagnostics(id, offset = 0) {
   for (const failure of data.recentFailures) {
     const item = element("details", "audit-event-detail");
     item.append(element("summary", "", `${dateText(failure.at)} · ${eventNames[failure.stage] ?? failure.stage}`),
-      element("pre", "", JSON.stringify(failure, null, 2))); card.append(item);
+      element("p", "error-copy", failure.reason ?? "失败原因未记录")); card.append(item);
   }
   for (const run of data.runs) {
+    const telemetry = run.telemetry;
     const item = element("details", "audit-event-detail");
-    item.append(element("summary", "", `${dateText(run.eventAt)} · ${run.phase ?? run.eventType} · ${run.status}`),
-      element("pre", "", JSON.stringify(run, null, 2))); card.append(item);
-    for (const change of run.telemetry?.modelSwitches ?? []) {
-      item.prepend(element("p", "", `${change.from.provider}/${change.from.model} → ${change.to.provider}/${change.to.model} · ${change.code}`));
-    }
+    const status = { succeeded: "完成", failed: "失败", paused: "用户暂停", skipped: "复用或未调用" }[run.status];
+    item.append(element("summary", "", `${dateText(run.eventAt)} · ${eventNames[run.eventType] ?? run.phase} · ${status}`));
+    if (run.error) item.append(element("p", "error-copy", run.error));
+    if (telemetry) item.append(element("p", "plain-copy", `${telemetry.provider}/${telemetry.model} · ${(telemetry.durationMs / 1000).toFixed(1)} 秒 · ${telemetry.assistantMessages} 次请求 · ${telemetry.toolCalls} 次工具调用`),
+      element("p", "plain-copy", `Token：输入 ${telemetry.tokens.input ?? "未知"} · 输出 ${telemetry.tokens.output ?? "未知"} · 缓存读 ${telemetry.tokens.cacheRead ?? "未知"} · 缓存写 ${telemetry.tokens.cacheWrite ?? "未知"}`));
+    let rendered = false;
+    item.addEventListener("toggle", () => {
+      if (!item.open || rendered) return;
+      rendered = true;
+      for (const request of telemetry?.requestTimings ?? []) item.append(element("p", "plain-copy",
+        `请求 ${request.request} · ${(request.durationMs / 1000).toFixed(1)} 秒 · ${request.status} · ${request.usageMeasured ? "用量已计量" : "用量未知"}`));
+      for (const tool of telemetry?.toolTimings ?? []) item.append(element("p", "plain-copy",
+        `工具 ${tool.tool} · ${(tool.durationMs / 1000).toFixed(1)} 秒 · ${tool.status}`));
+      for (const change of telemetry?.modelSwitches ?? []) item.append(element("p", "plain-copy",
+        `${change.from.provider}/${change.from.model} → ${change.to.provider}/${change.to.model} · ${change.code}`));
+      if (telemetry?.auditStorage) item.append(element("p", "plain-copy",
+        `审计正文 ${(telemetry.auditStorage.storedBytes / 1024).toFixed(1)} KB · 已省略 ${telemetry.auditStorage.omittedEvents} 条重复或增量事件及 ${telemetry.auditStorage.omittedThinkingBlocks} 段思考正文；用量计量保留`));
+      const evidence = element("details", "audit-diagnostics");
+      evidence.append(element("summary", "", "查看计量与证据元数据"));
+      evidence.addEventListener("toggle", () => {
+        if (evidence.open && evidence.children.length === 1) evidence.append(element("pre", "", JSON.stringify(run, null, 2)));
+      });
+      item.append(evidence);
+    });
+    card.append(item);
   }
   if (!data.total) card.append(element("p", "info-empty", "暂无模型执行记录。"));
   auditPager(card, offset, limit, data.total, (page) => openDiagnostics(id, page).catch((error) => toast(error.message, true)));
@@ -1607,12 +1713,12 @@ function openPlanEditor() {
   }, "保存并让 AI 核对");
 }
 
-const modelAgentLabels = { initialize: "项目初始化", intake: "产品需求沟通", plan: "研发方案设计", implement: "代码实现",
-  frontendReview: "前端方案检查", backendReview: "后端方案检查与沟通", qaReview: "测试方案检查" };
+const modelAgentLabels = { requirement: "需求 Agent · 业务对齐与验收", development: "开发 Agent · 项目理解、方案、实现与修复",
+  review: "审查 Agent · 前后端、测试与恢复检查" };
 
 function modelProfileFields(container, saved) {
-  const fields = {};
-  for (const [name, title, type] of [["provider", "服务提供商名称", "text"], ["baseUrl", "API 地址（OpenAI 兼容）", "url"],
+  const fields = { saved };
+  for (const [name, title, type] of [["baseUrl", "API 地址", "url"],
     ["model", "模型名称", "text"], ["apiKey", "API Key", "password"]]) {
     const input = formField(container, title, "input", name === "apiKey" ? "留空保留现有密钥" : "");
     input.type = type; input.value = name === "apiKey" ? "" : saved[name]; input.required = name !== "apiKey";
@@ -1625,31 +1731,17 @@ function modelProfileFields(container, saved) {
     const option = element("option", "", title); option.value = value; fields.thinking.append(option);
   }
   fields.thinking.value = saved.thinking;
-  const advanced = element("details", "model-advanced"); advanced.append(element("summary", "", "参数与用量限制")); container.append(advanced);
-  fields.outputFormat = formField(advanced, "结构化输出", "select");
-  for (const [value, title] of [["auto", "自动按能力选择（推荐）"], ["json_schema", "严格 JSON Schema"], ["json_object", "JSON 模式 + 程序结构校验"]]) {
-    const option = element("option", "", title); option.value = value; fields.outputFormat.append(option);
-  }
-  fields.outputFormat.value = saved.modelParameters.outputFormat ?? "auto";
+  fields.maxTokens = formField(container, "输出 Token 上限"); fields.maxTokens.type = "number";
+  fields.maxTokens.required = true; fields.maxTokens.min = 1; fields.maxTokens.max = 1000000; fields.maxTokens.step = 1;
+  fields.maxTokens.value = saved.modelParameters.maxOutputTokens ?? saved.maxTokens;
+  const advanced = element("details", "model-advanced"); advanced.append(element("summary", "", "高级兼容设置（通常无需修改）")); container.append(advanced);
   for (const [name, title, value, optional, maximum] of [
-    ["temperature", "Temperature（留空使用供应商默认）", saved.modelParameters.temperature, true, 2],
-    ["topP", "Top P（留空使用供应商默认）", saved.modelParameters.topP, true, 1],
-    ["maxOutputTokens", "单次输出 Token（留空使用下方输出上限）", saved.modelParameters.maxOutputTokens, true, 1000000],
     ["contextWindow", "模型上下文窗口 Token", saved.contextWindow, false, 1000000],
-    ["maxTokens", "模型输出上限 Token", saved.maxTokens, false, 1000000],
-    ["maxPiMs", "运行超时（毫秒）", saved.maxPiMs, false], ["maxToolCalls", "工具调用上限", saved.maxToolCalls, false]]) {
+    ["maxPiMs", "单次请求超时（秒）", saved.maxPiMs / 1000, false]]) {
     const input = formField(advanced, title); input.type = "number"; input.required = !optional;
-    input.value = value ?? ""; input.min = ["temperature", "topP"].includes(name) ? 0 : 1;
-    input.step = ["temperature", "topP"].includes(name) ? "any" : 1; if (maximum) input.max = maximum;
+    input.value = value; input.min = name === "maxPiMs" ? 0.001 : 1;
+    input.step = name === "maxPiMs" ? 0.001 : 1; if (maximum) input.max = maximum;
     fields[name] = input;
-  }
-  fields.modelUsage = {};
-  const usageLabels = { maxTokens: "阶段累计 Token 目标", maxContextBytes: "请求上下文字节目标", maxRequests: "阶段请求上限",
-    readOnlyMaxRequests: "只读阶段请求上限", maxToolResultBytes: "工具结果字节上限", initializationMaxTokens: "初始化 Token 上限",
-    initializationMaxRequests: "初始化请求上限", initializationMaxToolCalls: "初始化工具上限" };
-  for (const [name, title] of Object.entries(usageLabels)) {
-    const input = formField(advanced, title); input.type = "number"; input.min = 1; input.max = 1000000; input.step = 1;
-    input.value = saved.modelUsage[name]; fields.modelUsage[name] = input;
   }
   fields.capabilities = {};
   advanced.append(element("p", "intake-caption", "按供应商实际能力配置。思考开关与 reasoning_effort 参数并非所有模型都支持。"));
@@ -1663,12 +1755,21 @@ function modelProfileFields(container, saved) {
 }
 
 function modelProfileInput(fields) {
-  const values = Object.fromEntries(["provider", "baseUrl", "model", "apiKey", "thinking"].map(name => [name, fields[name].value.trim()]));
-  values.modelParameters = { outputFormat: fields.outputFormat.value };
-  for (const name of ["temperature", "topP", "maxOutputTokens"]) if (fields[name].value !== "") values.modelParameters[name] = Number(fields[name].value);
-  for (const name of ["contextWindow", "maxTokens", "maxPiMs", "maxToolCalls"]) values[name] = Number(fields[name].value);
+  const values = Object.fromEntries(["baseUrl", "model", "apiKey", "thinking"].map(name => [name, fields[name].value.trim()]));
+  values.provider = fields.saved.provider;
+  if (!fields.saved.credentialConfigured || new URL(fields.saved.baseUrl).origin !== new URL(values.baseUrl).origin) {
+    values.provider = new URL(values.baseUrl).hostname;
+  }
+  values.modelParameters = { ...fields.saved.modelParameters };
+  const outputLimit = Number(fields.maxTokens.value);
+  const priorOutputLimit = fields.saved.modelParameters.maxOutputTokens ?? fields.saved.maxTokens;
+  values.maxTokens = outputLimit === priorOutputLimit ? fields.saved.maxTokens : outputLimit;
+  if (outputLimit !== priorOutputLimit) values.modelParameters.maxOutputTokens = outputLimit;
+  values.contextWindow = Number(fields.contextWindow.value);
+  values.maxPiMs = Math.round(Number(fields.maxPiMs.value) * 1000);
+  values.maxToolCalls = fields.saved.maxToolCalls;
   Object.assign(values, Object.fromEntries(Object.entries(fields.capabilities).map(([name, input]) => [name, input.checked])));
-  values.modelUsage = Object.fromEntries(Object.entries(fields.modelUsage).map(([name, input]) => [name, Number(input.value)]));
+  values.modelUsage = { ...fields.saved.modelUsage };
   return values;
 }
 
@@ -1680,19 +1781,30 @@ async function openModelSettings() {
     const fields = { agents: {} };
     form.append(element("h3", "content-heading", "默认配置")); fields.default = modelProfileFields(form, setup.default);
     appendModelTest(form, "default", () => modelProfileInput(fields.default), projectId);
-    fields.maxCostUsd = formField(form, "单个需求费用上限（USD；未知计价不能保证实际账单上限）");
+    fields.maxCostUsd = formField(fields.default.advanced, "单个需求费用上限（USD）");
     fields.maxCostUsd.type = "number"; fields.maxCostUsd.min = 0.001; fields.maxCostUsd.step = "any"; fields.maxCostUsd.value = setup.maxCostUsd;
-    form.append(element("h3", "content-heading", "Agent 单独配置"));
+    form.append(element("h3", "content-heading", "Agent 模型"), element("p", "intake-caption", "默认继承项目模型；展开对应 Agent，取消继承即可单独设置。"));
     for (const [agent, title] of Object.entries(modelAgentLabels)) {
       const section = element("details", "model-agent"); const summary = element("summary", "", title); section.append(summary); form.append(section);
       const label = element("label", "model-capability"); const inherit = element("input", ""); inherit.type = "checkbox"; inherit.checked = !setup.agents[agent];
-      label.append(inherit, element("span", "", "使用默认配置")); section.append(label);
+      label.append(inherit, element("span", "", "继承项目默认模型")); section.append(label);
       const custom = element("div", "model-custom"); section.append(custom);
-      const inputs = modelProfileFields(custom, setup.agents[agent] ?? setup.default);
-      const toggle = () => { custom.hidden = inherit.checked; summary.textContent = `${title} · ${inherit.checked ? "继承默认" : "单独配置"}`;
+      const row = { inherit, custom, inputs: setup.agents[agent] ? modelProfileFields(custom, setup.agents[agent]) : null };
+      fields.agents[agent] = row;
+      const toggle = () => {
+        if (!inherit.checked && !row.inputs) {
+          row.inputs = modelProfileFields(custom, { ...fields.default.saved,
+            ...Object.fromEntries(["baseUrl", "model", "thinking"].map(name => [name, fields.default[name].value])),
+            maxTokens: Number(fields.default.maxTokens.value), contextWindow: Number(fields.default.contextWindow.value),
+            maxPiMs: Math.round(Number(fields.default.maxPiMs.value) * 1000),
+            modelParameters: { ...fields.default.saved.modelParameters, maxOutputTokens: Number(fields.default.maxTokens.value) },
+            ...Object.fromEntries(Object.entries(fields.default.capabilities).map(([name, input]) => [name, input.checked])) });
+          appendModelTest(custom, agent, () => modelProfileInput(row.inputs), projectId);
+        }
+        custom.hidden = inherit.checked; summary.textContent = `${title} · ${inherit.checked ? "继承默认" : "单独配置"}`;
         for (const node of custom.querySelectorAll("input,select,button")) node.disabled = inherit.checked; };
-      inherit.addEventListener("change", toggle); toggle(); fields.agents[agent] = { inherit, inputs };
-      appendModelTest(section, () => inherit.checked ? "default" : agent, () => modelProfileInput(inherit.checked ? fields.default : inputs), projectId);
+      inherit.addEventListener("change", toggle); toggle();
+      if (row.inputs) appendModelTest(custom, agent, () => modelProfileInput(row.inputs), projectId);
     }
     return fields;
   }, async fields => {
@@ -1701,7 +1813,7 @@ async function openModelSettings() {
       body: JSON.stringify({ expectedConfigHash: setup.expectedConfigHash, default: modelProfileInput(fields.default),
         agents: Object.fromEntries(Object.entries(fields.agents).map(([agent, row]) => [agent, row.inherit.checked ? null : modelProfileInput(row.inputs)])),
         maxCostUsd: Number(fields.maxCostUsd.value) }) });
-    fields.default.apiKey.value = ""; for (const row of Object.values(fields.agents)) row.inputs.apiKey.value = "";
+    fields.default.apiKey.value = ""; for (const row of Object.values(fields.agents)) if (row.inputs) row.inputs.apiKey.value = "";
     await refresh(); toast("模型设置已保存。后续调用使用新配置，已有需求、方案和审核记录保留。");
   }, "保存模型配置");
 }
@@ -1778,9 +1890,9 @@ async function openProjectSettings() {
   const setup = await api("/api/project-execution");
   const gitSetup = setup.mode === "git" ? await api("/api/project-git") : null;
   if (!["local", "unconfigured", "jenkins", "gitlab", "github"].includes(setup.kind)) return toast(`此项目使用 ${setup.kind} 扩展，请由开发人员维护已有配置。`, false);
-  structuredModal("项目设置", "由管理员维护 Git 交付规则和 Jenkins 等固定测试环境的发布连接。有自动部署环境就配置；本地测试的启动方式和地址由研发在需求中设置。保存不会执行检查或发布。", form => {
+  structuredModal("项目设置", "由管理员维护 Git 交付规则和固定测试环境连接。本地启动和影响范围内的检查由系统写入研发方案，确认时无需填命令。保存不会执行检查或发布。", form => {
     const checks = formField(form, "项目共用检查命令（可选，每行一条）", "textarea", "使用项目已有的测试脚本命令"); checks.value = setup.checksText;
-    form.append(element("p", "plain-copy", "可预设团队共用检查，也可留空，由负责研发在确认方案时读取或填写本次需求的检查命令。"));
+    form.append(element("p", "plain-copy", "可留空。这里只提供项目检查候选，系统根据源码依赖在研发方案中选择本次范围，不会默认全量回归。"));
     const kind = formField(form, "固定测试环境发布工具", "select");
     for (const [value, label] of [["unconfigured", "未配置固定测试环境"], ["jenkins", "Jenkins"], ["gitlab", "GitLab CI/CD"], ["github", "GitHub Actions"], ["local", "固定环境的已有发布脚本"]]) {
       const option = element("option", "", label); option.value = value; kind.append(option);
@@ -1841,40 +1953,19 @@ async function openPlanApproval() {
     body: JSON.stringify({ action: "local-validation", stage: "development", expectedPlanHash }) });
   if (state.selectedId !== taskId || state.currentProjectId !== projectId) return;
   structuredModal("确认方案并开发", "核对技术方案与本次检查方式。Pi 在独立工作目录开发和测试；完成后再选择本地人工验证或发布测试环境。", form => {
-    const checks = formField(form, "本次需求的自动检查命令（每行一条）", "textarea", "选择下方已有脚本，或填写项目实际使用的命令。");
-    checks.value = development.checks.map(argv => argv.map(value => `'${value.replaceAll("'", "'\\''")}'`).join(" ")).join("\n");
-    if (!development.checks.length) {
-      const files = state.detail.planAnalysis.draft.affectedFiles;
-      checks.value = development.checkScripts.filter(script => script.kind === "test" && !script.unavailableReason
-        && (script.directory === "." || files.some(file => file.startsWith(`${script.directory}/`))))
-        .map(script => script.command).join("\n");
-      if (checks.value) form.append(element("p", "plain-copy", "已填入与本次改动相关的测试命令，请核对后确认。这里只读取配置，尚未执行测试。"));
-    }
-    checks.required = true; checks.maxLength = 8000;
-    form.append(element("p", "plain-copy", "命令在隔离项目根目录执行，仅保存到本次需求。测试命令验证功能；构建和静态检查只验证对应事项，Pi 仍需补齐本次验收测试。"));
-    if (development.checkScripts.length) {
-      const scripts = formField(form, "读取项目已有检查配置", "select"); scripts.required = false;
-      const empty = element("option", "", "选择一项添加到检查命令"); empty.value = ""; scripts.append(empty);
-      for (const [index, script] of development.checkScripts.entries()) {
-        const option = element("option", "", `${script.kind === "test" ? "测试" : "构建/静态检查"} · ${script.sourceFile} · ${script.command}${script.unavailableReason ? ` · 不可用：${script.unavailableReason}` : ""}`);
-        option.value = String(index); option.disabled = Boolean(script.unavailableReason); scripts.append(option);
-      }
-      scripts.value = "";
-      scripts.addEventListener("change", () => {
-        if (scripts.value === "") return;
-        const command = development.checkScripts[Number(scripts.value)].command;
-        if (!checks.value.split("\n").includes(command)) checks.value = checks.value.trim() ? `${checks.value.trim()}\n${command}` : command;
-        scripts.value = ""; checks.focus();
-      });
-    } else form.append(element("p", "plain-copy", "未发现可读取的检查脚本，请按项目说明填写实际命令。"));
-    if (!setup) return { checks };
+    const validation = development.validation;
+    for (const item of validation.checks) form.append(element("p", "plain-copy", `自动检查：${item.command.join(" ")} · ${item.reason}`));
+    for (const item of validation.skipped) form.append(element("p", "plain-copy", `跳过：${item.command.join(" ")} · ${item.reason}`));
+    if (!validation.checks.length) form.append(element("p", "plain-copy", `待人工验证：${validation.manualReason}`));
+    for (const service of validation.startup) form.append(element("p", "plain-copy", `本地启动：${service.name} · ${service.url}`));
+    if (!setup) return {};
     form.append(element("p", "plain-copy", `方案 v${meta.planVersion} · 基础版本 ${meta.baseRevision?.slice(0, 12)} · 合并目标 ${setup.releaseBranch}`));
     const kind = formField(form, "开发分支", "select");
     for (const [value, text] of [["new", "新建需求分支（推荐）"], ["existing", "使用已有需求分支"]]) {
       const option = element("option", "", text); option.value = value; kind.append(option);
     }
     kind.value = "new";
-    const branch = formField(form, "新分支名称", "input"); branch.value = `${setup.branchPrefix}/${taskId}`;
+    const branch = formField(form, "新分支名称", "input"); branch.value = `${setup.branchPrefix}/${taskId}${meta.restartCount ? `-restart-${meta.restartCount}` : ""}`;
     const existing = formField(form, "已有需求分支", "select");
     for (const name of setup.branches.filter(name => ![setup.baseBranch, setup.releaseBranch, setup.testBranch].includes(name))) {
       const option = element("option", "", name); option.value = name; existing.append(option);
@@ -1882,11 +1973,11 @@ async function openPlanApproval() {
     const update = () => { branch.parentElement.hidden = kind.value !== "new"; branch.required = kind.value === "new";
       existing.parentElement.hidden = kind.value !== "existing"; existing.required = kind.value === "existing"; };
     kind.addEventListener("change", update); update();
-    return { kind, branch, existing, checks };
+    return { kind, branch, existing };
   }, fields => {
     if (state.selectedId !== taskId || state.currentProjectId !== projectId) throw new Error("需求已切换，请重新确认。");
     closeModal();
-    return sendAction("approve-plan", { expectedPlanHash, checksText: fields.checks.value.trim(),
+    return sendAction("approve-plan", { expectedPlanHash,
       ...(setup ? { developmentBranch: { kind: fields.kind.value, branch: fields.kind.value === "new" ? fields.branch.value.trim() : fields.existing.value } } : {}) });
   }, "确认方案并开始开发");
 }
@@ -1895,31 +1986,22 @@ async function openGitDelivery(action) {
   const { meta } = state.detail; const taskId = state.selectedId; const projectId = state.currentProjectId;
   const input = { expectedAfterHash: meta.afterHash, expectedPlanHash: meta.planHash };
   if (action === "local-validation") {
-    const result = await api(`/api/tasks/${encodeURIComponent(taskId)}/actions`, { method: "POST",
-      headers: { "Content-Type": "application/json", "X-Reqflow-Token": state.token }, body: JSON.stringify({ action, ...input }) });
+    const result = await sendAction(action, input, true);
+    if (!result) return;
     if (state.selectedId !== taskId || state.currentProjectId !== projectId) return;
-    structuredModal("本地测试设置", "由负责研发设置当前需求的本地启动方式和测试地址，也可读取项目已有脚本。配置保存在当前需求中；启动由研发在本地执行，保存不会执行命令、合并或发布。", form => {
-      form.append(element("p", "plain-copy", `工作目录：${result.workspace}`), element("p", "plain-copy", `基础版本：${result.baseRevision ?? result.baseHash}`));
-      const instructions = formField(form, "本地启动方式", "textarea", "例如：在 frontend 目录启动前端，在 backend 目录用本地测试配置启动后端。请填写实际命令或步骤。");
-      instructions.required = false; instructions.maxLength = 8000; instructions.value = result.environment?.instructions ?? "";
-      const url = formField(form, "本地测试地址", "input", "http://localhost:8080/");
-      url.type = "url"; url.required = false; url.maxLength = 2000; url.value = result.environment?.url ?? "";
-      if (result.startupScripts.length) {
-        const scripts = formField(form, "读取项目已有启动脚本", "select"); scripts.required = false;
-        const empty = element("option", "", "选择脚本，将启动命令填入上方"); empty.value = ""; scripts.append(empty); scripts.value = "";
-        for (const [index, script] of result.startupScripts.entries()) {
-          const option = element("option", "", `${script.sourceFile} · ${script.command}`); option.value = String(index); scripts.append(option);
-        }
-        scripts.addEventListener("change", () => {
-          if (scripts.value === "") return;
-          const script = result.startupScripts[Number(scripts.value)];
-          const line = `在 ${script.directory === "." ? "项目根目录" : script.directory} 运行：${script.command}`;
-          instructions.value = instructions.value.trim() ? `${instructions.value.trim()}\n${line}` : line;
-          scripts.value = ""; instructions.focus();
-        });
-      } else form.append(element("p", "plain-copy", "没有识别到 package.json 中的启动脚本。可按项目说明填写实际启动步骤，不会猜测后端配置或测试地址。"));
-      form.append(element("p", "plain-copy", "已通过的自动检查（项目启动方式请查看项目说明）："));
-      const commands = element("pre", "archive-result"); commands.textContent = result.checks.map(argv => argv.map(value => `'${value.replaceAll("'", "'\\''")}'`).join(" ")).join("\n"); form.append(commands);
+    structuredModal("本地环境验证", result.status === "running" ? "项目已启动。按方案中的验收场景验证，也可关闭窗口后发布测试环境。" : "此项目没有常驻本地服务。按方案验证 CLI/库，也可直接发布测试环境。", form => {
+      form.append(element("p", "plain-copy", `工作目录：${result.workspace}`));
+      for (const service of result.services) {
+        const link = element("a", "button", `打开 ${service.name}`); link.href = service.url; link.target = "_blank"; link.rel = "noopener"; form.append(link);
+        const log = element("pre", "archive-result"); log.textContent = service.tail; form.append(log);
+      }
+      if (result.status === "running") {
+        const stop = element("button", "button", "停止本地环境"); stop.type = "button";
+        stop.addEventListener("click", async () => {
+          if (state.selectedId !== taskId || state.currentProjectId !== projectId) throw new Error("需求已切换，请重新打开本地环境。");
+          await sendAction(action, { ...input, operation: "stop" }); closeModal();
+        }); form.append(stop);
+      }
       if (result.patch !== null) {
         const download = element("button", "button", "下载本次修改补丁"); download.type = "button";
         download.addEventListener("click", () => {
@@ -1928,11 +2010,11 @@ async function openGitDelivery(action) {
         });
         form.append(download, element("p", "plain-copy", "在对应基础版本运行 git apply --check，再运行 git apply 应用补丁。若本地有修改，回传的是相对于本次 Agent 结果的补丁。"));
       }
-      return { instructions, url };
-    }, async fields => {
-      if (state.selectedId !== taskId || state.currentProjectId !== projectId) throw new Error("需求已切换，请重新打开本地测试设置。");
-      return sendAction(action, { ...input, environment: { instructions: fields.instructions.value.trim(), url: fields.url.value.trim() } });
-    }, "保存本地测试设置");
+      return {};
+    }, async () => {
+      closeModal();
+      if (state.selectedId === taskId && state.currentProjectId === projectId) await refresh(taskId);
+    }, "完成，返回需求");
     return;
   }
   if (action === "recheck-local") {
@@ -1947,6 +2029,7 @@ async function openGitDelivery(action) {
       if (state.selectedId !== taskId || state.currentProjectId !== projectId) throw new Error("需求已切换，请重新确认。");
       const file = fields.patch?.files[0];
       if (file && file.size > 1024 * 1024) throw new Error("补丁不能超过 1 MiB。");
+      closeModal();
       return sendAction(action, { ...input, ...(file ? { patch: await file.text() } : {}) });
     }, "重新检查");
     return;
@@ -1992,6 +2075,17 @@ async function openGitDelivery(action) {
 }
 
 function openModal(action) {
+  if (action === "extend-execution-budget") {
+    const expectedAuditHead = state.detail.auditHead;
+    return structuredModal("追加执行时长", "为继续处理这条需求明确增加1至60分钟模型执行时长。原有消耗、失败和未知用量全部保留；追加时长不会自动执行需求。", form => {
+      const minutes = formField(form, "追加分钟数", "number", "1至60分钟");
+      minutes.min = 1; minutes.max = 60; minutes.step = 1; minutes.required = true;
+      const reason = formField(form, "继续执行的原因", "textarea", "说明已定位的问题及继续执行范围");
+      reason.required = true; reason.maxLength = 4000;
+      return { minutes, reason };
+    }, fields => sendAction(action, { expectedAuditHead,
+      additionalModelMs: Number(fields.minutes.value) * 60000, reason: fields.reason.value.trim() }));
+  }
   if (action === "revise-plan" && state.detail.meta.state === "contract_confirmed" && state.detail.meta.planHash
       && state.detail.meta.planFeedbackVersion === state.detail.meta.planVersion) {
     return sendAction("revise-plan", { retry: true, expectedPlanHash: state.detail.meta.planHash });
@@ -2010,6 +2104,7 @@ function openModal(action) {
   if (["local-validation", "recheck-local", "publish-test"].includes(action)) return openGitDelivery(action).catch(error => toast(error.message, true));
   if (action === "redeploy-test" && state.overview.project.mode === "git") return openGitDelivery(action).catch(error => toast(error.message, true));
   const taskId = state.selectedId; const expectedPlanHash = state.detail.meta.planHash; const expectedAfterHash = state.detail.meta.afterHash;
+  const expectedAuditHead = state.detail.auditHead;
   const copy = {
     develop: ["从当前现场继续", "沿用已确认方案、已有修改及可用的 Pi 会话，在剩余任务预算内继续开发和测试。可恢复问题最多自动处理一次；仍失败时保留原因和现场。", null, null],
     "redeploy-test": ["重新发布测试环境", "确认重新发布本需求的已验证代码，不会重新开发或改变需求。", null, null],
@@ -2023,6 +2118,7 @@ function openModal(action) {
     "observe-release": ["记录发布观察", "简要记录上线后健康状态和关键功能结果。", "例如：错误率正常，核心接口抽查通过。", "evidence"],
     "approve-release": ["批准生产发布", `确认发布候选版本 ${state.detail.meta.mergedRevision || state.detail.meta.candidateHash} 已验证，且人工测试结论可接受。`, null, null],
     rollback: ["恢复需求工作目录", "恢复本需求工作目录中的文件，先检查后续修改是否冲突。远端提交和已发布环境需在对应平台回退。", null, null],
+    "restart-development": ["返回研发方案", "沿用已确认的需求和研发分工，重新设计并确认方案后再开发。上一轮方案、审批、代码快照和累计用量保留；此操作不会调用模型或开始修改代码。", null, null],
   }[action];
   if (!copy) return sendAction(action);
   const [title, description, placeholder, field] = copy;
@@ -2040,7 +2136,8 @@ function openModal(action) {
     const value = input?.value.trim();
     if (state.selectedId !== taskId) return toast("需求已切换，请重新打开当前需求的操作。", true);
     if (field && !value) return toast("请填写具体内容。", true);
-    closeModal(); await sendAction(action, action === "develop" ? { authorizeImplementation: true, expectedPlanHash, expectedAfterHash }
+    closeModal(); await sendAction(action, action === "restart-development" ? { expectedAuditHead }
+      : action === "develop" ? { authorizeImplementation: true, expectedPlanHash, expectedAfterHash }
       : action === "redeploy-test" ? { authorizeDeployment: true, expectedAfterHash, expectedPlanHash }
       : action === "approve-plan" ? { expectedPlanHash } : field ? { [field]: value } : {});
   });
@@ -2059,7 +2156,7 @@ $("#taskList").addEventListener("click", async (event) => {
   state.tab = "plan";
   try { await loadDetail(item.dataset.id); } catch (error) { toast(error.message, true); }
 });
-$("#detailPanel").addEventListener("click", (event) => {
+$("#detailPanel").addEventListener("click", async (event) => {
   const file = event.target.closest("[data-file]");
   if (file) {
     const taskId = state.selectedId;
@@ -2073,6 +2170,20 @@ $("#detailPanel").addEventListener("click", (event) => {
   const button = event.target.closest("[data-action]");
   if (!button) return;
   const action = button.dataset.action;
+  if (action === "pause-execution") {
+    const taskId = state.selectedId, projectId = state.currentProjectId;
+    button.disabled = true;
+    try {
+      const execution = await api(`/api/tasks/${encodeURIComponent(taskId)}/actions`, { method: "POST",
+        headers: { "Content-Type": "application/json", "X-Reqflow-Token": state.token }, body: JSON.stringify({ action }) });
+      if (taskId === state.selectedId && projectId === state.currentProjectId) {
+        state.detail.execution = execution; renderDetail(); pollExecution();
+      }
+      toast("正在终止当前进程，保存现场后即可继续。");
+    } catch (error) { toast(error.message, true); button.disabled = false; }
+    return;
+  }
+  if (action === "continue-execution") return sendAction(action, { expectedAuditHead: state.detail.auditHead });
   if (action === "configure-project") return openProjectSettings().catch(error => toast(error.message, true));
   if (action === "assign-member" || action === "assign-team") return openAssignmentForm().catch((error) => toast(error.message, true));
   if (action === "review-plan-frontend" || action === "review-plan-backend") {
@@ -2155,13 +2266,21 @@ async function establishSession() {
     $("#changePasswordRoot").hidden = false;
     return;
   }
-  await refresh();
   $("#loginRoot").hidden = true;
-  if (session.principal.mustChangePassword) {
-    $("#changePasswordRoot").hidden = false;
-  } else {
-    $("#changePasswordRoot").hidden = true;
+  $("#changePasswordRoot").hidden = true;
+  try {
+    await refresh();
+  } catch (error) {
+    if (error.status === 401) throw error;
+    state.detail = null;
+    state.diff = null;
+    clear($("#detailPanel")).append(element("h2", "", "工作台内容加载失败"),
+      element("p", "error-copy", error.message),
+      element("p", "plain-copy", "登录成功。可以切换项目、配置模型或新建需求；处理记录错误后点击刷新重试。"));
+    toast(`工作台加载失败：${error.message}`, true);
+    return { authenticated: true, workspaceReady: false, error: error.message };
   }
+  return { authenticated: true, workspaceReady: true };
 }
 
 function renderProjectSelector() {
@@ -2510,6 +2629,11 @@ $("#projectRefButton").addEventListener("click", async () => {
   $("#projectRefModal").hidden = false;
   $("#projectRefContent").textContent = "加载中…";
   try {
+    if (state.actions.has("audit-report")) {
+      const status = await api("/api/project-reference/execution");
+      $("#projectRefRefresh").dataset.running = status.execution ? "true" : "false";
+      $("#projectRefRefresh").textContent = status.execution ? "暂停文档生成" : "刷新文档";
+    }
     const data = await api("/api/project-reference");
     projectDocuments = data;
     $("#projectRefAgent").disabled = typeof data.agentContent !== "string";
@@ -2525,14 +2649,27 @@ $("#projectRefClose").addEventListener("click", () => {
 
 $("#projectRefRefresh").addEventListener("click", async () => {
   const button = $("#projectRefRefresh");
-  button.disabled = true;
-  button.textContent = "刷新中…";
+  if (button.dataset.running === "true") {
+    button.disabled = true;
+    try {
+      await api("/api/project-reference/execution", { method: "POST", headers: { "X-Reqflow-Token": state.token } });
+      button.textContent = "正在保存现场…";
+      $("#projectRefContent").textContent = "正在停止模型，保留原文档与本轮记录。";
+    } catch (error) { toast(error.message, true); button.disabled = false; }
+    return;
+  }
+  button.dataset.running = "true";
+  button.textContent = "暂停文档生成";
   $("#projectRefContent").textContent = "正在重新生成文档…";
   try {
     const data = await api("/api/project-reference/regenerate", {
       method: "POST",
       headers: { "X-Reqflow-Token": state.token },
     });
+    if (data.paused) {
+      $("#projectRefContent").textContent = "文档生成已暂停，原文档和审计保留。点击刷新文档可继续生成。";
+      return;
+    }
     projectDocuments = data;
     $("#projectRefAgent").disabled = false;
     $("#projectRefDeveloper").click();
@@ -2540,6 +2677,7 @@ $("#projectRefRefresh").addEventListener("click", async () => {
   } catch (error) {
     $("#projectRefContent").textContent = `刷新失败：${error.message}`;
   } finally {
+    button.dataset.running = "false";
     button.disabled = false;
     button.textContent = "刷新文档";
   }

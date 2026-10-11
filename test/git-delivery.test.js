@@ -9,7 +9,7 @@ import { loadProject } from "../src/config.js";
 import { addCredential } from "../src/auth.js";
 import { assignMember, respondToAssignment } from "../src/assignment.js";
 import { recordDevFeedback, confirmContract } from "../src/intake.js";
-import { plan, implement, verify, approvePlan } from "../src/workflow.js";
+import { plan, implement, verify, approvePlan, rollback } from "../src/workflow.js";
 import { executeRequirementAction } from "../src/actions.js";
 import { localValidation, publishTest, recheckLocalChanges, readGitSetup, candidateReview, redeployTest } from "../src/git-delivery.js";
 import { getRequirementEvidence } from "../src/evidence.js";
@@ -72,12 +72,32 @@ async function developFixture(f, branch = { kind: "new", branch: "devsail/REQ-00
 function confirmation(meta, merge = false) { return { authorizeGit: true, expectedAfterHash: meta.afterHash,
   expectedPlanHash: meta.planHash, testMode: merge ? "merge" : "branch", ...(merge ? { testBranch: "integration" } : {}) }; }
 
-test("task-scoped developer checks survive Git merge and test deployment without global checks", async t => {
-  const f = await fixture(t, true, { checks: [] });
+test("Git rollback restart preserves the old branch and develops in a fresh worktree", async t => {
+  const f = await fixture(t);
+  const previous = await developFixture(f);
+  const oldHead = git(previous.workspace, "rev-parse", "HEAD");
+  await rollback(f.root, "REQ-001", "reviewer");
+  const rolled = await readTask(f.project, "REQ-001");
+  await executeRequirementAction(f.root, "REQ-001", { action: "restart-development", expectedAuditHead: rolled.lastHash }, actor);
+  await plan(f.root, "REQ-001"); await approvePlan(f.root, "REQ-001", "reviewer");
+  await implement(f.root, "REQ-001"); await verify(f.root, "REQ-001");
+  const next = await readTask(f.project, "REQ-001");
+  assert.equal(next.meta.branch, "devsail/REQ-001-restart-1");
+  assert.notEqual(next.meta.workspace, previous.workspace);
+  assert.equal(git(previous.workspace, "rev-parse", "HEAD"), oldHead);
+  assert.equal(git(previous.workspace, "status", "--porcelain"), "");
+  assert.equal(git(f.root, "rev-parse", previous.branch), oldHead);
+  assert.equal(git(f.root, "rev-parse", "HEAD"), oldHead);
+  const evidence = await getRequirementEvidence(f.root, actor, "REQ-001");
+  assert.equal(evidence.implementationAttempts.filter(item => item.priorState === "rolled_back").length, 1);
+  assert.equal(next.meta.state, "verified");
+});
+
+test("plan-scoped checks survive Git merge and test deployment without manual commands", async t => {
+  const f = await fixture(t, true);
   const planMeta = (await readTask(f.project, "REQ-001")).meta;
-  const checksText = `'${process.execPath}' --test --test-reporter=tap test/calculator.test.mjs`;
   const result = await executeRequirementAction(f.root, "REQ-001", { action: "approve-plan", expectedPlanHash: planMeta.planHash,
-    checksText, developmentBranch: { kind: "new", branch: "devsail/REQ-001" } }, actor);
+    developmentBranch: { kind: "new", branch: "devsail/REQ-001" } }, actor);
   assert.equal(result.state, "verified");
   const meta = (await readTask(f.project, "REQ-001")).meta;
   assert.deepEqual(meta.checks[0].command, meta.developmentChecks[0]);
@@ -85,7 +105,7 @@ test("task-scoped developer checks survive Git merge and test deployment without
   assert.equal(deployed.state, "test_deployed");
   const merged = (await readTask(f.project, "REQ-001")).events.findLast(event => event.type === "git_candidate_verified");
   assert.deepEqual(merged.detail.checks[0].command, meta.developmentChecks[0]);
-  assert.deepEqual((await loadProject(f.root)).config.checks, []);
+  assert.equal(meta.verificationMode, "automated");
 });
 
 test("branch development pins the reviewed revision while other developers advance main", async t => {

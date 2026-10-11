@@ -41,7 +41,7 @@ const emit=message=>console.log(JSON.stringify({type:'message_end',message}));
 const paid={role:'assistant',provider:'pool',model:'primary',stopReason:'toolUse',content:[],usage:{input:7,output:2,cacheRead:0,cacheWrite:0,cost:{total:0.01}}};
 emit(paid);
 for(const fn of handlers.get('context'))await fn({messages:[paid]});
-const pre=handlers.get('before_provider_request')[0];await pre({payload:{}},{});await pre({payload:{}},{});
+const pre=handlers.get('before_provider_request')[0];await pre({payload:{messages:[]}},{});await pre({payload:{messages:[]}},{});
 const failure={...paid,stopReason:'error',errorMessage:${JSON.stringify(errorCode)},usage:{input:0,output:0,cacheRead:0,cacheWrite:0,cost:{total:0}}};emit(failure);
 await handlers.get('turn_end')[0]({message:failure});
 for(const fn of handlers.get('agent_before_settle')??[]) assert.equal(await fn({},{}),undefined);
@@ -69,7 +69,8 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
     mode: "local", environment: { pi: ["PATH"] }, allowedPaths: ["."], excludedPaths: [],
     maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 20000,
     compatibleProviders: [{ name: "pool", baseUrl: "https://example.com", apiKeyEnv: "PATH", models:
-      ["primary", "unconstrained", "schema-secondary"].map(id => ({ id, supportsJsonSchema: id !== "unconstrained" })) }] };
+      ["primary", "unconstrained", "schema-secondary"].map(id => ({ id, input: ["text"], contextWindow: 65536,
+        maxTokens: 8192, reasoning: false, supportsJsonSchema: id !== "unconstrained" })) }] };
   await assert.rejects(runPi({ config }, directory, "plan", "Return JSON", path.join(directory, "events.jsonl"), 1, null, [], {
     maxTokens: 1000, maxMs: 3000, outputSchema: { name: "test", strict: true,
       schema: { type: "object", additionalProperties: false, required: ["ok"], properties: { ok: { type: "boolean" } } } },

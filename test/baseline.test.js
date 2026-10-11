@@ -95,7 +95,10 @@ test("initialization inventories architecture evidence and refreshes a stale sou
   assert.match(developerGuide, /项目开发指南/);
   assert.doesNotMatch(developerGuide, /负责人待确认/);
   assert.ok(await fs.stat(JSON.parse(documentResult.stdout).agentFile));
-  assert.equal(await fs.readFile(JSON.parse(documentResult.stdout).claudeFile, "utf8"), "@AGENTS.md\n");
+  const documented = JSON.parse(documentResult.stdout);
+  assert.equal(path.basename(documented.agentFile), "agent.md");
+  assert.match(await fs.readFile(documented.agentFile, "utf8"), /Project context/);
+  assert.equal(documented.claudeFile, undefined);
   assert.match(await fs.readFile(path.join(project.archive, "baseline.md"), "utf8"), /数据库与数据层/);
   assert.equal(baselineCli(root, "baseline-status").status, 0);
 

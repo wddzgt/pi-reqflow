@@ -28,6 +28,7 @@ async function fixture(t, objective = "Add multiplication",
     environment: { pi: [], checks: [], localDeployment: [] },
     allowedPaths: ["src", "test"], excludedPaths: [".env"], maxSnapshotBytes: 1000000,
     maxPiMs: 30000, maxToolCalls: 20, maxEventBytes: 1000000, maxCostUsd: 2,
+    planReview: "full", // Explicit specialist-review coverage; default routing is tested in workflow.test.js.
     fastPath: { enabled: true, maxFiles: 2, maxAcceptance: 2, maxChangedBytes: 10000,
       allowedPaths: ["src", "test"] },
     checks: [[process.execPath, "--test", "test/calculator.test.mjs"]],
@@ -78,11 +79,11 @@ test("fast path waits for human plan confirmation then pauses for the developer'
   assert.equal(task.meta.changeApproval, undefined);
   assert.equal(task.events.find((event) => event.type === "plan_approved").detail.approvalKind, "human");
   assert.equal(task.events.filter((event) => event.type === "plan_draft_completed").length, 1);
-  assert.deepEqual(task.events.filter((event) => event.type === "plan_specialist_completed").map(event => event.detail.role), ["qa"]);
+  assert.deepEqual(task.events.filter((event) => event.type === "plan_specialist_completed").map(event => event.detail.role), ["all"]);
   const specialist = task.events.find(event => event.type === "plan_specialist_completed").detail.findings;
   assert.equal(specialist.contractHash, task.meta.contractHash);
   assert.equal(specialist.analysisHash, task.events.find(event => event.type === "plan_draft_completed").detail.analysisHash);
-  assert.equal(specialist.role, "qa");
+  assert.equal(specialist.role, "all");
   assert.match(await fs.readFile(path.join(task.meta.workspace, "test/calculator.test.mjs"), "utf8"),
     /multiply returns the product/);
   assert.equal((await executeRequirementAction(root, "REQ-FAST", { action: "fast-track" }, reviewer)).state,
@@ -124,7 +125,7 @@ test("historical behavior changes leave the fast path for responsible human revi
   await assert.rejects(executeRequirementAction(root, "REQ-FAST", { action: "fast-track" }, reviewer), /no historical behavior/);
   const task = await readTask(project, "REQ-FAST");
   assert.equal(task.meta.state, "plan_review");
-  assert.deepEqual(task.events.filter((event) => event.type === "plan_specialist_completed").map((event) => event.detail.role), ["qa"]);
+  assert.deepEqual(task.events.filter((event) => event.type === "plan_specialist_completed").map((event) => event.detail.role), ["all"]);
   assert.equal(task.meta.workspace, undefined);
   assert.equal((await executeRequirementAction(root, "REQ-FAST", { action: "approve-plan" }, reviewer)).state, "verified");
   assert.equal((await readTask(project, "REQ-FAST")).meta.planApprovedBy, "reviewer");
@@ -144,20 +145,20 @@ test("directory projects without a fixed environment can develop and request loc
   assert.equal(local.patch, null);
   assert.equal(local.workspace, task.meta.workspace);
   assert.equal(local.baseHash, task.meta.baseHash);
-  assert.deepEqual(local.startupScripts, [{ sourceFile: "package.json", directory: ".", command: "npm run dev" }]);
-  const environment = { instructions: "使用独立测试数据库，在项目根目录运行 npm run dev", url: "http://localhost:8080/" };
+  assert.equal(local.status, "not_applicable");
+  const environment = local.environment;
   const input = { action: "local-validation", expectedAfterHash: task.meta.afterHash, expectedPlanHash: task.meta.planHash };
   const policyBefore = await fs.readFile(path.join(project.archive, "config.json"), "utf8");
-  const configured = await executeRequirementAction(root, "REQ-FAST", { ...input, environment }, reviewer);
+  const configured = await executeRequirementAction(root, "REQ-FAST", input, reviewer);
   assert.deepEqual(configured.environment, environment);
   assert.equal(await fs.readFile(path.join(project.archive, "config.json"), "utf8"), policyBefore);
   await assert.rejects(executeRequirementAction(root, "REQ-FAST", { ...input, environment },
     { id: "product", roles: ["product"] }), /Role cannot perform/);
   await assert.rejects(executeRequirementAction(root, "REQ-FAST", { ...input,
-    environment: { instructions: "", url: "javascript:alert(1)" } }, reviewer), /HTTP\/HTTPS/);
+    environment: { instructions: "", url: "javascript:alert(1)" } }, reviewer), /不接受手填/);
   assert.deepEqual((await executeRequirementAction(root, "REQ-FAST", input, reviewer)).environment, environment);
   await executeRequirementAction(root, "REQ-FAST", { ...input, action: "recheck-local" }, reviewer);
-  assert.deepEqual((await readTask(project, "REQ-FAST")).meta.localValidation.environment, environment);
+  assert.equal((await readTask(project, "REQ-FAST")).meta.localValidation, null);
   await executeRequirementAction(root, "REQ-FAST", input, reviewer);
   await assert.rejects(executeRequirementAction(root, "REQ-FAST", { action: "deploy-test" }, reviewer), /尚未连接固定测试环境/);
   const current = await readTask(project, "REQ-FAST");
@@ -174,13 +175,13 @@ test("directory projects without a fixed environment can develop and request loc
   assert.equal(archived.testDeployment, undefined);
 });
 
-test("missing automatic checks allows plan discussion but refuses implementation before changes", async (t) => {
+test("no automated checks leaves manual acceptance pending without blocking implementation", async (t) => {
   const { root, project, reviewer } = await fixture(t, "Add multiplication", undefined,
     { checks: [], testDeployment: { kind: "unconfigured" } });
   await executeRequirementAction(root, "REQ-FAST", { action: "plan" }, reviewer);
-  await assert.rejects(executeRequirementAction(root, "REQ-FAST", { action: "approve-plan" }, reviewer), /准备自动检查命令/);
+  await executeRequirementAction(root, "REQ-FAST", { action: "approve-plan" }, reviewer);
   const task = await readTask(project, "REQ-FAST");
-  assert.equal(task.meta.state, "plan_review");
-  assert.equal(task.meta.workspace, undefined);
-  assert.equal(task.events.some(event => event.type === "plan_approved" || event.type === "implementing"), false);
+  assert.equal(task.meta.state, "verified");
+  assert.equal(task.meta.verificationMode, "manual_pending");
+  assert.deepEqual(task.meta.checks, []);
 });

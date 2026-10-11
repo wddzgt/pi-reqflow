@@ -138,7 +138,7 @@ h1 { margin-bottom: 7px; font-size: clamp(28px, 2.8vw, 36px); letter-spacing: -1
 .button.primary:hover { background: #4353d1; }
 .button.danger { color: #bd575f; border-color: #efcdd0; }
 .button:disabled { opacity: .48; cursor: wait; }
-.detail-tabs { border-bottom: 1px solid #e9ecf1; display: flex; gap: 26px; margin-bottom: 20px; overflow-x: auto; }
+.detail-tabs { border-bottom: 1px solid #e9ecf1; display: flex; flex-wrap: wrap; gap: 8px 26px; margin-bottom: 20px; }
 .detail-tab { border: 0; background: transparent; color: #9ca6b5; font-size: 11px; padding: 0 1px 12px; white-space: nowrap; font-weight: 690; border-bottom: 2px solid transparent; }
 .detail-tab:hover { color: #5966d1; }
 .detail-tab.active { color: #5362d7; border-bottom-color: #6270df; }

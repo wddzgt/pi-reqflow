@@ -462,8 +462,7 @@ export async function generateProjectReference(registryEntry, loadedProject, out
   const baseline = await readProjectBaseline(loadedProject);
   const initialized = await initializeProjectContext(loadedProject, baseline);
   return { content: initialized.documents["PROJECT_REFERENCE.md"], snapshotHash: baseline.snapshotHash,
-    sourceHash: baseline.sourceHash, agentFile: path.join(outputDirectory, "AGENTS.md"),
-    claudeFile: path.join(outputDirectory, "CLAUDE.md"), initialization: initialized.metadata };
+    sourceHash: baseline.sourceHash, agentFile: path.join(outputDirectory, "agent.md"), initialization: initialized.metadata };
 }
 
 export async function regenerateProjectReference(projectId) {

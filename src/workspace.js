@@ -47,10 +47,10 @@ export async function preparePlanWorkspace(project, id, attempt, baseline) {
   return workspace;
 }
 
-export async function prepareWorkspace(project, id, approvedHash, approvedRevision, selection) {
+export async function prepareWorkspace(project, id, approvedHash, approvedRevision, selection, restartCount = 0) {
   const current = project.config.mode === "local" ? await sourceManifest(project) : null;
   if (current && manifestHash(current) !== approvedHash) throw new Error("Source files changed after plan approval");
-  const workspace = workspacePath(project, id);
+  const workspace = `${workspacePath(project, id)}${restartCount ? `-restart-${restartCount}` : ""}`;
   if (await fs.stat(workspace).then(() => true, (error) => {
     if (error.code === "ENOENT") return false;
     throw error;
@@ -58,7 +58,7 @@ export async function prepareWorkspace(project, id, approvedHash, approvedRevisi
   await fs.mkdir(path.dirname(workspace), { recursive: true });
   let branch = null;
   if (project.config.mode === "git") {
-    branch = selection?.branch ?? `${project.config.branchPrefix}/${id}`;
+    branch = selection?.branch ?? `${project.config.branchPrefix}/${id}${restartCount ? `-restart-${restartCount}` : ""}`;
     await git(project.root, ["check-ref-format", "--branch", branch]);
     if (selection?.kind === "existing" && !selection.fromRemote) {
       if (await git(project.root, ["rev-parse", `refs/heads/${branch}`]) !== approvedRevision) throw new Error("开发分支与已审核方案的基础版本不同，请核对该分支上的技术方案。");
@@ -209,7 +209,7 @@ export async function prepareReleaseCandidate(project, id, task) {
   } catch (error) {
     throw new Error("Published requirement revision is not in the release branch", { cause: error });
   }
-  const candidateWorkspace = `${workspacePath(project, id)}-merged`;
+  const candidateWorkspace = `${workspacePath(project, id)}${task.restartCount ? `-restart-${task.restartCount}` : ""}-merged`;
   const tracked = await git(project.root, ["ls-tree", "-r", "--name-only", "-z", local]);
   const excluded = tracked.split("\0").filter((file) => file && (file.split("/").some((part) => part === ".env" || part.startsWith(".env."))
     || project.config.excludedPaths.some((part) => file === part || file.startsWith(`${part}/`))));

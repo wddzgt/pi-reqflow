@@ -6,6 +6,47 @@ import { safeId } from "../src/files.js";
 
 const source = await readFile(new URL("../web/app.js", import.meta.url), "utf8");
 
+test("busy and refreshed executions have an enabled pause button and saved pauses offer continuation", () => {
+  const { run } = workbench();
+  const attention = source.slice(source.indexOf("  let [attentionTitle, description, attentionTone, actions] = nextStep(meta);"),
+    source.indexOf("  attention.append(copy); panel.append(attention);"));
+  run(`state.actions=new Set(['pause-execution','continue-execution']);
+    state.detail={meta:{id:'REQ-1'},events:[]};state.busy=true;state.runningTask='REQ-1';
+    globalThis.readText=node=>[node.textContent||'',...node.children.map(readText)].join(' ');`);
+  const render = () => run(`{ const meta={id:'REQ-1',state:'contract_confirmed'},productView=false,stageIndex=1,isArchived=false;
+    ${attention} globalThis.attentionCopy=copy; }`);
+  render();
+  assert.equal(run("attentionCopy.children.find(node=>node.dataset.action==='pause-execution').disabled"), false);
+  run("state.busy=false;state.detail.execution={status:'running',elapsedMs:10000,progress:{message:'正在执行相关测试'}}");
+  render(); assert.match(run("readText(attentionCopy)"), /正在执行相关测试.*10 秒/);
+  assert.equal(run("attentionCopy.children.find(node=>node.dataset.action==='pause-execution').disabled"), false);
+  run("state.detail.execution.status='pausing'"); render();
+  assert.equal(run("attentionCopy.children.find(node=>node.dataset.action==='pause-execution').disabled"), true);
+  run("state.detail.execution=null;state.detail.meta.executionPause={actor:'dev'};state.detail.events=[{type:'execution_paused'}]");
+  run(`nextStep=()=>['old','old','active',[]]`);
+  const pausedAttention = attention.replace("const execution = state.detail.execution;", "const execution = state.detail.execution;meta.executionPause=state.detail.meta.executionPause;");
+  run(`{ const meta={id:'REQ-1',state:'contract_confirmed'},productView=false,stageIndex=1,isArchived=false;
+    ${pausedAttention} globalThis.attentionCopy=copy; }`);
+  assert.match(run("readText(attentionCopy)"), /现场已保存.*继续执行/);
+});
+
+test("rolled-back requirements expose a version-bound restart without starting AI work", async () => {
+  const { run, modal } = workbench();
+  run(`state.actions.add('restart-development');state.detail={auditHead:'rollback-head',
+    meta:{state:'rolled_back',id:'REQ-1',planVersion:1,assignments:{developer:{userId:'dev',status:'accepted'}}}};
+    globalThis.step=nextStep(state.detail.meta);globalThis.sent=[];sendAction=async(action,body)=>sent.push({action,body});`);
+  assert.equal(run("step[3][0][0]"), "restart-development");
+  assert.equal(run("canUseAction(state.detail.meta,'restart-development')"), true);
+  run("state.principal.id='other'");
+  assert.equal(run("canUseAction(state.detail.meta,'restart-development')"), false);
+  run("state.principal.id='dev';openModal('restart-development')");
+  assert.match(modal.children[0].children[1].textContent, /不.*调用模型/);
+  const submit = modal.children[0].children.at(-1).children[1];
+  await submit.listeners.click();
+  assert.equal(run("sent[0].action"), "restart-development");
+  assert.equal(run("sent[0].body.expectedAuditHead"), "rollback-head");
+});
+
 test("large-file review renders the actual changed context rather than omitting the diff", () => {
   const { run } = workbench();
   run(`globalThis.root=document.createElement('div');
@@ -98,8 +139,34 @@ test("developer process records show request timing without exposing technical d
   assert.doesNotMatch(run("readText(root)"), /fixture-model|首个响应|声明缺失/);
 });
 
+test("diagnostics show results and metrics first and render raw evidence only when requested", async () => {
+  const { run } = workbench();
+  run(`api=async()=>({summary:{attempts:1,failedAttempts:1,knownCostUsd:0,costMeasuredAttempts:0,costUsd:null},
+    total:1,recentFailures:[{at:'2026-10-10T00:00:00Z',stage:'implementation_failed',reason:'A real check failed'}],
+    runs:[{eventAt:'2026-10-10T00:00:00Z',eventType:'implementation_failed',status:'failed',error:'A real check failed',
+      telemetry:{provider:'fake',model:'model',durationMs:2000,assistantMessages:1,toolCalls:1,
+        tokens:{input:100,output:20,cacheRead:30,cacheWrite:0},
+        requestTimings:[{request:1,durationMs:1000,status:'completed',usageMeasured:true}],
+        toolTimings:[{tool:'edit',durationMs:5,status:'completed'}],
+        auditStorage:{storedBytes:1024,omittedEvents:40,omittedThinkingBlocks:1},traceId:'RAW_TRACE_MARKER'}}]});
+    globalThis.readText=node=>[node.textContent||'',...node.children.map(readText)].join(' ');
+    globalThis.allNodes=node=>[node,...node.children.flatMap(allNodes)];`);
+  await run("openDiagnostics('REQ-1')");
+  run("globalThis.card=$('#modalRoot').children[0]");
+  assert.match(run("readText(card)"), /A real check failed.*fake\/model.*输入 100.*缓存读 30/);
+  assert.equal(run("allNodes(card).filter(node=>node.tagName==='PRE').length"), 0);
+  run("globalThis.item=card.children.filter(node=>node.tagName==='DETAILS').at(-1);item.open=true;item.listeners.toggle()");
+  assert.match(run("readText(item)"), /请求 1.*工具 edit.*审计正文 1.0 KB/);
+  assert.equal(run("allNodes(card).filter(node=>node.tagName==='PRE').length"), 0);
+  run("globalThis.evidence=item.children.at(-1);evidence.open=true;evidence.listeners.toggle()");
+  assert.match(run("readText(evidence)"), /RAW_TRACE_MARKER/);
+  run("evidence.listeners.toggle();item.listeners.toggle()");
+  assert.equal(run("allNodes(card).filter(node=>node.tagName==='PRE').length"), 1);
+});
+
 function workbench() {
-  const node = (tag = "div") => ({ tagName: tag.toUpperCase(), children: [], listeners: {}, attributes: {}, hidden: false,
+  const node = (tag = "div") => ({ tagName: tag.toUpperCase(), children: [], listeners: {}, attributes: {}, dataset: {}, hidden: false,
+    get childElementCount() { return this.children.length; },
     append(...children) { this.children.push(...children); for (const child of children) child.parentElement = this; },
     appendChild(child) { this.append(child); return child; },
     querySelector() { return null; }, querySelectorAll() { return []; }, focus() {},
@@ -108,7 +175,7 @@ function workbench() {
   });
   const modal = node();
   modal.hidden = true;
-  const context = vm.createContext({ setInterval, clearInterval, document: {
+  const context = vm.createContext({ setInterval, clearInterval, URL, document: {
     createElement: node, querySelector: () => modal,
   } });
   vm.runInContext(source.slice(0, source.indexOf('document.querySelectorAll("[data-nav], [data-filter]")')), context);
@@ -123,6 +190,59 @@ function workbench() {
   `, context);
   return { context, modal, run: code => vm.runInContext(code, context) };
 }
+
+test("authenticated login remains usable when the selected requirement has invalid plan evidence", async () => {
+  const { context, run } = workbench();
+  run(`globalThis.nodes=new Map();document.querySelector=selector=>{
+    if(!nodes.has(selector))nodes.set(selector,document.createElement('div'));return nodes.get(selector);};
+    renderProjectSelector=()=>{};renderList=()=>{};
+    globalThis.calls=[];api=async url=>{calls.push(url);
+      if(url==='/api/bootstrap')return {token:'csrf',principal:{id:'admin',roles:['admin']},actions:['new','configure-project'],projects:[],currentProjectId:'demo'};
+      if(url==='/api/overview')return {project:{name:'Demo',root:'/demo',mode:'local'},tasks:[{id:'old',state:'verified'}],total:1,counts:{review:0,active:1,error:0,done:0}};
+      const error=new Error('Invalid plan review policy');error.status=400;throw error;};`);
+  run(source.slice(source.indexOf("async function establishSession()"), source.indexOf("function renderProjectSelector()")));
+  const result = await run("establishSession()");
+  assert.equal(result.authenticated, true); assert.equal(result.workspaceReady, false);
+  assert.equal(run("state.principal.id"), "admin");
+  assert.equal(run("state.token"), "csrf");
+  assert.equal(run("nodes.get('#loginRoot').hidden"), true);
+  assert.equal(run("nodes.get('#loginButton').hidden"), true);
+  assert.equal(run("nodes.get('#modelSettingsButton').hidden"), false);
+  assert.equal(run("state.detail"), null);
+  assert.equal(run("nodes.get('#detailPanel').children[1].textContent"), "Invalid plan review policy");
+  assert.match(context.messages.at(-1), /工作台加载失败.*Invalid plan review policy/);
+  assert.deepEqual(Array.from(context.calls), ["/api/bootstrap", "/api/overview", "/api/tasks/old"]);
+});
+
+test("login still rejects revoked authentication instead of treating it as a workspace error", async () => {
+  const { run } = workbench();
+  run(`state.principal=null;state.token=null;globalThis.refreshed=false;
+    refresh=async()=>{refreshed=true;};api=async()=>{const error=new Error('Session was revoked');error.status=401;throw error;};`);
+  run(source.slice(source.indexOf("async function establishSession()"), source.indexOf("function renderProjectSelector()")));
+  await assert.rejects(run("establishSession()"), error => error.status === 401 && error.message === "Session was revoked");
+  assert.equal(run("state.principal"), null); assert.equal(run("state.token"), null);
+  assert.equal(run("refreshed"), false);
+});
+
+test("explicit time extension preserves the displayed audit version and does not execute the requirement", async () => {
+  const { run } = workbench();
+  run(`state.detail.auditHead='displayed-audit-head';
+    structuredModal=(title,description,build,submit)=>{globalThis.fields=build(document.createElement('form'));globalThis.submit=submit;};
+    globalThis.sent=[];sendAction=async(...args)=>sent.push(args);
+    openModal('extend-execution-budget');fields.minutes.value='30';fields.reason.value=' 已定位超时根因，继续当前需求 ';`);
+  assert.equal(run("fields.minutes.min"), 1); assert.equal(run("fields.minutes.max"), 60);
+  await run("submit(fields)");
+  assert.equal(run("sent.length"), 1);
+  assert.equal(run("sent[0][0]"), "extend-execution-budget");
+  assert.equal(run("sent[0][1].expectedAuditHead"), "displayed-audit-head");
+  assert.equal(run("sent[0][1].additionalModelMs"), 1800000);
+  assert.equal(run("sent[0][1].reason"), "已定位超时根因，继续当前需求");
+  run(`state.overview.project.admission.budgetMode='adaptive';
+    globalThis.meta={state:'contract_confirmed',executionBoundary:['Requirement execution budget exhausted; hand off to the responsible developer']};`);
+  assert.equal(run("nextStep(meta)[3][0][0]"), "extend-execution-budget");
+  run("meta.executionBoundary=['Unmeasured execution duration']");
+  assert.equal(run("nextStep(meta)[3].length"), 0);
+});
 
 test("split review offers only the member's responsible part and starts code only after team confirmation", () => {
   const { run } = workbench();
@@ -492,6 +612,24 @@ test("development entry respects assignment and retains manual review boundaries
   assert.equal(run("nextStep({ state: 'plan_review', admission: { status: 'out_of_scope' } })[3].some(a => a[0] === 'develop' || a[0] === 'approve-plan')"), false);
 });
 
+test("failed plan generation shows its retained cause and clears after a new planning or contract event", () => {
+  const { run } = workbench();
+  run(`state.detail.meta={state:'contract_confirmed',planAttempts:2,assignments:{developer:{status:'accepted'}}};
+    state.detail.events=[{type:'plan_attempt_failed',error:'request context byte limit exceeded'}];`);
+  assert.equal(run("nextStep(state.detail.meta)[0]"), "研发方案生成失败");
+  assert.equal(run("nextStep(state.detail.meta)[2]"), "error");
+  assert.match(run("nextStep(state.detail.meta)[1]"), /request context byte limit exceeded/);
+  assert.equal(run("nextStep(state.detail.meta)[3][0][0]"), "plan");
+  run("state.principal.roles=['product']");
+  assert.doesNotMatch(run("nextStep(state.detail.meta)[1]"), /context byte/);
+  assert.match(run("nextStep(state.detail.meta)[1]"), /研发负责人/);
+  for (const type of ["contract_revised", "contract_confirmed", "plan_analysis_started", "plan_created"]) {
+    run(`state.detail.events.unshift({type:${JSON.stringify(type)}})`);
+    assert.equal(run("nextStep(state.detail.meta)[0]"), type === "plan_analysis_started" ? "正在生成研发方案" : "等待 Agent 设计方案");
+    if (type === "plan_analysis_started") assert.equal(run("nextStep(state.detail.meta)[3].length"), 0);
+  }
+});
+
 test("validation choice uses project mode without assuming a particular CI provider", () => {
   const { run } = workbench();
   run("state.overview.project.testDeployment = 'company-ci'; state.overview.project.deploymentRequiresPublishedRevision = true");
@@ -505,7 +643,7 @@ test("verified local environment exposes acceptance without requiring a CI deplo
   const { run } = workbench();
   run(`state.overview={project:{mode:'local',executionReady:false}};
     state.detail={meta:{state:'verified',afterHash:'verified-hash',localValidation:{
-      afterHash:'verified-hash',environment:{url:'http://localhost:4180',instructions:''}}}};`);
+      status:'running',afterHash:'verified-hash',environment:{url:'http://localhost:4180',instructions:''}}}};`);
   assert.equal(run("nextStep(state.detail.meta)[3].some(row=>row[0]==='accept-test')"), true);
   run("state.detail.meta.localValidation.afterHash='old-hash'");
   assert.equal(run("nextStep(state.detail.meta)[3].some(row=>row[0]==='accept-test')"), false);
@@ -533,7 +671,7 @@ test("Git plan approval chooses a branch without authorizing a commit or test de
   run(`state.overview.project.mode='git';state.detail.meta={planVersion:1,planHash:"shown-plan",baseRevision:"abc123"};
     api=async(url)=>url==='/api/project-git'
       ? {baseBranch:"main",releaseBranch:"main",branchPrefix:"devsail",branches:["main","existing-feature"]}
-      : {checks:[['npm','test']],checkScripts:[]};
+      : {validation:{checks:[{command:['npm','test'],reason:'相关用例'}],skipped:[],manualReason:'',startup:[]}};
     globalThis.sent=[];sendAction=async(...args)=>sent.push(args);`);
   await run("openPlanApproval()");
   await modal.children[0].listeners.submit({ preventDefault() {} });
@@ -542,34 +680,27 @@ test("Git plan approval chooses a branch without authorizing a commit or test de
   assert.equal(context.sent[0][1].developmentBranch.branch, "devsail/REQ-1");
   assert.equal(context.sent[0][1].authorizeGit, undefined);
   assert.equal(context.sent[0][1].expectedPlanHash, "shown-plan");
-  assert.equal(context.sent[0][1].checksText, "'npm' 'test'");
+  assert.equal(context.sent[0][1].checksText, undefined);
 });
 
-test("local plan confirmation reads scripts and saves checks only with developer confirmation", async () => {
+test("plan confirmation displays scoped checks and skipped suites without asking for commands", async () => {
   const { context, run } = workbench();
   run(`state.token='csrf-token';state.detail.meta={state:'plan_review',planVersion:1,planHash:'shown-plan'};
     state.detail.planAnalysis={draft:{affectedFiles:['frontend/src/Editor.vue']}};
-    api=async(url,options)=>{globalThis.preparation={url,options};return {checks:[],checkScripts:[
-      {sourceFile:'frontend/package.json',directory:'frontend',kind:'check',command:'npm --prefix frontend run build'},
-      {sourceFile:'package.json',directory:'.',kind:'test',command:'npm test',unavailableReason:'npm 初始化占位脚本'},
-      {sourceFile:'backend/pom.xml',directory:'backend',kind:'test',command:'mvn -f backend/pom.xml test'}]};};
+    api=async(url,options)=>{globalThis.preparation={url,options};return {validation:{
+      checks:[{command:['npm','--prefix','frontend','run','build'],reason:'只改前端渲染'}],
+      skipped:[{command:['mvn','test'],reason:'后端无调用路径变化'}],manualReason:'',startup:[]}};};
     structuredModal=(title,description,build,submit)=>{globalThis.form=document.createElement('form');globalThis.fields=build(form);globalThis.submit=submit;};
     globalThis.sent=[];sendAction=async(...args)=>sent.push(args);`);
   await run("openPlanApproval()");
   assert.equal(context.sent.length, 0);
   assert.equal(context.preparation.options.headers['X-Reqflow-Token'], 'csrf-token');
   assert.equal(context.preparation.options.headers['Content-Type'], 'application/json');
-  assert.equal(run("fields.checks.value"), "");
-  assert.equal(run("fields.checks.required"), true);
-  run(`globalThis.scripts=form.children.find(node=>node.tagName==='LABEL'&&node.children.some(child=>child.tagName==='SELECT')).children.find(node=>node.tagName==='SELECT');`);
-  assert.match(run("scripts.children[1].textContent"), /构建\/静态检查.*frontend\/package.json/);
-  assert.equal(run("scripts.children[2].disabled"), true);
-  assert.match(run("scripts.children[2].textContent"), /不可用.*占位/);
-  run("scripts.value='0';scripts.listeners.change()");
-  assert.equal(run("fields.checks.value"), "npm --prefix frontend run build");
+  assert.equal(run("fields.checks"), undefined);
+  assert.match(run("form.children.map(node=>node.textContent).join(' ')"), /前端渲染.*跳过.*后端无调用路径变化/);
   await run("submit(fields)");
   assert.equal(context.sent[0][0], "approve-plan");
-  assert.equal(context.sent[0][1].checksText, "npm --prefix frontend run build");
+  assert.equal(context.sent[0][1].checksText, undefined);
   assert.equal(context.sent[0][1].developmentBranch, undefined);
 });
 
@@ -603,7 +734,7 @@ test("paused development exposes the retained failure and a continuation action"
 test("plan confirmation submits the displayed version and rejects a switched task", async () => {
   const { context, run } = workbench();
   run(`state.detail.meta.state = 'plan_review'; state.detail.meta.planHash = 'displayed-hash';
-    api=async()=>({checks:[['npm','test']],checkScripts:[]});
+    api=async()=>({validation:{checks:[{command:['npm','test'],reason:'相关用例'}],skipped:[],manualReason:'',startup:[]}});
     structuredModal=(title,description,build,submit)=>{globalThis.fields=build(document.createElement('form'));globalThis.submit=submit;};
     globalThis.sent = []; sendAction = async (...args) => sent.push(args);`);
   await run("openModal('approve-plan')");
@@ -632,7 +763,7 @@ test("admin model form inherits defaults, saves overrides and clears entered sec
     globalThis.setup={expectedConfigHash:'shown-config',default:{provider:'Bailian',model:'qwen3.8-27b',baseUrl:'https://model.example/v1',
       thinking:'off',credentialConfigured:true,contextWindow:65536,maxTokens:8192,maxPiMs:180000,maxToolCalls:30,
       reasoning:true,thinkingToggle:true,supportsReasoningEffort:false,supportsJsonSchema:false,imageInput:false,
-      modelParameters:{outputFormat:'auto'},modelUsage:{maxTokens:60000,maxContextBytes:64000,maxRequests:8,readOnlyMaxRequests:6,maxToolResultBytes:8000,
+      modelParameters:{outputFormat:'auto',temperature:0.2,topP:0.8,maxOutputTokens:4096},modelUsage:{maxTokens:60000,maxContextBytes:64000,maxRequests:8,readOnlyMaxRequests:6,maxToolResultBytes:8000,
         initializationMaxTokens:30000,initializationMaxRequests:1,initializationMaxToolCalls:8}},
       agents:Object.fromEntries(Object.keys(modelAgentLabels).map(name=>[name,null])),maxCostUsd:2};
     api=async()=>setup;refresh=async()=>{};globalThis.requests=[];
@@ -642,20 +773,38 @@ test("admin model form inherits defaults, saves overrides and clears entered sec
   assert.equal(run("fields.default.apiKey.type"), "password");
   assert.equal(run("fields.default.apiKey.required"), false);
   assert.equal(run("Object.values(fields.agents).every(row=>row.inherit.checked)"), true);
-  run(`globalThis.planSection=form.children.find(node=>node.tagName==='DETAILS'&&node.children[0].textContent.startsWith('研发方案设计'));
+  assert.equal(run("Object.values(fields.agents).every(row=>row.inputs===null&&row.custom.hidden)"), true);
+  run(`fields.default.baseUrl.value='';fields.agents.requirement.inherit.checked=false;fields.agents.requirement.inherit.listeners.change();`);
+  assert.equal(run("fields.agents.requirement.inputs.baseUrl.value"), "");
+  run(`fields.agents.requirement.inherit.checked=true;fields.agents.requirement.inherit.listeners.change();fields.default.baseUrl.value=setup.default.baseUrl;`);
+  run(`globalThis.planSection=form.children.find(node=>node.tagName==='DETAILS'&&node.children[0].textContent.startsWith('开发 Agent'));
     api=async(url,options)=>{requests.push({url,body:JSON.parse(options.body)});return {model:'qwen3.8-27b',elapsedMs:1,outputFormat:'json_object'};};`);
-  await run("planSection.children.find(node=>node.tagName==='BUTTON').listeners.click()");
+  await run("form.children.find(node=>node.tagName==='BUTTON').listeners.click()");
   assert.equal(context.requests[0].url, "/api/model-connection");
   assert.equal(context.requests[0].body.scope, "default");
   run("requests.length=0");
-  run(`fields.agents.plan.inherit.checked=false;fields.agents.plan.inherit.listeners.change();fields.agents.plan.inputs.model.value='glm-5.3';
+  run(`fields.default.model.value='updated-default-model';
+    fields.agents.development.inherit.checked=false;fields.agents.development.inherit.listeners.change();`);
+  assert.equal(run("fields.agents.development.inputs.model.value"), "updated-default-model");
+  assert.equal(run("fields.agents.development.custom.hidden"), false);
+  run(`fields.agents.development.inputs.model.value='glm-5.3';
     fields.default.apiKey.value='new-private-key';api=async(url,options)=>{requests.push({url,body:JSON.parse(options.body)});return {};};`);
   await run("submit(fields)");
   assert.equal(context.requests.length, 1); assert.equal(context.requests[0].url, "/api/model-settings");
   assert.equal(context.requests[0].body.expectedConfigHash, "shown-config");
-  assert.equal(context.requests[0].body.agents.intake, null); assert.equal(context.requests[0].body.agents.plan.model, "glm-5.3");
+  assert.equal(context.requests[0].body.agents.requirement, null); assert.equal(context.requests[0].body.agents.development.model, "glm-5.3");
   assert.equal(context.requests[0].body.default.apiKey, "new-private-key");
+  assert.equal(context.requests[0].body.default.maxPiMs, 180000);
+  assert.equal(context.requests[0].body.default.maxToolCalls, 30);
+  assert.equal(context.requests[0].body.default.modelUsage.maxRequests, 8);
+  assert.equal(context.requests[0].body.default.maxTokens, 8192);
+  assert.equal(context.requests[0].body.default.modelParameters.maxOutputTokens, 4096);
+  assert.equal(context.requests[0].body.default.modelParameters.temperature, 0.2);
+  assert.equal(context.requests[0].body.default.modelParameters.topP, 0.8);
+  assert.equal(run("fields.agents.development.inputs.saved.apiKey"), undefined);
   assert.equal(run("fields.default.apiKey.value"), "");
+  run("fields.default.maxTokens.value=2048;globalThis.profile=modelProfileInput(fields.default)");
+  assert.equal(run("profile.maxTokens"), 2048); assert.equal(run("profile.modelParameters.maxOutputTokens"), 2048);
   run("state.currentProjectId='switched'"); await assert.rejects(run("submit(fields)"), /项目已切换/);
   run("state.principal.roles=['developer']"); await assert.rejects(run("openModelSettings()"), /只有管理员/);
 });
@@ -716,25 +865,26 @@ test("Git project settings preserves delivery rules without a fixed deployment e
   assert.equal(run("fields.kind.children.some(option=>option.value==='jenkins')"), true);
 });
 
-test("responsible developer reads project scripts and saves local environment only to this requirement", async () => {
+test("local validation opens automatically started services without an editable command form", async () => {
   const { context, run } = workbench();
   run(`state.detail.meta={state:'verified',afterHash:'shown-code',planHash:'shown-plan'};
     globalThis.form=document.createElement('form');
-    api=async()=>({workspace:'/isolated/work',baseHash:'base',patch:null,checks:[],environment:null,
-      startupScripts:[{sourceFile:'frontend/package.json',directory:'frontend',command:'npm run dev'}]});
+    api=async(url,options)=>{globalThis.started=JSON.parse(options.body);return {workspace:'/isolated/work',patch:null,status:'running',
+      services:[{name:'前端',url:'http://127.0.0.1:9000/',tail:'Ready'}]};};
     structuredModal=(title,description,build,submit)=>{globalThis.fields=build(form);globalThis.submit=submit;};
-    globalThis.sent=[];sendAction=async(...args)=>{sent.push(args);return true;};`);
+    globalThis.sent=[];sendAction=async(action,input,returnResult)=>{
+      if(returnResult)return api('/actions',{body:JSON.stringify({action,...input})});
+      sent.push([action,input]);return true;};`);
   await run("openGitDelivery('local-validation')");
   assert.equal(context.sent.length, 0);
-  run(`globalThis.scripts=form.children.find(node=>node.children.some(child=>child.tagName==='SELECT')).children.find(child=>child.tagName==='SELECT');
-    scripts.value='0';scripts.listeners.change();fields.url.value='http://localhost:9000/';`);
-  assert.match(run("fields.instructions.value"), /frontend.*npm run dev/);
-  await run("submit(fields)");
+  assert.equal(context.started.expectedAfterHash, "shown-code");
+  assert.equal(run("form.children.find(node=>node.tagName==='A').href"), "http://127.0.0.1:9000/");
+  assert.equal(run("fields.instructions"), undefined);
+  assert.equal(run("fields.url"), undefined);
+  await run("form.children.find(node=>node.textContent==='停止本地环境').listeners.click()");
   assert.equal(context.sent[0][0], "local-validation");
-  assert.equal(context.sent[0][1].environment.url, "http://localhost:9000/");
+  assert.equal(context.sent[0][1].operation, "stop");
   assert.equal(context.sent[0][1].expectedAfterHash, "shown-code");
-  run("state.selectedId='OTHER'");
-  await assert.rejects(run("submit(fields)"), /需求已切换/);
   assert.equal(context.sent.length, 1);
 });
 

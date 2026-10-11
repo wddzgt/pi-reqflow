@@ -11,11 +11,12 @@ import { readImage } from "./intake-images.js";
 import { readPlanAnalysis } from "./plan-analysis.js";
 import { planDiscussion } from "./plan-conversation.js";
 import { planReviewStatus } from "./plan-review.js";
+import { executionStatus } from "./action-progress.js";
 
 export async function getRequirementEvidence(projectPath, principal, id) {
   safeId(id);
   const project = await loadProject(projectPath);
-  const { meta, directory, events: eventRows } = await readTask(project, id);
+  const { meta, directory, events: eventRows, lastHash } = await readTask(project, id);
   authorizeTaskRead(principal, meta);
   const request = await fs.readFile(path.join(directory, "request.md"), "utf8");
   const feedback = meta.feedbackVersion
@@ -78,12 +79,33 @@ export async function getRequirementEvidence(projectPath, principal, id) {
     implementationAttempts.push({ priorState: "verified", priorStateHash: retained.previous, at: retained.at,
       actor: retained.detail.actor, retained: expected, diagnosis: "本地修改前的已验证代码", changes: report.changes });
   }
+  for (const restarted of eventRows.filter(event => event.type === "development_restarted")) {
+    const detail = restarted.detail;
+    const rollback = eventRows.find(event => event.hash === detail.priorRollbackHash && event.type === "workspace_rolled_back");
+    const implementation = eventRows.find(event => event.hash === detail.priorImplementationHash);
+    const retained = path.join(directory, `rollback-${detail.priorRollbackHash}`);
+    if (!rollback || !implementation || detail.retained !== retained || rollback.meta.baselineHash !== detail.baselineHash
+        || eventRows.indexOf(implementation) >= eventRows.indexOf(rollback)) throw new Error("Restart history differs from the audited rollback");
+    const report = await readJson(path.join(retained, "changes.json"));
+    if (sha256(JSON.stringify(report)) !== detail.reportHash || JSON.stringify(report.changes) !== JSON.stringify(implementation.detail.changes))
+      throw new Error("Retained rollback report changed");
+    for (const change of report.changes) for (const kind of ["before", "after"]) {
+      if (!change[kind]) continue;
+      const file = path.join(retained, kind === "before" ? "baseline" : "after", change.file); assertInside(retained, file);
+      if (sha256(await fs.readFile(file)) !== change[kind].hash || ((await fs.stat(file)).mode & 0o777) !== change[kind].mode)
+        throw new Error("Retained rollback snapshot changed");
+    }
+    implementationAttempts.push({ priorState: "rolled_back", priorStateHash: rollback.hash, at: restarted.at,
+      actor: detail.actor, retained, diagnosis: "代码已回退，保留上一轮开发与验证证据后重新设计", changes: report.changes });
+  }
   const baselineChecks = plan ? eventRows.findLast((event) => event.type === "plan_created")?.detail?.baselineChecks ?? null : null;
   const events = eventRows.slice(-100).reverse().map((event) => ({ at: event.at, type: event.type,
     actor: event.detail?.actor ?? null, approvalKind: event.detail.approvalKind ?? null,
     error: event.detail?.error ?? null,
     timing: event.detail.telemetry ? { durationMs: event.detail.telemetry.durationMs, model: event.detail.telemetry.model,
-      requestTimings: event.detail.telemetry.requestTimings, toolCalls: event.detail.telemetry.toolCalls } : null }));
+      requestTimings: event.detail.telemetry.requestTimings, toolCalls: event.detail.telemetry.toolCalls,
+      tokens: event.detail.telemetry.tokens, unmeasuredRequests: event.detail.telemetry.unmeasuredRequests,
+      timeouts: event.detail.telemetry.timeouts, handoff: event.detail.handoff } : null }));
   const resultFile = path.join(directory, "result.md");
   const result = await fs.stat(resultFile).then(() => fs.readFile(resultFile, "utf8"), (error) => {
     if (error.code === "ENOENT") return null;
@@ -94,7 +116,7 @@ export async function getRequirementEvidence(projectPath, principal, id) {
   });
   const supersededBy = meta.state === "test_deployed" && environment && environment.taskId !== id
     && environment.url === meta.testDeployment.url ? environment.taskId : null;
-  return { meta: { ...meta, testEnvironmentSupersededBy: supersededBy }, request, feedback, contract, reviews, plan, planAnalysis, changes, implementationAttempts, baselineChecks, events, result,
+  return { auditHead: lastHash, execution: executionStatus(directory), meta: { ...meta, testEnvironmentSupersededBy: supersededBy }, request, feedback, contract, reviews, plan, planAnalysis, changes, implementationAttempts, baselineChecks, events, result,
     planReview: planAnalysis ? planReviewStatus(meta, planAnalysis.draft) : null,
     planDiscussion: planDiscussion({ meta, directory, events: eventRows }),
     discussion: intakeDiscussion({ meta, directory, events: eventRows }) };

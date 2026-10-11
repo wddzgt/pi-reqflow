@@ -1,12 +1,12 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { loadProject, validateConfig, defaultModelUsage, validateModelParameters } from "./config.js";
+import { loadProject, validateConfig, defaultModelUsage, validateModelParameters, modelAgents } from "./config.js";
 import { readJson, sha256, writeJson } from "./files.js";
 import { withLock } from "./store.js";
 import { refreshProjectBaseline } from "./baseline.js";
 import { readModelCredential, saveModelCredential } from "./model-credentials.js";
 
-export const modelAgents = ["initialize", "intake", "plan", "implement", "frontendReview", "backendReview", "qaReview"];
+export { modelAgents } from "./config.js";
 
 function profile(config, selection = config) {
   const provider = config.compatibleProviders?.find(row => row.name === selection.provider);

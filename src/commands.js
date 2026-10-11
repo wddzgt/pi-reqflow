@@ -4,6 +4,8 @@ import { promises as fs } from "node:fs";
 import { promisify } from "node:util";
 import { childEnvironment } from "./execution-env.js";
 import { sha256 } from "./files.js";
+import { executionSignal, assertExecutionActive } from "./action-progress.js";
+import { reportProgress } from "./action-progress.js";
 
 const execute = promisify(execFile);
 
@@ -30,7 +32,9 @@ async function removeContainer(name, env) {
 }
 
 export async function runCommand(argv, cwd, timeoutMs, logFile, maxBytes, envNames, sandbox = null) {
+  assertExecutionActive();
   if (!Array.isArray(argv) || argv.length === 0) throw new Error("Command argv is required");
+  reportProgress(`正在执行检查：${argv.join(" ")}`, "", "checks");
   const started = Date.now();
   const env = childEnvironment(envNames);
   const containerName = sandbox ? `reqflow-${randomUUID()}` : null;
@@ -43,6 +47,7 @@ export async function runCommand(argv, cwd, timeoutMs, logFile, maxBytes, envNam
   const workspace = sandbox ? await fs.realpath(cwd) : cwd;
   const executable = sandbox ? "docker" : argv[0];
   const args = sandbox ? dockerArguments(argv, workspace, envNames, sandbox, containerName) : argv.slice(1);
+  assertExecutionActive();
   const log = await fs.open(logFile, "wx", 0o600);
   const child = spawn(executable, args, { cwd, env: childEnv, stdio: ["ignore", "pipe", "pipe"],
     detached: process.platform !== "win32" });
@@ -69,6 +74,9 @@ export async function runCommand(argv, cwd, timeoutMs, logFile, maxBytes, envNam
       catch (error) { terminationError = error; child.kill("SIGKILL"); }
     }, 1500);
   };
+  const signal = executionSignal();
+  signal?.addEventListener("abort", terminate, { once: true });
+  if (signal?.aborted) terminate();
   let writes = Promise.resolve();
   const timer = setTimeout(() => { timedOut = true; terminate(); }, timeoutMs);
   const completion = new Promise((resolve, reject) => {
@@ -94,6 +102,7 @@ export async function runCommand(argv, cwd, timeoutMs, logFile, maxBytes, envNam
     await writes;
     await log.sync();
     if (terminationError) throw terminationError;
+    assertExecutionActive();
     if (timedOut) throw new Error(`Command timed out: ${argv[0]}`);
     if (exceeded) throw new Error(`Command log exceeded configured byte limit: ${maxBytes}`);
     return { ...exit, durationMs: Date.now() - started, tail, bytes,
@@ -103,6 +112,7 @@ export async function runCommand(argv, cwd, timeoutMs, logFile, maxBytes, envNam
     runError = error;
     throw error;
   } finally {
+    signal?.removeEventListener("abort", terminate);
     clearTimeout(timer);
     clearTimeout(escalation);
     try {

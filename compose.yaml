@@ -19,10 +19,13 @@ services:
       - /tmp:rw,nosuid,nodev,size=256m,mode=1777
     ports:
       - "127.0.0.1:${REQFLOW_PORT:-4173}:4173"
+      - "127.0.0.1:${REQFLOW_LOCAL_PORT_RANGE:-4180-4184}:${REQFLOW_LOCAL_PORT_RANGE:-4180-4184}"
     environment:
       REQFLOW_PUBLIC_ORIGIN: ${REQFLOW_PUBLIC_ORIGIN:-http://localhost:4173}
       REQFLOW_IMPORT_DIR: /projects/project
       REQFLOW_PI_EXECUTABLE: /usr/local/bin/pi
+      REQFLOW_LOCAL_RUNTIME_CONTAINER: "1"
+      REQFLOW_LOCAL_PORT_RANGE: ${REQFLOW_LOCAL_PORT_RANGE:-4180-4184}
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
     volumes:
       - type: bind

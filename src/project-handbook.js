@@ -18,7 +18,7 @@ export function renderProjectHandbook(baseline) {
     `## 先了解这个项目\n\n${descriptions.length
       ? descriptions.join("\n")
       : "仓库文档未说明项目用途；静态索引不根据目录名推断业务。"}\n\n优先阅读：\n\n${inventory(paths.documentation, 8)}`,
-    "## 扫描范围\n\n已完成源码和配置的静态盘点。尚未执行启动、测试、数据库连接或部署验证；下列命令和依赖均为声明证据，不能作为运行成功的证明。自动生成的项目理解见 PROJECT_REFERENCE.md 和 AGENTS.md。初始化无需人工确认。",
+    "## 扫描范围\n\n已完成源码和配置的静态盘点。尚未执行启动、测试、数据库连接或部署验证；下列命令和依赖均为声明证据，不能作为运行成功的证明。自动生成的项目理解见 PROJECT_REFERENCE.md 和 agent.md。初始化无需人工确认。",
     `## 从哪里开始阅读代码\n\n程序入口候选：\n\n${inventory(paths.entrypoints)}\n\n模块分布（目录统计，不代表已确认的业务职责）：\n\n${baseline.modules.length
       ? baseline.modules.slice(0, 20).map((item) => `- ${code(item.path)}：${item.fileCount} 个文件`).join("\n") : "未发现常见模块目录；请从依赖清单和源码索引定位入口。"}`,
   ];

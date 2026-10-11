@@ -1,7 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { allowedFile, describePolicy, loadProject, validateConfig } from "./config.js";
-import { parse } from "shell-quote";
+import { localRuntimePorts, stopLocalRuntime } from "./local-runtime.js";
 import { baselineAgentContext, readProjectBaseline } from "./baseline.js";
 import { assertInside, copyFiles, manifest, manifestHash, sha256, writeJson } from "./files.js";
 import { runPi } from "./pi-runner.js";
@@ -112,15 +112,17 @@ export async function plan(projectPath, id) {
     }
     const revisionProposal = recordedRevision?.detail.candidate ?? null;
     const priorPlan = meta.planHash ? await readPlanAnalysis(meta, directory) : null;
-    const discussion = events.filter(event => event.meta.planVersion === meta.planVersion && ["plan_message", "plan_reply"].includes(event.type));
+    const discussion = meta.planHash ? events.filter(event => event.meta.planVersion === meta.planVersion && ["plan_message", "plan_reply"].includes(event.type)) : [];
     const recentDiscussion = discussion.slice(-4).map(event => ({ eventHash: event.hash,
       role: event.type === "plan_message" ? "developer" : "ai", text: (event.detail.text ?? event.detail.reply.reply).slice(0, 500),
       partial: (event.detail.text ?? event.detail.reply.reply).length > 500 }));
+    const reviewPolicy = project.config.planReview ?? "risk-based";
     const contextHash = sha256(JSON.stringify([meta.contractHash, baseHash, projectBaseline.snapshotHash,
-      configHash, revision, standards.hash, sha256(feedback), discussion.map(event => event.hash), "design-v3-internal-correction"]));
+      configHash, revision, standards.hash, sha256(feedback), discussion.map(event => event.hash), "design-v7-validation-contract", reviewPolicy,
+      process.env.REQFLOW_LOCAL_RUNTIME_CONTAINER === "1", localRuntimePorts]));
     const checkpoint = events.findLast(event => event.type === "plan_draft_completed"
       && event.detail.contextHash === contextHash && event.detail.version === meta.planVersion + 1);
-    const prompt = `Read-only delivery plan. Project mode=${project.config.mode}; local mode has NO Git. Validate diffs/recovery with controller manifests and snapshots; never prescribe Git commands for local mode. Return JSON only; no top-level markdown or repeated requirement. Exact root fields: schemaVersion=2,contractHash,affectedFiles:string[] (write paths only),changes:[{file,description}] in that exact order (<=500 characters each, concrete symbols/lines),domains:string[],impacts:{existingBehavior:{status,evidence},interfaces:{status,evidence},data:{status,evidence}},verification:[{acceptanceId,scenario,regression}],openQuestions:string[],boundaries,design. verification MUST be an ARRAY with ${contract.acceptance.length} separate items, exactly covering ${JSON.stringify(contract.acceptance.map(item => item.id))}; never merge items; scenario/regression are nonempty assertion strings, never booleans. Do not add an acceptance field. Impact status:none/changed/unknown; evidence is nonempty source evidence. Unknown blocks approval; agreement is not safety proof. openQuestions=[] when none. Keep sufficient existing tests; add missing coverage without removing assertions.\n冻结需求哈希：${meta.contractHash}\n冻结需求 JSON：${JSON.stringify(contract)}\n适用代码规范：${standardsPrompt(standards)}\n项目只读参考：${await baselineAgentContext(project, projectBaseline, null, "index")}\n${feedback ? `上次方案审核意见，必须解决：${feedback}\n` : ""}检查命令：${JSON.stringify(project.config.checks)}`;
+    const prompt = `Read-only delivery plan. Project mode=${project.config.mode}; local mode has NO Git. Validate diffs/recovery with controller manifests and snapshots; never prescribe Git commands for local mode. Return JSON only; no top-level markdown or repeated requirement. Exact root fields: schemaVersion=2,contractHash,affectedFiles:string[] (write paths only),changes:[{file,description}] in that exact order (<=500 characters each, concrete symbols/lines),domains:string[],impacts:{existingBehavior:{status,evidence},interfaces:{status,evidence},data:{status,evidence}},verification:[{acceptanceId,scenario,regression}],validation,openQuestions:string[],boundaries,design. verification MUST be an ARRAY with ${contract.acceptance.length} separate items, exactly covering ${JSON.stringify(contract.acceptance.map(item => item.id))}; never merge items; scenario/regression are nonempty assertion strings, never booleans. Do not add an acceptance field. Impact status:none/changed/unknown; evidence is nonempty source evidence. Unknown blocks approval; agreement is not safety proof. openQuestions=[] when none. Keep sufficient existing tests; add missing coverage without removing assertions.\n冻结需求哈希：${meta.contractHash}\n冻结需求 JSON：${JSON.stringify(contract)}\n适用代码规范：${standardsPrompt(standards)}\n项目只读参考：${await baselineAgentContext(project, projectBaseline, null, "index")}\n${feedback ? `上次方案审核意见，必须解决：${feedback}\n` : ""}检查命令：${JSON.stringify(project.config.checks)}`;
     const designPrompt = `\n用中文写一份研发可以读懂的具体设计，不能只列文件或检查项。design={approach:实现思路及选择原因,frontend:页面交互与状态和调用,backend:业务流程与校验和兼容,data:数据处理与恢复,interfaces:[{name,method,path,status:existing/modified/new,sourceFile,request,response,errors}],diagrams:[{title,kind:flow/sequence,domain:frontend/backend/shared,source:Mermaid纯语法}],components:[{file,domain:frontend/backend/shared,location:类/方法/组件与现有行号或明确新增位置,pseudocode:关键逻辑伪代码或短代码片段}]}。components按affectedFiles顺序逐项对应。未涉及的一端说明为空；没有接口则interfaces=[]。普通需求默认diagrams=[]，前后端同时变更也不强制画图；用前后端文字和接口约定说明调用顺序、状态与错误处理。只有一张短图能明显帮助理解交互或分支流程时才画，选择流程图或时序图其中一种，不重复文字、需求原文、整份源码或架构科普。新增接口明确new；现有或修改接口必须读源码并给真实sourceFile，不能猜测路径。所有描述、接口样例及必要的图和关键伪代码必须互相一致，以冻结验收为准。两名研发负责已明确接口的普通联调不等于复杂的跨团队协调；只有未解决外部决策或跨团队依赖才属于coordination required。`;
     const boundaryPrompt = `\nboundaries={modules:[{name,files,evidence}],deliveryUnits:[{name,evidence}],designStages:positive integer,estimatedChangedLines:positive integer,coordination:{status:none/required/unknown,evidence},verification:{status:ready/unknown,evidence},recovery:{status:code_only/documented/unresolved,evidence},externalEffects:{status:none/reversible/irreversible/unknown,evidence},exclusions:[{kind,evidence}]}. modules cover every proposed write file exactly once. deliveryUnits are independently deployable units. This agent automates bounded junior-development work. High-complexity long tasks needing staged design decisions, architecture redesign, staged migration, core security rework, framework upgrades or open-ended exploration must be handed to a human developer using other design tools; do not conceal complexity or automatically split such work to bypass this boundary. designStages counts unresolved design/decision stages, NOT coding steps, tool calls, tests or repair iterations. exclusions list actual architecture_redesign/staged_migration/core_security_rework/framework_upgrade/exploratory_work/irreversible_data_operation with concrete evidence, else []. Size estimates alone do not establish high complexity. Writing a known migration in isolation is distinct from designing a complex data migration or executing it against live data. Investigate ordinary code dependencies before declaring unknown; openQuestions are decisions requiring the owner. File snapshots restore code, never data/external effects. External coordination and irreversible operations require human-led work. Planning estimates (advisory): ${JSON.stringify({ maxFiles: policy.maxFiles, maxAcceptance: policy.maxAcceptance, maxBusinessModules: policy.maxBusinessModules, maxDeliveryUnits: policy.maxDeliveryUnits, maxEstimatedChangedLines: policy.maxEstimatedChangedLines })}. Restricted paths (mandatory): ${JSON.stringify(policy.restrictedPaths)}. domains: frontend=Web/mobile UI,backend=CLI/service/business logic,database=schema,infrastructure=runtime,documentation=docs; only affected domains. CLI display is backend.`;
     const version = meta.planVersion + 1;
@@ -139,34 +141,49 @@ export async function plan(projectPath, id) {
         planCostUsd: meta.planCostUsd ?? 0, updatedAt: new Date().toISOString() };
       await appendEvent(project, id, "plan_analysis_started", active, { contractHash: meta.contractHash, version });
       const planningWorkspace = await preparePlanWorkspace(project, id, attempt, baseline);
-      for (const [index, command] of project.config.checks.entries()) {
-        const checkLog = path.join(directory, `baseline-v${version}-attempt-${attempt}-check-${index + 1}.log`);
-        const result = await runCommand(command, planningWorkspace, project.config.maxPiMs, checkLog,
-          project.config.maxEventBytes, project.config.environment.checks, project.config.checkSandbox);
-        baselineChecks.push({ command, logFile: checkLog, ...result });
-        if (!Number.isInteger(result.code) || result.signal !== null) throw new Error(`Baseline check did not finish normally: ${command.join(" ")}`);
+      if (project.config.checks.length) {
+        for (const file of Object.keys(baseline).filter(file => path.posix.basename(file) === "package.json")) {
+          const directory = path.posix.dirname(file);
+          if (!(await fs.readdir(path.join(project.root, directory))).includes("node_modules")) continue;
+          const dependencies = await fs.realpath(path.join(project.root, directory, "node_modules"));
+          await fs.cp(dependencies, path.join(planningWorkspace, directory, "node_modules"),
+            { recursive: true, verbatimSymlinks: true, filter: async source => {
+              if ((await fs.lstat(source)).isSymbolicLink()) {
+                const target = await fs.readlink(source);
+                if (path.isAbsolute(target)) throw new Error(`Installed dependency has an absolute link: ${source}`);
+                assertInside(dependencies, await fs.realpath(source));
+              }
+              return true;
+            } });
+        }
       }
       if (manifestHash(await manifest(planningWorkspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== baseHash) {
         throw new Error("Baseline checks modified project files");
       }
       if (!checkpoint) result = await runPi(project, planningWorkspace, "plan", prompt + boundaryPrompt + designPrompt
+        + (process.env.REQFLOW_LOCAL_RUNTIME_CONTAINER === "1"
+          ? `\n本地启动运行在Docker容器中，${localRuntimePorts.join("、")}已经映射到宿主机回环地址。每个startup服务选择这5个端口之一，监听0.0.0.0，健康和访问地址使用http://127.0.0.1:对应端口；前端代理后端也使用对应容器端口。需要更改启动参数或代理配置时列入方案，不让用户另填命令。`
+          : "\n本地服务运行在工作台主机，监听回环地址；核实现有端口和依赖后选择启动参数。")
         + "\n保留关键逻辑伪代码，也可用少量关键代码说明：优先展示核心判断、身份映射、事务或写入边界，通常5–10行；多个文件复用同一逻辑时只在核心文件展示，其他文件用修改说明交代。纯展示、配置或样式文件没有关键逻辑时pseudocode为空。每个文件最多1600字符，禁止输出完整Java类、Vue组件、全部实现或大段样板代码；实际实现由后续Pi完成。返回前核对字段长度。"
         + '\n仅在选择出图时：Mermaid source 必须包含图类型声明，kind=flow 的首行为 flowchart TD（或合法方向），kind=sequence 的首行为 sequenceDiagram；之后才写节点或 participant，不能省略首行，也不要加 Markdown 围栏。流程图节点标签统一用双引号包围，如 A["用户选择模板"]、B{"是否冲突"}。'
         + "\n保持简明：实现思路建议150–300字，前后端各100–250字，数据处理100–200字；接口用最小有效样例，文件说明1–3句，伪代码只在关键逻辑有帮助时写5–10行。验收仍全部覆盖，但不在多个段落重复；说明真实取舍，不写架构科普。普通技术选择按已有代码和最简单安全做法直接决定，不再追问命名、UUID唯一性、错误文案、定时器形式等细枝末节。openQuestions只保留必须人工决定的业务结果、授权或调查后仍未知的风险。"
         + "\n返回前逐项核对设计的一致性：接口请求与前端调用、数据主记录与关联记录的身份映射、事务边界、跳过/覆盖的写入范围必须在文字、图、伪代码中一致。涉及删除或恢复字段必须直接读实体、schema和服务，既有字段与需要新增的字段明确区分，新增字段所需迁移也要列入拟改文件；不得凭项目文档假设已有支持。普通技术纠错直接写入方案，不转化为人工问答；新增关系表等扩大范围的建议先检查是否确有必要。"
         + (meta.planHash ? `\n正在收敛已有方案 ${meta.planHash}。通过read_plan读取当前相关设计、specialists和discussion原文；已明确的研发决定只核实是否偏离需求，不重复追问。过去AI意见不是人类审批，不能盲从；同一根因合并修正。近期沟通导航：${JSON.stringify(recentDiscussion)}。不论修改几轮，都以当前冻结需求为准。` : "")
         + (priorPlan?.draft.design ? `\n已有方案的接口索引：${JSON.stringify(priorPlan.draft.design.interfaces.map(({ name, method, path }) => ({ name, method, path })))}。本轮是在这份方案上局部修订，不是重新设计：未被意见、源码事实或冻结需求否定的接口路径、请求响应和文件职责必须保留；确有必要改动时在approach说明原因，并同步更新前后端、接口和关键伪代码。更改数据恢复方式不能顺带重新命名接口或重建Controller。请求响应、拟改文件和其余原文通过read_plan按需读取。` : "")
-        + `\nBaseline checks are diagnostic evidence: ${JSON.stringify(baselineChecks.map(({ command, code, tail }) => ({ command, code, output: tail })))}. A reproducible failing test for the requested bug is useful evidence, not an automatic rejection. Diagnose whether failures are inside the confirmed requirement; do not broaden business scope or weaken tests. Unrelated failures that prevent full verification require an explicit blocker. All final configured checks must pass.`
+        + "\n另返回 validation={checks:[{command:argv数组,reason:源码依赖和验收依据}],skipped:[{command:argv数组,reason:与影响范围无关的具体依据}],manualReason:字符串,startup:[{name,command:argv数组,url:回环HTTP地址}]}。检查和启动命令都从项目根目录运行。先读现有脚本、测试和调用依赖，只选择影响范围内的用例或构建；项目检查配置只是候选，禁止默认全量回归，无关失败不阻塞也不修复。后端改动也选择对应类/方法/依赖调用方测试。没有合适自动检查时checks=[]，manualReason说明人工验收步骤，绝不伪称通过。startup包含本地验证必需的前后端服务及其真实健康地址，明确回环绑定和端口；检查依赖/环境，不猜测凭据。缺启动脚本时将最小启动方式的文件纳入affectedFiles和changes，交由编码补齐。CLI或库没有常驻服务可startup=[]。用户不填写命令；完成后可启动本地验证或跳过本地发布测试环境。"
         + "\nAssess the real runtime feature, not only its isolated tests: persistent writes require impacts.data=changed and documented data recovery. Persistence alone is not irreversible. Use reversible only with concrete backup/restore steps and verification; irreversible means no documented recovery can restore the affected state. Test isolation does not establish code_only recovery for a data feature. Missing operational recovery facts stay unresolved; never invent them. Existing loaders and builtin registration must be read from real source, not guessed."
         + "\n有INSERT、UPDATE或逻辑删除时，即使没有DDL也不能把数据恢复写成code_only。给出受影响记录/旧值的备份或记录方式、失败事务回滚及必要时恢复的具体步骤和验证，核实后才能标documented。运维恢复步骤不等于增加用户可见的撤销功能，也不强制独立回退脚本；能用已有可靠方式就复用，缺少必要事实再提问。沟通中的AI建议须核实，不得直接沿用'代码回滚可恢复数据库'等错误结论。"
         + (revisionProposal ? `\n本轮包含研发直接编辑提案。额外返回 candidateReview={proposalHash:"${sha256(JSON.stringify(revisionProposal))}",status:accepted/adjusted/product_confirmation/human_led,reasons:非空理由数组最多4项}。核实源码，不盲从研发：合理保留的提案为accepted，调整改法须adjusted并说明具体理由和替代建议；需要改变业务需求则product_confirmation；复杂设计则human_led。当前方案仍必须遵守原冻结需求，不得为了通过而删除验收或隐藏未知影响。` : ""),
-      logFile, remainingCost, null, [], { ...allowance, planContract: contract, ...(meta.planHash ? { discussionTask: id } : {}), authoritativeContext: { contractHash: meta.contractHash, contract },
+      logFile, remainingCost, null, [], { ...allowance, developerSession: true,
+        ...(priorPlan ? { resumeSession: events.findLast(event => event.type === "plan_reply" && event.detail.planHash === meta.planHash)?.detail.telemetry.sessionCheckpoint ?? priorPlan.developerSession } : {}),
+        planContract: contract, ...(meta.planHash ? { discussionTask: id } : {}), authoritativeContext: { contractHash: meta.contractHash, contract, currentState: "contract_confirmed" },
         outputSchema });
       if (manifestHash(await manifest(planningWorkspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== baseHash) {
         throw new Error("Planning workspace changed during read-only Pi run");
       }
       const after = manifestHash(await sourceManifest(project));
       if (after !== baseHash) throw new Error("Project files changed during read-only planning");
+      let developerSession = checkpoint ? checkpoint.detail.telemetry.sessionCheckpoint : result.telemetry.sessionCheckpoint;
       let draft;
       if (checkpoint) {
         if (path.dirname(checkpoint.detail.draftFile) !== directory) throw new Error("Plan checkpoint must belong to this requirement");
@@ -175,15 +192,18 @@ export async function plan(projectPath, id) {
         draft = planAnalysisInput(saved, contract, project);
       } else draft = planAnalysisInput(JSON.parse(result.text), contract, project);
       if (draft.schemaVersion !== 2) throw new Error("新生成的研发方案必须包含完整设计说明。");
+      if (revisionProposal && draft.candidateReview?.proposalHash !== sha256(JSON.stringify(revisionProposal))) throw new Error("Plan revision must objectively assess the exact developer proposal");
+      if (revisionProposal && draft.candidateReview.status === "accepted") {
+        draft = planAnalysisInput({ ...revisionProposal, candidateReview: draft.candidateReview }, contract, project);
+      }
       for (const api of draft.design.interfaces) {
         if (api.status !== "new" && !Object.hasOwn(baseline, api.sourceFile)) throw new Error(`接口引用的源码不存在：${api.sourceFile}`);
       }
-      if (revisionProposal && draft.candidateReview?.proposalHash !== sha256(JSON.stringify(revisionProposal))) throw new Error("Plan revision must objectively assess the exact developer proposal");
       const caseMismatch = draft.affectedFiles.find(file => !Object.hasOwn(baseline, file)
         && Object.keys(baseline).some(existing => existing.toLowerCase() === file.toLowerCase()));
       if (caseMismatch) throw new Error(`Plan file path case does not match the verified source index: ${caseMismatch}`);
       let admission = assessAdmission(draft, contract, policy);
-      let specialistRoles = admission.eligible ? planSpecialists(draft, true) : [];
+      let specialistRoles = admission.eligible ? planSpecialists(draft, reviewPolicy) : [];
       const drafted = { ...active, planCostUsd: active.planCostUsd + (checkpoint ? 0 : result.costUsd) };
       if (checkpoint) {
         await appendEvent(project, id, "plan_draft_reused", drafted, { contextHash, version,
@@ -218,10 +238,11 @@ export async function plan(projectPath, id) {
             if (sha256(JSON.stringify(saved)) !== correctionCheckpoint.detail.analysisHash) throw new Error("Plan correction checkpoint changed");
             draft = planAnalysisInput(saved, contract, project);
             await appendEvent(project, id, "plan_correction_reused", checked.meta, { contextHash, version,
-              sourceEventHash: correctionCheckpoint.hash, modelRun: false, phase: "plan" });
+              sourceEventHash: correctionCheckpoint.hash, draftFile: correctionCheckpoint.detail.draftFile,
+              analysisHash: correctionCheckpoint.detail.analysisHash, modelRun: false, phase: "plan" });
           } else {
             const { markdown, ...currentDesign } = draft;
-            const fields = ["affectedFiles", "changes", "domains", "impacts", "verification", "openQuestions", "boundaries",
+            const fields = ["affectedFiles", "changes", "domains", "impacts", "verification", "validation", "openQuestions", "boundaries",
               ...(revisionProposal ? ["candidateReview"] : [])];
             const patchProperties = Object.fromEntries(fields.map(key => [key, { anyOf: [outputSchema.schema.properties[key], { type: "null" }] }]));
             patchProperties.verification = { anyOf: [{ type: "null" }, { type: "object", additionalProperties: false,
@@ -252,7 +273,7 @@ export async function plan(projectPath, id) {
               + `\nverification修改协议：为null表示全部测试项保持不变；否则必须为按验收编号组织的对象，包含${JSON.stringify(contract.acceptance.map(item => item.id))}所有键。仅修改涉及的验收项为{scenario,regression}，其他键为null。不得返回数组、删除验收或重新编号。`
               + "\nchanges和design.components只返回需要更新的文件条目，按file合并，未返回文件保留旧说明/伪代码。design.interfaces只返回需要更新或新增的接口，按method/path合并，未返回接口保留旧契约。这些修改数组不能删除条目；完整内容通过read_plan按需读取，禁止捏造路径。affectedFiles等其他数组仍为完整替换，通常保持null。变更后端接口时同步前端调用、组件伪代码和测试。普通技术建议（例如缺失数据源的提示）采用最简方案，不把已冻结业务行为重新提问。",
               correctionLog, remaining, null, [], {
-              ...modelAllowance((await readTask(project, id)).events, policy), contextFiles: draft.affectedFiles,
+               ...modelAllowance((await readTask(project, id)).events, policy), developerSession: true, resumeSession: developerSession, contextFiles: draft.affectedFiles,
               planContract: contract, planCorrection: { draftFile: (await readTask(project, id)).events.findLast(event =>
                 ["plan_draft_completed", "plan_draft_reused"].includes(event.type) && event.detail.analysisHash === priorAnalysisHash).detail.draftFile,
                 draftHash: priorAnalysisHash },
@@ -283,8 +304,9 @@ export async function plan(projectPath, id) {
             { contextHash, version, error: error.message, logFile: correctionLog, costUsd, modelRun: Boolean(correctionRun || error.telemetry), telemetry: correctionRun?.telemetry ?? error.telemetry ?? null });
           throw error;
         }
-        admission = assessAdmission(draft, contract, policy);
-        specialistRoles = admission.eligible ? planSpecialists(draft, true) : [];
+         developerSession = correctionCheckpoint ? correctionCheckpoint.detail.telemetry.sessionCheckpoint : correctionRun.telemetry.sessionCheckpoint;
+         admission = assessAdmission(draft, contract, policy);
+        specialistRoles = admission.eligible ? planSpecialists(draft, reviewPolicy) : [];
         checked = await reviewPlanAnalysis(project, id, checked.meta, directory, planningWorkspace, baseHash, draft, contract, specialistRoles, contextHash, 1);
         internalCorrection = { attempts: 1, maxAttempts: 1 };
       }
@@ -294,13 +316,22 @@ export async function plan(projectPath, id) {
           .map((item) => `${row.role}：${item.subject}；${item.recommendation}`))];
       const decision = admission.eligible && blockers.length ? { ...admission, status: "needs_clarification",
         label: "待补充", eligible: false, reasons: blockers } : admission;
+      for (const [index, command] of draft.validation.checks.map(item => item.command).entries()) {
+        const checkLog = path.join(directory, `baseline-v${version}-attempt-${attempt}-check-${index + 1}.log`);
+        const result = await runCommand(command, planningWorkspace, project.config.maxPiMs, checkLog,
+          project.config.maxEventBytes, project.config.environment.checks, project.config.checkSandbox);
+        baselineChecks.push({ command, logFile: checkLog, ...result });
+        if (!Number.isInteger(result.code) || result.signal !== null) throw new Error(`Baseline check did not finish normally: ${command.join(" ")}`);
+      }
+      if (manifestHash(await manifest(planningWorkspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== baseHash)
+        throw new Error("Scoped baseline checks modified project files");
       const text = draft.markdown.replace(/((?:^|\n)## 待确认\s*\n)[\s\S]*?(?=\n## |$)/,
         (_, heading) => `${heading}${blockers.length ? blockers.map((item) => `- ${item}`).join("\n") : "无"}`);
       const planFile = path.join(directory, `plan-v${version}.md`);
       const analysisFile = path.join(directory, `plan-analysis-v${version}.json`);
-      const analysis = { schemaVersion: 1, testReviewRequired: true, contractHash: meta.contractHash, baselineHash: projectBaseline.snapshotHash,
+      const analysis = { schemaVersion: 1, reviewPolicy, contractHash: meta.contractHash, baselineHash: projectBaseline.snapshotHash,
         standardsHash: standards.hash, planHash: sha256(text), draft, specialists: checked.results, blockers,
-        admission: decision, admissionPolicy: policy, internalCorrection };
+         admission: decision, admissionPolicy: policy, internalCorrection, developerSession };
       await appendEvent(project, id, "plan_artifacts_prepared", { ...checked.meta, planVersion: version,
         planHash: null, planAnalysisHash: null, planBlockers: [] }, { version, planFile, analysisFile });
       await fs.writeFile(analysisFile, `${JSON.stringify(analysis, null, 2)}\n`, { flag: "wx", mode: 0o600 });
@@ -312,7 +343,7 @@ export async function plan(projectPath, id) {
         standardsHash: standards.hash, planResolutionHash: null, updatedAt: new Date().toISOString() };
       await appendEvent(project, id, "plan_created", next, { planFile, analysisFile, modelRun: false, planningWorkspace, baselineChecks,
         projectBaselineHash: projectBaseline.snapshotHash, standardsHash: standards.hash,
-        analysisHash: next.planAnalysisHash, roles: specialistRoles, blockers, admission: decision });
+        analysisHash: next.planAnalysisHash, reviewPolicy, roles: specialistRoles, blockers, admission: decision });
       return { planFile, state: next.state, blocked: blockers.length > 0 };
     } catch (error) {
       const latest = (await readTask(project, id)).meta;
@@ -398,7 +429,8 @@ export async function resolvePlanFindings(projectPath, id, actor, input) {
     if (describePolicy(project.config).executionConfigHash !== meta.configHash || manifestHash(await sourceManifest(project)) !== meta.baseHash) throw new Error("Policy or source changed before findings resolution");
     await assertTaskStandards(project, meta, directory);
     const created = (await readTask(project, id)).events.findLast(event => event.type === "plan_created");
-    await assertCheckEvidence(project, created.detail.baselineChecks, directory, `baseline-v${meta.planVersion}-attempt-${meta.planAttempts}`, true);
+    await assertCheckEvidence(project, created.detail.baselineChecks, directory, `baseline-v${meta.planVersion}-attempt-${meta.planAttempts}`, true,
+      analysis.draft.validation.checks.map(item => item.command));
     const proofs = [];
     for (const item of input.items) {
       if (!["false_positive", "clarified"].includes(item.disposition) || typeof item.reason !== "string" || !item.reason.trim()
@@ -429,26 +461,17 @@ export async function resolvePlanFindings(projectPath, id, actor, input) {
   });
 }
 
-export async function approvePlan(projectPath, id, actor, scope, authorizationHash, expectedPlanHash, developmentBranch, checksText) {
+export async function approvePlan(projectPath, id, actor, scope, authorizationHash, expectedPlanHash, developmentBranch) {
   requireActor(actor);
   const project = await loadProject(projectPath);
-  let developmentChecks = project.config.checks;
-  if (checksText !== undefined) {
-    if (typeof checksText !== "string" || !checksText.trim() || checksText.length > 8000)
-      throw new Error("请在研发确认窗口选择或填写本次需求的真实自动检查命令。");
-    developmentChecks = checksText.trim().split(/\r?\n/).map(line => parse(line, name => {
-      throw new Error(`检查命令不能展开环境变量 ${name}；使用项目已有脚本。`);
-    }));
-    if (developmentChecks.length > 20 || developmentChecks.some(argv => !argv.length || argv.some(value => typeof value !== "string" || !value.trim())))
-      throw new Error("检查命令每行一条，最多20条；复合命令、重定向和通配符请放进项目已有脚本。");
-    validateConfig({ ...project.config, checks: developmentChecks });
-  }
-  if (!developmentChecks.length) throw new Error("请在研发确认窗口准备自动检查命令，固定测试环境可以暂不配置。");
   return withLock(path.join(taskPath(project, id), "task.lock"), async () => {
     const { meta, directory, events } = await readTask(project, id);
     requireState(meta, "plan_review");
     if (expectedPlanHash !== undefined && expectedPlanHash !== meta.planHash) throw new Error("The plan has changed; review the current version before approval");
     const analysis = await readPlanAnalysis(meta, directory);
+    if (!analysis.draft.validation) throw new Error("当前方案缺少验证与启动约定，请重新生成研发方案。");
+    const developmentChecks = analysis.draft.validation.checks.map(item => item.command);
+    validateConfig({ ...project.config, checks: developmentChecks });
     if (analysis.blockers.length) throw new Error("Plan analysis has unresolved blockers; revise the plan before approval");
     if (!analysis.admission.eligible) throw new Error("Requirement is outside the approved admission boundary or needs clarification");
     const teamReview = planReviewStatus(meta, analysis.draft);
@@ -462,7 +485,7 @@ export async function approvePlan(projectPath, id, actor, scope, authorizationHa
     if (sha256(text) !== meta.planHash) throw new Error("Plan changed after it was generated");
     const created = events.findLast((event) => event.type === "plan_created");
     await assertCheckEvidence(project, created?.detail.baselineChecks, directory,
-      `baseline-v${meta.planVersion}-attempt-${meta.planAttempts}`, true);
+      `baseline-v${meta.planVersion}-attempt-${meta.planAttempts}`, true, developmentChecks);
     const contract = JSON.parse(await fs.readFile(path.join(directory, `contract-v${meta.contractVersion}.json`), "utf8"));
     if (sha256(JSON.stringify(contract)) !== meta.contractHash) throw new Error("Confirmed contract changed after planning");
     await assertTaskStandards(project, meta, directory);
@@ -477,7 +500,7 @@ export async function approvePlan(projectPath, id, actor, scope, authorizationHa
     }
     if (project.config.mode === "local" && await sourceRevision(project) !== meta.baseRevision) throw new Error("Project revision changed after planning");
     const branchSelection = project.config.mode === "git" ? await validateDevelopmentBranch(project, meta,
-      developmentBranch ?? { kind: "new", branch: `${project.config.branchPrefix}/${id}` }) : null;
+      developmentBranch ?? { kind: "new", branch: `${project.config.branchPrefix}/${id}${meta.restartCount ? `-restart-${meta.restartCount}` : ""}` }) : null;
     if (project.config.mode === "local" && developmentBranch !== undefined) throw new Error("目录项目不支持 Git 分支选择。");
     if (meta.assignments?.developer?.userId !== actor || meta.assignments.developer.status !== "accepted") {
       throw new Error("Plan approval requires the assigned developer");
@@ -503,7 +526,7 @@ export async function approvePlan(projectPath, id, actor, scope, authorizationHa
     await appendEvent(project, id, "plan_approved", next, { actor,
       approvalKind: authorizationHash === undefined ? "human" : "delegated", authorizationHash: authorizationHash ?? null,
       contractHash: meta.contractHash, planHash: meta.planHash, baseHash: meta.baseHash,
-      developmentChecks, checksSource: checksText === undefined ? "project" : "developer",
+       developmentChecks, checksSource: "plan", validation: analysis.draft.validation,
       admissionHash: sha256(JSON.stringify(analysis.admission)), riskOwner: actor,
        planResolutionHash: meta.planResolutionHash ?? null, scopeDecision: scopeDecision ?? null, developmentBranch: branchSelection,
        teamReview });
@@ -563,18 +586,21 @@ export async function resumeImplementation(projectPath, id, actor, evidence, fil
     }
     const replacements = [];
     if (reviewedEdits !== undefined) {
-      if (!Array.isArray(reviewedEdits) || reviewedEdits.length !== files.length
-          || new Set(reviewedEdits.map(edit => edit?.file)).size !== files.length) throw new Error("Reviewed repair requires one explicit replacement per selected file");
+      if (!Array.isArray(reviewedEdits) || !reviewedEdits.length
+          || new Set(reviewedEdits.map(edit => edit?.file)).size !== files.length) throw new Error("Reviewed repair requires explicit replacements covering every selected file");
       for (const edit of reviewedEdits) {
         if (!edit || Object.keys(edit).sort().join() !== "file,newText,oldText" || !files.includes(edit.file)
             || typeof edit.oldText !== "string" || !edit.oldText || typeof edit.newText !== "string"
             || edit.oldText === edit.newText || [edit.oldText, edit.newText].some(text => text.split("\n").length > 50)) throw new Error("Reviewed repair requires unique nonempty old text and at most 50 lines per replacement");
         const file = await fs.realpath(path.join(meta.workspace, edit.file));
         assertInside(await fs.realpath(meta.workspace), file);
-        const text = await fs.readFile(file, "utf8");
+        const previous = replacements.find(replacement => replacement.path === file);
+        const text = previous ? previous.text : await fs.readFile(file, "utf8");
         const offset = text.indexOf(edit.oldText);
         if (offset < 0 || text.indexOf(edit.oldText, offset + 1) >= 0) throw new Error(`Reviewed repair must uniquely match current source: ${edit.file}`);
-        replacements.push({ ...edit, path: file, text: text.slice(0, offset) + edit.newText + text.slice(offset + edit.oldText.length) });
+        const replaced = text.slice(0, offset) + edit.newText + text.slice(offset + edit.oldText.length);
+        if (previous) previous.text = replaced;
+        else replacements.push({ ...edit, path: file, text: replaced });
       }
     } else modelAllowance(events, admissionPolicy(project.config));
     const retained = path.join(directory, `implementation-${meta.state === "verified" ? "review" : "failure"}-${failed.hash}`);
@@ -635,8 +661,7 @@ export async function implement(projectPath, id) {
   return withLock(path.join(taskPath(project, id), "task.lock"), async () => {
     const { meta, directory, events } = await readTask(project, id);
     requireState(meta, "approved");
-    const commands = meta.developmentChecks ?? project.config.checks;
-    if (!commands.length) throw new Error("开始自动开发前需要研发确认真实自动检查命令。");
+    const commands = meta.developmentChecks;
     if (meta.planApprovedBy !== meta.assignments?.developer?.userId
         || meta.assignments.developer.status !== "accepted") {
       throw new Error("Implementation requires the assigned developer's plan approval");
@@ -668,39 +693,71 @@ export async function implement(projectPath, id) {
     }
     if (resumed && manifestHash(await manifest(meta.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== meta.afterHash) throw new Error("Resumed workspace changed before execution");
     const prepared = resumed ? { workspace: meta.workspace, branch: meta.branch, baselineHash: meta.baselineHash }
-      : await prepareWorkspace(project, id, meta.baseHash, meta.baseRevision, meta.developmentBranch);
+      : await prepareWorkspace(project, id, meta.baseHash, meta.baseRevision, meta.developmentBranch, meta.restartCount ?? 0);
+    const baseline = JSON.parse(await fs.readFile(path.join(directory, "baseline.json"), "utf8"));
+    prepared.runtimeDependencies = [];
+    for (const file of Object.keys(baseline).filter(file => path.posix.basename(file) === "package.json")) {
+      const sourceDirectory = path.posix.dirname(file);
+      if (!(await fs.readdir(path.join(project.root, sourceDirectory))).includes("node_modules")) continue;
+      const relative = path.posix.join(sourceDirectory, "node_modules");
+      if (!(await fs.readdir(path.join(prepared.workspace, sourceDirectory))).includes("node_modules")) {
+        const dependencies = await fs.realpath(path.join(project.root, relative));
+        await fs.cp(dependencies, path.join(prepared.workspace, relative),
+          { recursive: true, verbatimSymlinks: true, filter: async source => {
+            if ((await fs.lstat(source)).isSymbolicLink()) {
+              const target = await fs.readlink(source);
+              if (path.isAbsolute(target)) throw new Error(`Installed dependency has an absolute link: ${source}`);
+              assertInside(dependencies, await fs.realpath(source));
+            }
+            return true;
+          } });
+      }
+      prepared.runtimeDependencies.push(relative);
+    }
     const attempt = events.filter(event => event.type === "workspace_prepared").length + 1;
     const active = { ...meta, ...prepared, resumeImplementationFiles: null, resumeImplementationModel: null,
       resumeSession: null, resumeContinuation: false, developmentFailure: null, developmentPause: null,
       state: "implementing", updatedAt: new Date().toISOString() };
-    await appendEvent(project, id, "workspace_prepared", active, { workspace: prepared.workspace, branch: prepared.branch });
+    await appendEvent(project, id, "workspace_prepared", active, { workspace: prepared.workspace,
+      branch: prepared.branch, runtimeDependencies: prepared.runtimeDependencies });
     const prompt = resumed && !meta.resumeContinuation
-      ? `Apply the owner's diagnosed local repair only. No redesign, scope expansion or weaker tests. Controller verified the frozen contract, approval and snapshots; full external regression/change review remain required. No commands or success claims.\nContract: ${meta.contractHash}\nFrozen requirement: ${JSON.stringify(contract)}\nPlan: ${meta.planHash}\nApproved changes: ${JSON.stringify(analysis.draft.changes.filter(item => meta.resumeImplementationFiles.includes(item.file)))}\nApproved impact and recovery: ${JSON.stringify({ impacts: analysis.draft.impacts, recovery: analysis.draft.boundaries.recovery, externalEffects: analysis.draft.boundaries.externalEffects })}\nExcluded scope: ${JSON.stringify(contract.outOfScope)}\nStandards (${standards.hash}): ${standardsPrompt(standards)}`
-      : `Implement the confirmed requirement. Investigate missing evidence using source tools; follow callers, dependencies and existing fixtures before editing. ${implementationScope === "project" ? "The plan is an initial implementation guide. Add necessary source/test files within project allowed paths when investigation proves they are required for the same acceptance criteria. Explain every scope addition in your final response. Do not add unrelated features." : "Edit approved files only."} External checks run after edits; do not run commands or claim success. Preserve existing assertions; add missing acceptance/boundary/failure/regression coverage, leave sufficient tests unchanged.\n计划文件：${JSON.stringify(meta.developmentFiles)}\n项目授权目录：${JSON.stringify(project.config.allowedPaths)}\n项目参考上下文：${projectContext}\n适用代码规范（哈希 ${standards.hash}）：${standardsPrompt(standards)}\n产品确认的需求契约：\n${JSON.stringify(contract)}\n计划改法：${JSON.stringify(analysis.draft.changes)}\n影响与恢复依据：${JSON.stringify({ impacts: analysis.draft.impacts, recovery: analysis.draft.boundaries.recovery, externalEffects: analysis.draft.boundaries.externalEffects })}`;
+      ? `Apply the owner's diagnosed local repair only. No redesign, scope expansion or weaker tests. Controller verified the frozen contract, approval and snapshots; full external regression/change review remain required. Use native tools to investigate, edit and verify; report actual results.\nContract: ${meta.contractHash}\nFrozen requirement: ${JSON.stringify(contract)}\nPlan: ${meta.planHash}\nApproved changes: ${JSON.stringify(analysis.draft.changes.filter(item => meta.resumeImplementationFiles.includes(item.file)))}\nApproved impact and recovery: ${JSON.stringify({ impacts: analysis.draft.impacts, recovery: analysis.draft.boundaries.recovery, externalEffects: analysis.draft.boundaries.externalEffects })}\nExcluded scope: ${JSON.stringify(contract.outOfScope)}\nStandards (${standards.hash}): ${standardsPrompt(standards)}`
+      : `Implement the approved plan for the confirmed requirement. Investigate only evidence needed for this implementation. ${implementationScope === "project" ? "Necessary related source and tests within project allowed paths may be changed; explain additions. Do not add unrelated features." : "Edit approved files only."} Preserve existing assertions and use the existing verification infrastructure for changed behavior. Report actual checks and unresolved issues.\n计划文件：${JSON.stringify(meta.developmentFiles)}\n项目授权目录：${JSON.stringify(project.config.allowedPaths)}\n项目参考上下文：${projectContext}\n适用代码规范（哈希 ${standards.hash}）：${standardsPrompt(standards)}\n产品确认的需求契约：\n${JSON.stringify(contract)}\n计划改法：${JSON.stringify(analysis.draft.changes)}\n影响与恢复依据：${JSON.stringify({ impacts: analysis.draft.impacts, recovery: analysis.draft.boundaries.recovery, externalEffects: analysis.draft.boundaries.externalEffects })}`;
     let inspected;
     let result;
     try {
       const diagnosis = resumed ? events.findLast(event => event.type === "implementation_resumed").detail.evidence : null;
       const resolvedGuidance = (analysis.resolution ? `\n责任研发人逐项澄清（${analysis.resolution.actor}；只在已批准文件和需求内实施）：\n${analysis.resolution.implementationGuidance}` : "")
         + (analysis.approvalScope ? `\nApproved owner scope note (${analysis.approvalScope.actor}): ${analysis.approvalScope.reason}` : "")
-        + (resumed ? `\nContinue from the current retained workspace: ${JSON.stringify(meta.resumeImplementationFiles)}. Prior failure and evidence: ${diagnosis}. Preserve completed edits and existing assertions. Investigate and fix the root cause; never weaken tests to pass. Reuse saved session context when present; older tasks without a saved session must inspect current files before editing.` : "");
-      const verificationGuidance = `\nApproved acceptance assertions: ${JSON.stringify(analysis.draft.verification)}. Implement and test EVERY acceptance ID. Developer-confirmed checks: ${JSON.stringify(commands)}. Reuse these checks and existing test infrastructure; add test coverage only where actual acceptance assertions are missing. Do not invent a new test runner or unrelated rejection/write-failure cases for a read-only UI change. Before declaring REQFLOW_EDITS_COMPLETE, check each assertion against actual code and tests. Do not silently accept invalid input or omit required errors.`;
+        + (resumed ? `\nContinue from the current retained workspace: ${JSON.stringify(meta.resumeImplementationFiles)}. Prior failure and evidence: ${diagnosis}. Preserve completed edits and existing assertions. Investigate and fix the root cause; never weaken tests to pass. This is a fresh coding session: inspect current source rather than relying on historical tool results.` : "");
+      const verificationGuidance = (analysis.draft.schemaVersion === 2 ? `\nApproved implementation design (${meta.planHash}): ${JSON.stringify(analysis.draft.design)}\nFollow these reviewed interface fields, rendering choices, component locations and data handling; a file change summary does not replace this design.` : "")
+        + `\nAcceptance assertions: ${JSON.stringify(analysis.draft.verification)}. Approved validation contract: ${JSON.stringify(analysis.draft.validation)}. Only execute scoped checks; never repair skipped unrelated suites. Complete planned missing startup scripts. Do not start persistent servers during coding: the controller starts them when local validation is selected. Never claim manual acceptance. The controller independently verifies the source against these checks.`;
       const specialistGuidance = analysis.specialists.flatMap(row => row.findings.findings.filter(finding => finding.severity === "advisory")
         .map(finding => ({ role: row.role, subject: finding.subject, evidence: finding.evidence, recommendation: finding.recommendation })));
       const implementationGuidance = specialistGuidance.length
         ? `\n方案审核中的实施建议：${JSON.stringify(specialistGuidance)}。核实源码后在已冻结需求及批准权限内落实，不扩大范围，不把建议当成新的业务决定。` : "";
-      result = await runPi({ ...project, config: { ...project.config, checks: commands } }, prepared.workspace, "implement", prompt + resolvedGuidance + verificationGuidance + implementationGuidance,
+      const currentFiles = await manifest(prepared.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes);
+      const currentChanges = await inspectChanges(project, id, prepared.workspace);
+      const pathGuidance = `\nController-verified approved path status: ${JSON.stringify((resumed ? meta.resumeImplementationFiles : meta.developmentFiles).map(file => ({ file, existsInWorkspace: Object.hasOwn(currentFiles, file) })))}. Paths marked false are planned NEW files, not missing source evidence. Create them in the approved location; parent directories may also be new. Do not read or list a nonexistent planned file or parent directory. Investigate existing source through the verified source index instead.`;
+      result = await runPi({ ...project, config: { ...project.config, checks: commands } }, prepared.workspace, "implement", prompt + resolvedGuidance + verificationGuidance + implementationGuidance + pathGuidance,
         path.join(directory, attempt === 1 ? "implement.events.jsonl" : `implement-attempt-${attempt}.events.jsonl`), remainingCost,
-        null, [], { ...allowance, ...(meta.resumeSession ? { resumeSession: meta.resumeSession } : {}), ...(resumed && meta.resumeImplementationModel ? { modelSelection: meta.resumeImplementationModel } : {}),
+          null, [], { ...allowance,
+           ...(resumed && meta.resumeImplementationModel ? { modelSelection: meta.resumeImplementationModel } : {}),
           approvedFiles: resumed ? meta.resumeImplementationFiles : meta.developmentFiles, researchRequests: 1, implementationScope,
           authoritativeContext: { contractHash: meta.contractHash, contract, planHash: meta.planHash,
-            changes: analysis.draft.changes, verification: analysis.draft.verification, openQuestions: analysis.draft.openQuestions,
-            impacts: analysis.draft.impacts, guidance: { scope: analysis.approvalScope, resolution: analysis.resolution },
-            projectReference: reference, specialistGuidance, currentState: "approved", implementationScope },
-          sourceQuery: resumed ? JSON.stringify({ files: meta.resumeImplementationFiles, changes: analysis.draft.changes }) : JSON.stringify({ ownerGuidance: analysis.approvalScope?.reason,
-            resolutionGuidance: analysis.resolution?.implementationGuidance,
-            changes: analysis.draft.changes,
-            verification: analysis.draft.boundaries.verification }).slice(0, 4000) });
+            changes: analysis.draft.changes, verification: analysis.draft.verification, validation: analysis.draft.validation, openQuestions: analysis.draft.openQuestions,
+            ...(analysis.draft.schemaVersion === 2 ? { design: analysis.draft.design } : {}),
+            impacts: analysis.draft.impacts, recovery: analysis.draft.boundaries.recovery,
+            externalEffects: analysis.draft.boundaries.externalEffects, standards: standardsPrompt(standards), checks: commands,
+            guidance: { scope: analysis.approvalScope, resolution: analysis.resolution ? {
+              actor: analysis.resolution.actor, planResolutionHash: meta.planResolutionHash,
+              implementationGuidance: analysis.resolution.implementationGuidance,
+              items: analysis.resolution.items.map(item => ({ ...item,
+                sources: item.sources.map(({ text, ...reference }) => reference) })) } : null },
+            projectReference: reference, specialistGuidance, currentState: "approved", implementationScope,
+             workspaceState: { sourceHash: manifestHash(currentFiles), changes: currentChanges.changes },
+             ...(resumed ? { diagnosis } : {}) },
+          sourceQuery: JSON.stringify({ changes: analysis.draft.changes, impacts: analysis.draft.impacts }) });
       inspected = await inspectChanges(project, id, prepared.workspace);
       if (inspected.violations.length) throw new Error(`Changes exceed approved scope: ${inspected.violations.join(", ")}`);
       if (!inspected.changes.length) throw new Error("Pi made no code changes");
@@ -725,7 +782,7 @@ export async function implement(projectPath, id) {
         }
       }
       const kind = inspected.violations.length ? "scope_violation" : error.code === "PI_TOOL_LIMIT" ? "tool_limit"
-        : error.code === "PI_TIMEOUT" ? "timeout" : "implementation_error";
+        : error.code === "PI_TIMEOUT" ? "timeout" : error.code === "EXECUTION_PAUSED" ? "user_paused" : "implementation_error";
       const failed = { ...active, state: "implementation_failed", changeCount: inspected.changes.length,
         developmentFailure: { kind, message: error.message, retryable: !inspected.violations.length },
         afterHash: inspected.afterHash, implementationCostUsd: previousImplementationCost + costUsd, updatedAt: new Date().toISOString() };
@@ -740,9 +797,8 @@ export async function verify(projectPath, id) {
   const project = await loadProject(projectPath);
   return withLock(path.join(taskPath(project, id), "task.lock"), async () => {
     const { meta, directory, events } = await readTask(project, id);
-    requireState(meta, "implemented");
-    const commands = meta.developmentChecks ?? project.config.checks;
-    if (!commands.length) throw new Error("未配置自动检查命令，不能标记代码测试通过。");
+    if (!["implemented", "verification_failed"].includes(meta.state)) throw new Error(`Task ${id} is ${meta.state}; expected implemented or verification_failed`);
+    const commands = meta.developmentChecks;
     if (describePolicy(project.config).executionConfigHash !== meta.configHash) throw new Error("Project policy changed after plan approval");
     if (!(await readPlanAnalysis(meta, directory)).admission.eligible) throw new Error("Requirement is outside the verification admission boundary");
     await assertTaskStandards(project, meta, directory);
@@ -761,12 +817,14 @@ export async function verify(projectPath, id) {
       }
       const after = manifestHash(await manifest(meta.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes));
       if (after !== before) throw new Error("Verification commands modified project files");
-      const next = { ...meta, state: "verified", verificationAttempt, checks: results, updatedAt: new Date().toISOString() };
-      await appendEvent(project, id, "verified", next, { checks: results });
+      const verificationMode = commands.length ? "automated" : "manual_pending";
+      const next = { ...meta, state: "verified", verificationAttempt, verificationMode, checks: results, updatedAt: new Date().toISOString() };
+      await appendEvent(project, id, "verified", next, { checks: results, verificationMode,
+        validation: (await readPlanAnalysis(meta, directory)).draft.validation });
       return next;
     } catch (error) {
       const failed = { ...meta, state: "verification_failed", verificationAttempt, checks: results,
-        developmentFailure: { kind: error.code === "CHECK_FAILED" ? "check_failed" : "verification_error", message: error.message, retryable: error.code === "CHECK_FAILED" },
+        developmentFailure: { kind: error.code === "EXECUTION_PAUSED" ? "user_paused" : error.code === "CHECK_FAILED" ? "check_failed" : "verification_error", message: error.message, retryable: error.code === "CHECK_FAILED" },
         updatedAt: new Date().toISOString() };
       await appendEvent(project, id, "verification_failed", failed, { error: error.message, checks: results });
       throw error;
@@ -793,7 +851,7 @@ export async function approveChanges(projectPath, id, actor, evidence) {
     if (!(await readPlanAnalysis(meta, directory)).admission.eligible) throw new Error("Requirement is outside the change approval admission boundary");
     await assertTaskStandards(project, meta, directory);
     await assertCheckEvidence(project, meta.checks, directory, meta.verificationAttempt === 1 ? "" : `verification-attempt-${meta.verificationAttempt}`,
-      false, meta.developmentChecks ?? project.config.checks);
+      false, meta.developmentChecks);
     const current = manifestHash(await manifest(meta.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes));
     if (current !== meta.afterHash) throw new Error("Workspace changed after verification");
     const changes = events.findLast((event) => event.type === "implemented")?.detail.changes;
@@ -862,7 +920,7 @@ export async function deployTest(projectPath, id) {
     await assertTaskStandards(project, meta, directory);
     const changes = events.findLast((event) => event.type === "implemented")?.detail.changes;
     await assertCheckEvidence(project, meta.checks, directory, meta.verificationAttempt === 1 ? "" : `verification-attempt-${meta.verificationAttempt}`,
-      false, meta.developmentChecks ?? project.config.checks);
+      false, meta.developmentChecks);
     const approval = meta.changeApproval;
     if (!Array.isArray(changes) || !changes.length) throw new Error("Audited implementation changes are missing");
     if (approval && (approval.actor !== meta.assignments?.developer?.userId
@@ -904,7 +962,7 @@ export async function deployTest(projectPath, id) {
       if (candidate.requestRevision !== meta.publishedRevision || candidate.branch !== project.config.gitDelivery?.testBranch
           || manifestHash(await manifest(candidate.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== candidate.sourceHash
           || await runGit(candidate.workspace, ["rev-parse", "HEAD"]) !== candidate.publishedRevision) throw new Error("测试合并版本已改变。");
-      const commands = meta.developmentChecks ?? project.config.checks;
+      const commands = meta.developmentChecks;
       if (candidate.checks.length !== commands.length) throw new Error("缺少合并后测试证据。");
       for (const [i, check] of candidate.checks.entries()) {
         assertInside(directory, check.logFile);
@@ -1025,7 +1083,7 @@ export async function acceptTest(projectPath, id, actor, evidence) {
       await assertTaskStandards(project, meta, directory);
       await assertCheckEvidence(project, meta.checks, directory,
         meta.verificationAttempt === 1 ? "" : `verification-attempt-${meta.verificationAttempt}`,
-        false, meta.developmentChecks ?? project.config.checks);
+        false, meta.developmentChecks);
       if (manifestHash(await manifest(meta.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== meta.afterHash)
         throw new Error("本地代码已改变，请重新检查后再验收。");
     } else requireState(meta, "test_deployed");
@@ -1034,8 +1092,11 @@ export async function acceptTest(projectPath, id, actor, evidence) {
       error => { if (error.code === "ENOENT") return null; throw error; });
     if (environment && environment.taskId !== id && environment.url === meta.testDeployment.url) throw new Error("共享测试环境已用于其他需求发布，请重新发布本需求后再验收。");
     await fs.writeFile(path.join(directory, "acceptance.md"), evidence, { flag: "wx", mode: 0o600 });
-    const next = { ...meta, state: "test_accepted", acceptanceMode: local ? "local" : "deployed", acceptedBy: actor, acceptedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
-    await appendEvent(project, id, "test_accepted", next, { actor, evidenceHash: sha256(evidence) });
+    const stopped = await stopLocalRuntime(directory);
+    const next = { ...meta, state: "test_accepted", acceptanceMode: local ? "local" : "deployed",
+      ...(meta.localValidation ? { localValidation: { ...meta.localValidation, status: stopped.status } } : {}),
+      acceptedBy: actor, acceptedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    await appendEvent(project, id, "test_accepted", next, { actor, evidenceHash: sha256(evidence), localRuntime: stopped });
     return next;
   }));
 }
@@ -1051,13 +1112,61 @@ export async function rollback(projectPath, id, actor) {
     }
     let files;
     try {
+      await stopLocalRuntime(taskPath(project, id));
       files = await rollbackWorkspace(project, id, meta.workspace);
     } catch (error) {
       await appendEvent(project, id, "rollback_rejected", meta, { actor, error: error.message });
       throw error;
     }
-    const next = { ...meta, state: "rolled_back", rolledBackBy: actor, updatedAt: new Date().toISOString() };
+    const next = { ...meta, state: "rolled_back", executionPause: null, rolledBackBy: actor, updatedAt: new Date().toISOString() };
     await appendEvent(project, id, "workspace_rolled_back", next, { actor, files });
+    return next;
+  });
+}
+
+export async function restartDevelopment(projectPath, id, actor, expectedAuditHead) {
+  requireActor(actor);
+  const project = await loadProject(projectPath);
+  return withLock(path.join(taskPath(project, id), "task.lock"), async () => {
+    const { meta, directory, events, lastHash } = await readTask(project, id);
+    requireState(meta, "rolled_back");
+    if (expectedAuditHead !== lastHash) throw new Error("需求记录已改变，请刷新后重新开始。");
+    const rolled = events.findLast(event => event.type === "workspace_rolled_back");
+    if (!rolled || rolled.meta.baselineHash !== meta.baselineHash) throw new Error("Rollback audit record is missing or changed");
+    if (meta.assignments?.developer?.userId !== actor || meta.assignments.developer.status !== "accepted")
+      throw new Error("Only the assigned developer can restart development");
+    const contract = JSON.parse(await fs.readFile(path.join(directory, `contract-v${meta.contractVersion}.json`), "utf8"));
+    if (sha256(JSON.stringify(contract)) !== meta.contractHash) throw new Error("Confirmed contract changed before restart");
+    if (manifestHash(await manifest(meta.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== meta.baselineHash)
+      throw new Error("回退后的工作区存在新修改，请先核对，不能直接重新开始。");
+    const report = JSON.parse(await fs.readFile(path.join(directory, "changes.json"), "utf8"));
+    const implementation = events.findLast(event => ["implemented", "implementation_failed", "implementation_interrupted"].includes(event.type));
+    if (!implementation || JSON.stringify(report.changes) !== JSON.stringify(implementation.detail.changes))
+      throw new Error("Restart changes differ from the audited implementation");
+    const baseline = await manifest(path.join(directory, "baseline"), project.config.excludedPaths, project.config.maxSnapshotBytes);
+    const saved = await manifest(path.join(directory, "after"), project.config.excludedPaths, project.config.maxSnapshotBytes);
+    if (manifestHash(baseline) !== meta.baselineHash
+        || manifestHash(JSON.parse(await fs.readFile(path.join(directory, "baseline.json"), "utf8"))) !== meta.baselineHash
+        || report.changes.some(change => change.after && JSON.stringify(saved[change.file]) !== JSON.stringify(change.after)))
+      throw new Error("Implementation snapshots changed before restart");
+    const retained = path.join(directory, `rollback-${rolled.hash}`);
+    await fs.mkdir(retained, { mode: 0o700 });
+    for (const name of ["baseline", "baseline.json", "after", "changes.json"])
+      await fs.rename(path.join(directory, name), path.join(retained, name));
+    const next = { ...meta, state: "contract_confirmed", restartCount: (meta.restartCount ?? 0) + 1,
+      planHash: null, planAnalysisHash: null, planFeedbackVersion: null, planBlockers: [], planPartApprovals: {},
+      executionPause: null, executionBoundary: null, updatedAt: new Date().toISOString() };
+    for (const field of ["workspace", "branch", "branchStartRevision", "baselineHash", "afterHash", "baseHash", "baseRevision",
+      "planApprovedBy", "planApprovedAt", "planScopeHash", "planResolutionHash", "developmentBranch", "developmentFiles",
+      "developmentChecks", "configHash", "configBindingVersion", "standardsHash", "projectBaselineHash", "admission", "admissionPolicyHash",
+      "resumeImplementationFiles", "resumeImplementationModel", "resumeContinuation", "resumeSessionCheckpoint", "developmentFailure",
+      "fastPathEligibility", "fastPathAuthorization", "changeApproval", "changeCount", "checks", "verificationMode", "verificationFailure",
+      "localValidation", "publishedRevision", "publishedBy", "gitDeliveryError", "gitCandidate", "gitCommit", "testCandidate", "testDeployment",
+      "acceptedBy", "acceptedAt", "acceptanceMode", "rolledBackBy", "candidateWorkspace", "candidateHash", "mergedRevision", "mergeChecks"])
+      delete next[field];
+    await appendEvent(project, id, "development_restarted", next, { actor, retained, priorRollbackHash: rolled.hash, priorAuditHead: lastHash,
+      priorImplementationHash: implementation.hash, priorPlanHash: meta.planHash, baselineHash: meta.baselineHash,
+      reportHash: sha256(JSON.stringify(report)), contractHash: meta.contractHash, modelRun: false });
     return next;
   });
 }
@@ -1084,14 +1193,14 @@ export async function verifyCandidate(projectPath, id) {
     if (describePolicy(project.config).executionConfigHash !== meta.configHash) throw new Error("Project policy changed after plan approval");
     await assertTaskStandards(project, meta, directory);
     await assertCheckEvidence(project, meta.checks, directory, meta.verificationAttempt === 1 ? "" : `verification-attempt-${meta.verificationAttempt}`,
-      false, meta.developmentChecks ?? project.config.checks);
+      false, meta.developmentChecks);
     const candidate = await prepareReleaseCandidate(project, id, meta);
     const active = { ...meta, ...candidate, state: "merge_verifying", updatedAt: new Date().toISOString() };
     await appendEvent(project, id, "merge_candidate_prepared", active, candidate);
     const before = manifestHash(await manifest(candidate.candidateWorkspace, project.config.excludedPaths, project.config.maxSnapshotBytes));
     const results = [];
     try {
-      for (const [index, command] of (meta.developmentChecks ?? project.config.checks).entries()) {
+      for (const [index, command] of (meta.developmentChecks).entries()) {
         const logFile = path.join(directory, `merge-check-${index + 1}.log`);
         const result = await runCommand(command, candidate.candidateWorkspace, project.config.maxPiMs, logFile,
           project.config.maxEventBytes, project.config.environment.checks, project.config.checkSandbox);
@@ -1120,7 +1229,7 @@ export async function approveRelease(projectPath, id, actor) {
     requireState(meta, "merge_verified");
     await assertTaskStandards(project, meta, directory);
     if (describePolicy(project.config).executionConfigHash !== meta.configHash) throw new Error("Project policy changed after plan approval");
-    await assertCheckEvidence(project, meta.mergeChecks, directory, "merge", false, meta.developmentChecks ?? project.config.checks);
+    await assertCheckEvidence(project, meta.mergeChecks, directory, "merge", false, meta.developmentChecks);
     if (manifestHash(await manifest(meta.candidateWorkspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== meta.candidateHash) {
       throw new Error("Release candidate changed after verification");
     }
@@ -1138,7 +1247,7 @@ export async function release(projectPath, id) {
     requireState(meta, "release_approved");
     await assertTaskStandards(project, meta, directory);
     if (describePolicy(project.config).executionConfigHash !== meta.configHash) throw new Error("Project policy changed after release approval");
-    await assertCheckEvidence(project, meta.mergeChecks, directory, "merge", false, meta.developmentChecks ?? project.config.checks);
+    await assertCheckEvidence(project, meta.mergeChecks, directory, "merge", false, meta.developmentChecks);
     await assertReleaseRevision(project, meta.mergedRevision);
     const target = {
       ...meta, workspace: meta.candidateWorkspace,
@@ -1256,7 +1365,7 @@ export async function archiveTestOnly(projectPath, id, actor) {
     if (describePolicy(project.config).executionConfigHash !== meta.configHash) throw new Error("Project policy changed after plan approval");
     await assertCheckEvidence(project, acceptedLocal ? meta.checks : meta.mergeChecks, directory,
       acceptedLocal ? (meta.verificationAttempt === 1 ? "" : `verification-attempt-${meta.verificationAttempt}`) : "merge",
-      false, meta.developmentChecks ?? project.config.checks);
+      false, meta.developmentChecks);
     if (manifestHash(await manifest(acceptedLocal ? meta.workspace : meta.candidateWorkspace,
       project.config.excludedPaths, project.config.maxSnapshotBytes)) !== (acceptedLocal ? meta.afterHash : meta.candidateHash)) {
       throw new Error("Archive candidate changed after verification");

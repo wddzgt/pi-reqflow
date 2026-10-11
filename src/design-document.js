@@ -88,7 +88,7 @@ export function planReviewHash(meta, draft, responsibility) {
   return sha256(JSON.stringify({ contractHash: meta.contractHash, baseHash: meta.baseHash, configHash: meta.configHash,
     standardsHash: meta.standardsHash, approach: draft.design.approach, interfaces: draft.design.interfaces,
     data: draft.design.data, impacts: draft.impacts, boundaries: draft.boundaries,
-    externalEffects: draft.boundaries.externalEffects, verification: draft.verification,
+    externalEffects: draft.boundaries.externalEffects, verification: draft.verification, validation: draft.validation,
     design: draft.design[responsibility], diagrams: draft.design.diagrams.filter(row => [responsibility, "shared"].includes(row.domain)),
     components: parts, changes: draft.changes.filter(row => parts.some(part => part.file === row.file)) }));
 }

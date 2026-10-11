@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const phase = process.env.REQFLOW_PHASE;
 const prompt = process.argv.at(-1);
@@ -55,7 +55,7 @@ if (phase === "intake") {
     process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "user", content: [{ type: "image", data, mimeType: "image/png" }] } }) + "\n");
   }
 }
-if (phase === "review") {
+if (phase === "review" || phase === "plan" && prompt.startsWith("研发方案沟通")) {
   if (prompt.startsWith("研发方案沟通")) {
     const question = prompt.match(/^本轮研发问题：(.*)$/m)[1];
     review = { schemaVersion: 2, planHash: prompt.match(/当前方案哈希：([a-f0-9]{64})/)[1], decisions: [],
@@ -63,7 +63,7 @@ if (phase === "review") {
       recommendation: question.includes("新增除法") ? "product_confirmation" : "keep",
       reasons: ["src/calculator.mjs 中现有加法保持原行为，新增乘法按原验收检查。"], pendingQuestions: [] };
   } else if (prompt.startsWith("研发方案专项检查")) {
-    const role = prompt.match(/本方案在 (frontend|backend|qa) 职责/)[1];
+    const role = prompt.match(/本方案在 (all) 职责/)[1];
     review = { findings: [] };
   } else {
   const role = prompt.match(/你是独立的(frontend|backend|qa)评审 Agent/)?.[1];
@@ -85,7 +85,7 @@ if (phase === "review") {
 }
 
 let analysis;
-if (phase === "plan") {
+if (phase === "plan" && !prompt.startsWith("研发方案沟通") && !prompt.startsWith("局部研发方案纠错")) {
   const contract = JSON.parse(prompt.match(/冻结需求 JSON：(.*)\n适用代码规范/)[1]);
   analysis = { schemaVersion: 2, contractHash: prompt.match(/冻结需求哈希：([a-f0-9]{64})/)[1],
     affectedFiles: contract.inScope.every((file) => file.endsWith(".mjs")) ? contract.inScope : ["src/calculator.mjs", "test/calculator.test.mjs"], domains: ["backend"],
@@ -94,6 +94,8 @@ if (phase === "plan") {
       data: { status: "none", evidence: "src/calculator.mjs 不读取或写入持久数据。" } },
     verification: contract.acceptance.map((item) => ({ acceptanceId: item.id, scenario: item.text,
       regression: "执行 test/calculator.test.mjs 中既有 add 用例" })), openQuestions: [] };
+  analysis.validation = { checks: JSON.parse(prompt.match(/检查命令：(.*)$/m)[1]).map(command => ({ command,
+    reason: "计算器实现与调用方验收用例；只回归当前计算器项目" })), skipped: [], manualReason: "按验收场景调用计算器导出函数，核对结果和既有加法。", startup: [] };
   analysis.changes = analysis.affectedFiles.map(file => ({ file, description: documentAddition ? "为 add 增加说明注释，不改函数实现。" : file.startsWith("test/")
     ? "补充新功能断言并保留已有加法回归。" : refineAddition ? "调整 add 的数字字符串处理。" : "独立增加 multiply，保留 add 实现。" }));
   analysis.design = { approach: "沿用计算器纯函数结构，局部修改以满足冻结需求，保留原有加法的签名和回归断言。",
@@ -120,10 +122,22 @@ if (phase === "plan") {
     status: "adjusted", reasons: ["已核对计算器源码，保留冻结需求与现有加法，改法以当前结构化方案为准。"] };
 }
 if (phase === "plan" && prompt.startsWith("局部研发方案纠错")) {
-  analysis = Object.fromEntries(["affectedFiles", "changes", "domains", "impacts", "verification", "openQuestions", "boundaries", "design"].map(key => [key, null]));
+  analysis = Object.fromEntries(["affectedFiles", "changes", "domains", "impacts", "verification", "validation", "openQuestions", "boundaries", "design"].map(key => [key, null]));
   if (prompt.includes('"candidateReview":')) analysis.candidateReview = null;
 }
-const text = phase === "initialize" ? JSON.stringify(initialization) : phase === "intake" ? JSON.stringify(intake) : phase === "review" ? JSON.stringify(review) : phase === "plan" ? JSON.stringify(analysis) : "已修改计算器及测试。";
+const text = phase === "initialize" ? JSON.stringify(initialization) : phase === "intake" ? JSON.stringify(intake) : phase === "review" || prompt.startsWith("研发方案沟通") ? JSON.stringify(review) : phase === "plan" ? JSON.stringify(analysis) : "已修改计算器及测试。";
+const args = process.argv.slice(2);
+if (args.includes("--session")) {
+  const session = args[args.indexOf("--session") + 1];
+  const exists = await fs.stat(session).then(() => true, error => {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  });
+  if (!exists) await fs.writeFile(session, JSON.stringify({ type: "session", version: 3,
+    id: randomUUID(), timestamp: new Date().toISOString(), cwd: process.cwd() }) + "\n", { flag: "wx", mode: 0o600 });
+  await fs.appendFile(session, JSON.stringify({ type: "message", id: `${phase}-${Date.now()}`,
+    timestamp: new Date().toISOString(), message: { role: "assistant", content: [{ type: "text", text }] } }) + "\n");
+}
 if (phase === "plan") {
   process.stdout.write(`${JSON.stringify({ type: "message_end", message: { role: "assistant",
     content: [{ type: "text", text: "Reviewing source" }], stopReason: "toolUse",

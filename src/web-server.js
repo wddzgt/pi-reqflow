@@ -1,4 +1,6 @@
 import { createServer } from "node:http";
+import { stopAllLocalRuntimes } from "./local-runtime.js";
+import { controlledExecution, executionStatus, pauseExecution, assertExecutionActive } from "./action-progress.js";
 import { randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
@@ -14,7 +16,7 @@ import { configureExecution, readExecutionSetup, verifyDeploymentConnection } fr
 import { readModelSettings, configureModels, testModelConnection } from "./model-settings.js";
 import { allowedActions, authenticate, authenticateByUsername, authorize, canReadTask, changePassword, listUsers, loadCredentials, resetPassword, updateUserRoles, validSessionPrincipal } from "./auth.js";
 import { readJson, sha256, writeJson } from "./files.js";
-import { actionAuditContext } from "./store.js";
+import { actionAuditContext, readTask, taskPath } from "./store.js";
 import { createRequirement, executeRequirementAction, getAuditReport, getAuthenticationHistory, getChangedFile,
   getRequirementEvidence, getRequirementImage, getRequirementLifecycle, getTaskHistory, getTaskObservability } from "./core.js";
 import { listProjects, importProject, removeProject, getProject, analyzeProjectStructure, regenerateProjectReference, generateProjectReference } from "./project-registry.js";
@@ -26,8 +28,8 @@ const staticFiles = new Map([
   ["/styles.css", ["styles.css", "text/css; charset=utf-8"]],
   ["/mermaid.js", ["../node_modules/@mermaid-js/tiny/dist/mermaid.tiny.js", "text/javascript; charset=utf-8"]],
 ]);
-const reviewStates = new Set(["assignment_pending", "intake_feedback", "intake_clarifying", "intake_ready", "plan_review", "test_deployed", "released"]);
-const doneStates = new Set(["archived", "archived_test_only", "rolled_back"]);
+const reviewStates = new Set(["assignment_pending", "intake_feedback", "intake_clarifying", "intake_ready", "plan_review", "test_deployed", "released", "rolled_back"]);
+const doneStates = new Set(["archived", "archived_test_only"]);
 const errorStates = new Set(["implementation_failed", "implementation_inspection_failed", "implementation_interrupted",
   "verification_failed", "test_deploy_failed", "test_deploy_outcome_unknown", "merge_verification_failed",
   "release_failed", "release_outcome_unknown"]);
@@ -77,7 +79,7 @@ async function overview(project, projectName, principal, offset, limit) {
   rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   const counts = { review: 0, active: 0, done: 0, error: 0 };
   for (const row of rows) {
-    const group = reviewStates.has(row.state) ? "review" : doneStates.has(row.state) ? "done"
+    const group = row.executionPaused || reviewStates.has(row.state) ? "review" : doneStates.has(row.state) ? "done"
       : errorStates.has(row.state) ? "error" : "active";
     counts[group]++;
   }
@@ -372,8 +374,17 @@ export async function startWebServer(projectPath, port = 4173, options = {}) {
           snapshotHash: baseline.snapshotHash, sourceHash: baseline.sourceHash });
         if (mode.mode !== "agent") throw new Error("Invalid project documentation mode");
         const initialized = await readInitialization(project, baseline);
-        return send(res, 200, { content: initialized.documents["PROJECT_REFERENCE.md"], agentContent: initialized.documents["AGENTS.md"],
+        return send(res, 200, { content: initialized.documents["PROJECT_REFERENCE.md"], agentContent: initialized.documents["agent.md"],
           mode: "agent", snapshotHash: baseline.snapshotHash, sourceHash: baseline.sourceHash });
+      }
+      if (pathname === "/api/project-reference/execution") {
+        authorize(session.principal, "audit-report");
+        const key = path.join(project.archive, "initialization");
+        if (req.method === "GET") return send(res, 200, { execution: executionStatus(key) });
+        if (req.method !== "POST") return send(res, 405, { error: "Use GET or POST" });
+        if (!sameOrigin(req, allowedOrigins) || req.headers["x-reqflow-token"] !== session.csrf)
+          return send(res, 403, { error: "Session token or origin is invalid" });
+        return send(res, 200, pauseExecution(key, session.principal.id, true));
       }
       if (req.method === "POST" && pathname === "/api/project-reference/regenerate") {
         if (!sameOrigin(req, allowedOrigins) || req.headers["x-reqflow-token"] !== session.csrf) {
@@ -382,9 +393,16 @@ export async function startWebServer(projectPath, port = 4173, options = {}) {
         authorize(session.principal, "audit-report");
         const entry = session.currentProjectId === "default" ? { projectDir: project.root, name: projectName }
           : await getProject(session.currentProjectId);
-        const generated = await generateProjectReference(entry, project, project.archive);
+        let generated;
+        try {
+          generated = await controlledExecution(path.join(project.archive, "initialization"), "initialize", session.principal.id,
+            async () => { const result = await generateProjectReference(entry, project, project.archive); assertExecutionActive(); return result; });
+        } catch (error) {
+          if (error.code !== "EXECUTION_PAUSED") throw error;
+          return send(res, 200, { paused: true, message: error.message });
+        }
         return send(res, 200, { content: generated.content,
-          agentContent: (await readInitialization(project, await readProjectBaseline(project))).documents["AGENTS.md"],
+          agentContent: (await readInitialization(project, await readProjectBaseline(project))).documents["agent.md"],
           snapshotHash: generated.snapshotHash });
       }
       if (req.method === "GET" && pathname === "/api/members") {
@@ -476,6 +494,12 @@ export async function startWebServer(projectPath, port = 4173, options = {}) {
         const body = await readBody(req, 6 * 1024 * 1024);
         return send(res, 201, await createRequirement(project.root, session.principal, body));
       }
+      const executionMatch = pathname.match(/^\/api\/tasks\/([A-Za-z0-9][A-Za-z0-9_-]{0,63})\/execution$/);
+      if (req.method === "GET" && executionMatch) {
+        const task = await readTask(project, executionMatch[1]);
+        if (!canReadTask(session.principal, task.meta)) return send(res, 403, { error: "Role cannot read this requirement" });
+        return send(res, 200, { execution: executionStatus(taskPath(project, executionMatch[1])), paused: Boolean(task.meta.executionPause) });
+      }
       const match = pathname.match(/^\/api\/tasks\/([A-Za-z0-9][A-Za-z0-9_-]{0,63})(\/actions)?$/);
       if (req.method === "GET" && match && !match[2]) return send(res, 200,
         await getRequirementEvidence(project.root, session.principal, match[1]));
@@ -536,5 +560,6 @@ export async function startWebServer(projectPath, port = 4173, options = {}) {
     }
   });
   await new Promise((resolve, reject) => { server.once("error", reject); server.listen(port, host, resolve); });
+  server.once("close", () => { stopAllLocalRuntimes().catch(error => process.stderr.write(`Local runtime shutdown failed: ${error.stack}\n`)); });
   return { server, url: options.origins?.[0] ?? `http://127.0.0.1:${server.address().port}` };
 }

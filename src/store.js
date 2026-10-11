@@ -7,7 +7,7 @@ import { validateConfig } from "./config.js";
 import { buildProjectBaseline, saveProjectBaseline } from "./baseline.js";
 import { initializeProjectContext } from "./project-initialization.js";
 import { persistImages, readImage, validateImages } from "./intake-images.js";
-import { reportProgress } from "./action-progress.js";
+import { reportProgress, executionSignal } from "./action-progress.js";
 
 export const actionAuditContext = new AsyncLocalStorage();
 
@@ -61,6 +61,7 @@ export async function readTask(project, id) {
 }
 
 export async function appendEvent(project, id, type, meta, detail) {
+  if (detail.error && detail.error === executionSignal()?.reason?.message) detail = { ...detail, executionOutcome: "paused" };
   const context = actionAuditContext.getStore();
   if (context) detail = { ...detail, actor: detail.actor ?? "system:workflow", initiatedBy: context.actor, action: context.action };
   return withLock(path.join(project.archive, "index.lock"), async () => {
@@ -116,7 +117,7 @@ export async function initialize(projectRoot, configFile, options = {}) {
     await fs.rename(staging, archive);
     return { root, archive, config, documentation: options.inventoryOnly === true ? { mode: "inventory" } : {
       mode: "agent", developerFile: path.join(archive, "PROJECT_REFERENCE.md"),
-      agentFile: path.join(archive, "AGENTS.md"), claudeFile: path.join(archive, "CLAUDE.md") }, baseline: { ...result,
+      agentFile: path.join(archive, "agent.md") }, baseline: { ...result,
       baselineFile: path.join(archive, "baseline.json"), reportFile: path.join(archive, "baseline.md") } };
   } catch (error) {
     const diagnostics = path.join(staging, "initialization");
@@ -164,9 +165,9 @@ async function rebuildIndex(project) {
   const ids = await fs.readdir(path.join(project.archive, "tasks"));
   const entries = [];
   for (const id of ids) {
-    const { meta } = await readTask(project, id);
+    const { meta, events } = await readTask(project, id);
     const entry = { id, title: meta.title, createdBy: meta.createdBy, assignments: meta.assignments ?? {}, state: meta.state,
-      updatedAt: meta.updatedAt ?? meta.createdAt };
+      executionPaused: events.at(-1).type === "execution_paused", updatedAt: meta.updatedAt ?? meta.createdAt };
     if (meta.state === "archived") {
       entry.archivedBy = meta.observedBy ?? null;
       entry.archivedAt = meta.observedAt ?? null;

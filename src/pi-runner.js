@@ -9,7 +9,7 @@ import { readModelCredential } from "./model-credentials.js";
 import { childEnvironment } from "./execution-env.js";
 import { allowedFile, defaultModelUsage, resolveAgentModel } from "./config.js";
 import { assertInside, safeId, sha256 } from "./files.js";
-import { reportProgress, publicPreview } from "./action-progress.js";
+import { reportProgress, publicPreview, executionSignal, assertExecutionActive } from "./action-progress.js";
 
 const guard = path.join(path.dirname(fileURLToPath(import.meta.url)), "pi-guard.js");
 
@@ -20,6 +20,7 @@ function assistantText(message) {
 }
 
 export async function runPi(project, cwd, phase, prompt, logFile, costLimit, role = null, images = [], executionLimit = null) {
+  assertExecutionActive();
   if (typeof costLimit !== "number" || costLimit <= 0) throw new Error("Pi cost limit must be positive");
   if (executionLimit !== null && (!Number.isSafeInteger(executionLimit.maxTokens) || executionLimit.maxTokens < 1
       || !Number.isSafeInteger(executionLimit.maxMs) || executionLimit.maxMs < 1)) throw new Error("Pi execution limit requires positive token and duration allowances");
@@ -38,7 +39,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       || executionLimit.outputSchema.schema?.type !== "object")) throw new Error("Structured stages require a named strict object schema");
   const implementationScope = executionLimit?.implementationScope ?? project.config.implementationScope ?? "plan";
   if (executionLimit?.sourceQuery !== undefined && (!["implement", "review"].includes(phase) || typeof executionLimit.sourceQuery !== "string"
-      || !executionLimit.sourceQuery.trim() || executionLimit.sourceQuery.length > 4000)) throw new Error("Implementation source query requires a bounded responsible diagnosis");
+      || !executionLimit.sourceQuery.trim() || executionLimit.sourceQuery.length > 12000)) throw new Error("Implementation source query requires a bounded responsible diagnosis");
   if (executionLimit?.contextFiles !== undefined && (!["plan", "review", "intake"].includes(phase)
       || !Array.isArray(executionLimit.contextFiles) || !executionLimit.contextFiles.length
       || new Set(executionLimit.contextFiles).size !== executionLimit.contextFiles.length
@@ -56,7 +57,6 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
     modelUsage: { ...project.config.modelUsage, ...selected.modelUsage },
     modelParameters: { ...project.config.modelParameters, ...selected.modelParameters } } };
   const validateOutput = executionLimit?.outputSchema ? new Ajv({ allErrors: true }).compile(executionLimit.outputSchema.schema) : null;
-  const runTimeoutMs = executionLimit === null ? project.config.maxPiMs : Math.min(project.config.maxPiMs, executionLimit.maxMs);
   const modelUsage = { ...defaultModelUsage, ...project.config.modelUsage };
   const readOnly = ["intake", "plan", "review"].includes(phase);
   if (executionLimit?.discussionTask !== undefined) {
@@ -79,8 +79,9 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
   if (executionLimit?.maxRequests !== undefined) requestLimit = Math.min(requestLimit, executionLimit.maxRequests);
   const tokenLimit = Math.min(executionLimit?.maxTokens ?? modelUsage.maxTokens,
     phase === "initialize" ? modelUsage.initializationMaxTokens : modelUsage.maxTokens);
-  const adaptiveBudget = executionLimit?.budget?.mode === "adaptive";
-  const internalCheckLimit = (executionLimit?.budget?.maxRepairAttempts ?? 1) + 1;
+  const adaptiveBudget = phase === "implement" || executionLimit?.budget?.mode === "adaptive";
+  const runTimeoutMs = executionLimit === null ? project.config.maxPiMs : phase === "implement" ? executionLimit.maxMs
+    : Math.min(executionLimit.maxMs, project.config.maxPiMs * (adaptiveBudget ? requestLimit : 1));
   const tokenBudgetKind = executionLimit !== null && executionLimit.maxTokens <= (phase === "initialize"
     ? modelUsage.initializationMaxTokens : modelUsage.maxTokens) ? "remaining requirement" : "phase";
   const toolLimit = phase === "initialize"
@@ -146,7 +147,11 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
           const symbol = line.match(/^\s*(?:export\s+)?(?:async\s+)?(?:def|function|class)\s+([\w$]+)/)?.[1];
           return symbol && new RegExp(`\\b${symbol.replace(/[$]/g, "\\$")}\\b`).test(executionLimit.sourceQuery) ? [index] : [];
         });
-        const referencePattern = new RegExp(`(?<![\\w/.$-])${relative.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}:(\\d+)(?:-(\\d+))?`, "g");
+        const citationNames = [relative];
+        if (executionLimit.approvedFiles.filter(file => path.posix.basename(file) === path.posix.basename(relative)).length === 1) {
+          citationNames.push(path.posix.basename(relative));
+        }
+        const referencePattern = new RegExp(`(?<![\\w/.$-])(?:${citationNames.map(name => name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")}):(\\d+)(?:-(\\d+))?`, "g");
         const citedAnchors = [];
         const citedRanges = new Map();
         for (const match of executionLimit.sourceQuery.matchAll(referencePattern)) {
@@ -160,7 +165,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
           citedAnchors.push(line - 1);
         }
         const selectedAnchors = [...new Set([...citedAnchors, ...anchors])];
-        if (executionLimit.researchRequests !== 0) selectedAnchors.unshift(0);
+        if (executionLimit.researchRequests !== 0 && selectedAnchors.length === 0) selectedAnchors.push(0);
         const relatedAnchors = [];
         if (executionLimit.researchRequests !== 0 && /(?:^|\/)(?:tests?|__tests__)(?:\/|\.)/.test(relative)) {
           const queriedNames = [...executionLimit.sourceQuery.matchAll(/\b[A-Za-z$][\w$]*_[\w$]+\b/g)]
@@ -223,7 +228,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       }
     }
     artifacts.sort((a, b) => Number(b.relevant) - Number(a.relevant));
-    for (const { file: artifact, directory } of artifacts) {
+    for (const { file: artifact, directory, relevant } of artifacts) {
       const bytes = await fs.readFile(path.join(directory, artifact));
       if (`source-${sha256(bytes)}.json` !== artifact) throw new Error(`Source evidence integrity failed: ${artifact}`);
       const entry = JSON.parse(bytes);
@@ -247,8 +252,11 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       const text = contents.split("\n").slice(entry.startLine - 1, entry.endLine).map((line, i) => `${entry.startLine + i}: ${line}`).join("\n");
       if (text !== entry.text) throw new Error(`Source evidence range mismatch: ${artifact}`);
       if (sourceEvidence.completeFiles.some(row => row.file === relative)) { sourceEvidence.omitted.push(artifact); continue; }
-      if ((readOnly && !contextFiles && sharedSourceDirectory)
-          || (phase === "implement" && executionLimit?.approvedFiles && executionLimit.researchRequests !== 0)) {
+      if ((readOnly && !contextFiles && directory === sharedSourceDirectory)
+           || (phase === "implement" && executionLimit?.approvedFiles && executionLimit.researchRequests !== 0
+             && !relevant)) {
+        if ([...excerpts.values()].some(row => row.file === relative && row.startLine <= entry.startLine
+            && row.endLine >= entry.endLine)) { sourceEvidence.omitted.push(artifact); continue; }
         const reference = `${relative}:${entry.startLine}-${entry.endLine}`;
         if (!index.has(reference) && Buffer.byteLength([...index.keys(), reference].join("\n")) <= 2000) {
           index.set(reference, artifact); sourceEvidence.indexed.push(artifact);
@@ -294,7 +302,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
     throw new Error("Research-free resume requires verified source context for every approved existing file");
   }
   if (phase === "implement" && executionLimit?.approvedFiles && project.config.checks) {
-    prompt += "\nUse run_checks after applying the required edits to diagnose real failures. A regression assertion for the requested bug is expected to fail before the fix; do not redesign its test infrastructure first. Fix source causes and rerun. Check commands may use developer-owned executables or assertion files outside this workspace: execute them only through run_checks, never read or edit external paths. Source tools are restricted to this requirement workspace. A passed check is evidence for that command only; final verification and change review remain required.";
+    prompt += "\nThe approved checks are available through run_checks. Use existing verification infrastructure for changed behavior. External developer-owned check scripts may be executed only through run_checks, not read or edited. The controller independently verifies the final source and reviews its changes.";
   }
   if (!Array.isArray(images) || images.length > 12 || (images.length && phase !== "intake")) throw new Error("Image input is limited to the intake phase");
   const imageInputs = [];
@@ -305,27 +313,61 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
     if (!stat.isFile() || stat.size > 1024 * 1024 || !/\.(png|jpg)$/.test(resolved)) throw new Error("Invalid intake image input");
     imageInputs.push({ file: path.relative(cwd, resolved), hash: sha256(await fs.readFile(resolved)), bytes: stat.size });
   }
-  let tools = phase === "initialize" ? "" : phase === "implement" && executionLimit?.approvedFiles
-    ? `${researchRequests === 0 ? "" : "read,grep,find,ls,"}edit${implementationScope === "project" || sourceEvidence.pendingCreation.length ? ",write" : ""}${project.config.checks ? ",run_checks" : ""}` : ["intake", "plan", "review"].includes(phase) ? "read,grep,find,ls"
+  let tools = phase === "initialize" ? "" : phase === "implement"
+    ? `read,bash,edit,write,grep,find,ls${project.config.checks ? ",run_checks" : ""}` : ["intake", "plan", "review"].includes(phase) ? "read,grep,find,ls"
     : project.config.mode === "git" ? "read,ls,edit,write" : "read,grep,find,ls,edit,write";
   if (readOnly && project.archive) tools += ",search_history,read_history";
   if (executionLimit?.discussionTask) tools += ",read_discussion,read_plan";
-  const sessionFile = phase === "implement" && executionLimit?.approvedFiles ? `${logFile}.session.jsonl` : null;
+  const developerSession = phase === "plan" && executionLimit?.developerSession === true;
+  const sessionFile = developerSession || phase === "implement" && executionLimit?.approvedFiles ? `${logFile}.session.jsonl` : null;
   let sessionCheckpoint = null;
+  let supersededPromptHashes = [];
+  let priorRequestLayout;
   if (executionLimit?.resumeSession) {
-    if (!sessionFile) throw new Error("Session continuation requires an implementation run");
+    if (!sessionFile) throw new Error("Session continuation requires a developer run");
     const previous = executionLimit.resumeSession;
     assertInside(await fs.realpath(path.dirname(logFile)), await fs.realpath(previous.file));
     const content = await fs.readFile(previous.file);
-    if (sha256(content) !== previous.hash) throw new Error("Implementation session changed before continuation");
-    await fs.writeFile(sessionFile, content, { flag: "wx", mode: 0o600 });
-    prompt += "\nContinue the saved implementation session. Inspect the current workspace before repeating interrupted edits. Keep completed work; use the latest confirmed contract and approval above. Do not restart repository exploration or repeat completed checks without a relevant change.";
+    if (sha256(content) !== previous.hash) throw new Error("Developer session changed before continuation");
+    const headerEnd = content.indexOf(10);
+    if (headerEnd < 0) throw new Error("Developer session has no native session header");
+    const header = JSON.parse(content.subarray(0, headerEnd).toString("utf8"));
+    if (header.type !== "session" || typeof header.cwd !== "string" || !header.cwd
+        || typeof header.id !== "string" || !header.id) throw new Error("Developer session has an invalid native header");
+    // Private developer sessions receive user messages only from this controller.
+    // The current prompt replaces stage instructions, not assistant/tool evidence.
+    const sessionEntries = content.subarray(headerEnd + 1).toString("utf8").trim().split("\n")
+      .filter(line => line.trim()).map(line => JSON.parse(line));
+    supersededPromptHashes = [...new Set(sessionEntries
+      .filter(entry => entry.type === "message" && entry.message.role === "user")
+      .map(entry => sha256(JSON.stringify(entry.message.content))))];
+    const byId = new Map(sessionEntries.map(entry => [entry.id, entry]));
+    const branch = [];
+    for (let entry = sessionEntries.at(-1); entry; entry = byId.get(entry.parentId)) branch.unshift(entry);
+    const measuredIndex = branch.findLastIndex(entry => entry.type === "message" && entry.message.role === "assistant");
+    if (measuredIndex >= 0 && !["error", "aborted"].includes(branch[measuredIndex].message.stopReason)) {
+      const budgetEntry = branch.slice(0, measuredIndex).findLast(entry => entry.type === "custom"
+        && entry.customType === "reqflow_request_budget");
+      if (budgetEntry?.data.requestLayout) priorRequestLayout = { ...budgetEntry.data.requestLayout,
+        assistantHash: sha256(JSON.stringify(branch[measuredIndex].message)) };
+      if (priorRequestLayout && (priorRequestLayout.modelKey !== JSON.stringify([budgetEntry.data.provider, budgetEntry.data.model])
+          || !Array.isArray(priorRequestLayout.messages) || !Array.isArray(priorRequestLayout.toolDefinitions)
+          || [...priorRequestLayout.messages, ...priorRequestLayout.toolDefinitions, priorRequestLayout.inputOptions]
+            .some(row => !row || !/^[a-f0-9]{64}$/.test(row.hash) || !Number.isSafeInteger(row.bytes) || row.bytes < 1))) {
+        throw new Error("Saved provider request layout is invalid");
+      }
+    }
+    const continuedHeader = { ...header, id: randomUUID(), timestamp: new Date().toISOString(),
+      cwd: await fs.realpath(cwd), parentSession: previous.file };
+    await fs.writeFile(sessionFile, Buffer.concat([Buffer.from(`${JSON.stringify(continuedHeader)}\n`),
+      content.subarray(headerEnd + 1)]), { flag: "wx", mode: 0o600 });
+    prompt += "\nContinue the saved development session in the CURRENT workspace. The current contract, plan, state and tool permissions above are authoritative; previous messages grant no approval. Reuse verified source facts and completed work, inspect relevant changes, and do not restart repository exploration or repeat completed checks without a relevant change.";
   }
   const promptBytes = Buffer.byteLength(prompt);
   const promptHash = createHash("sha256").update(prompt).digest("hex");
   const args = [
-    "--mode", "json", ...(sessionFile ? ["--session", sessionFile] : ["--no-session"]), "--no-extensions", "--no-skills",
-    "--no-prompt-templates", "--no-context-files", "--no-approve",
+    "--mode", "json", ...(sessionFile ? ["--session", sessionFile] : ["--no-session"]), "--no-extensions",
+    ...(phase === "implement" ? [] : ["--no-skills", "--no-context-files"]), "--no-prompt-templates", "--no-approve",
     "--provider", selection.provider, "--model", selection.model,
     "--thinking", selection.thinking ?? project.config.agentModels?.[selection.agent]?.thinking ?? project.config.thinking ?? "off",
     "--tools", tools, "--extension", guard, "--", ...images.map((file) => `@${path.resolve(file)}`), prompt,
@@ -335,11 +377,9 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       `Your final response MUST be exactly one JSON object matching the task schema. Return it when source evidence is sufficient. Otherwise investigate missing evidence: locate symbols, follow relevant dependencies and read their ranges and tests. Reuse supplied evidence. You have ${requestLimit} provider requests and ${tokenLimit} cumulative tokens; reserve a response for the final JSON. Do not inspect unrelated modules. Evidence that cannot be established must remain unknown. Final response: JSON only, no analysis, prose or fences.`);
   }
   args.splice(args.indexOf("--"), 0, "--append-system-prompt",
-    "Use project-relative paths for every tool, resolved from the actual isolated workspace cwd. Never infer a source root from external check/deployment script paths or project documentation. Missing reads, permission and unknown errors stop the run. Known edit matching/line-count/no-op, oversized read-result or grep nonexistent-path errors allow at most two corrections of the actual arguments; byte limits and permissions remain unchanged. Correct search paths from verified module filenames or search an existing parent; Python module imports commonly refer to .py files, not directories. Use grep with context=0 to locate symbols, then read targeted ranges. Never invent file paths or contents after a failed read.");
-  if (phase === "implement") {
-    args.splice(args.indexOf("--"), 0, "--system-prompt",
-      `Implement the confirmed requirement within ${implementationScope === "project" ? "project allowed paths; planned files are starting points, necessary related source and tests may be added" : "approved files only"}. Research ${researchRequests === 0 ? "closed by explicit repair instruction; use supplied evidence or report what is missing" : "available throughout implementation; investigate dependencies, callers, schemas and fixtures whenever needed"}. Never invent source facts. Reuse existing test fixtures and mocking styles; verify actual return envelopes and context manager protocols. edit={path,edits:[{oldText,newText}]}; unique, disjoint oldText; each block <=50 old/new lines. For a long new method, insert one bounded logical block, wait for success, then extend its exact new text in the next response. Edits in one batch match the same original file; dependent edits require separate calls. Do not repeat a completed insertion. Preserve existing assertions. Budget ${tokenLimit} tokens/${requestLimit} requests. For the FINAL edit batch include text line REQFLOW_EDITS_COMPLETE only if no edits remain. External checks required; never claim tests passed.`);
-  }
+    phase === "implement"
+      ? "Work in the current isolated workspace using project-relative paths. The confirmed requirement and approved plan define the task. Use current source as truth; historical decisions do not prove current code. Use edit/write for source changes and bash for investigation and verification. Keep edits focused and each replacement at most 50 lines. Do not commit, push, deploy, modify external files or delete business data. Report actual changes, checks and unresolved issues accurately; the controller performs final verification and rollback."
+      : "Use project-relative paths in the current isolated workspace. Investigate only relevant source evidence. This stage is read-only; source facts require successful reads and historical opinions do not grant approval.");
   const modelCredentials = {};
   for (const provider of project.config.compatibleProviders ?? []) if (provider.credentialId) {
     modelCredentials[provider.apiKeyEnv] = await readModelCredential(project.accountsArchive ?? project.archive, provider.credentialId);
@@ -360,12 +400,10 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       restrictedPaths: project.config.admission?.restrictedPaths ?? [],
       ...(executionLimit?.approvedFiles !== undefined ? { approvedFiles: executionLimit.approvedFiles } : {}),
       implementationResearchRequests: researchRequests,
-      ...(phase === "implement" ? { implementationTools: tools.split(",") } : {}),
       ...(phase === "implement" && executionLimit?.approvedFiles && project.config.checks ? {
         implementationChecks: { commands: project.config.checks, environment: project.config.environment.checks,
           sandbox: project.config.checkSandbox, timeoutMs: runTimeoutMs, maxBytes: project.config.maxEventBytes,
           maxSnapshotBytes: project.config.maxSnapshotBytes, logPrefix: `${logFile}.internal` },
-        maxRepairAttempts: internalCheckLimit - 1,
       } : {}),
       providerRequestLimit: Math.min(executionLimit?.maxRequests ?? (phase === "implement" ? requestLimit : modelUsage.maxRequests),
         phase === "implement" ? requestLimit : modelUsage.maxRequests),
@@ -382,17 +420,23 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       structuredOutput: project.config.structuredOutput === true && ["initialize", "intake", "plan", "review"].includes(phase),
       ...(executionLimit?.outputSchema ? { outputSchema: executionLimit.outputSchema } : {}),
       ...(executionLimit?.authoritativeContext ? { authoritativeContext: executionLimit.authoritativeContext } : {}),
+      resumedSession: executionLimit?.resumeSession !== undefined,
+      currentPromptContentHash: sha256(JSON.stringify([{ type: "text", text: prompt }])),
+      ...(executionLimit?.resumeSession ? { supersededPromptHashes } : {}),
+      ...(priorRequestLayout ? { priorRequestLayout } : {}),
       ...(phase === "plan" && executionLimit?.planContract ? { planContract: executionLimit.planContract } : {}),
       ...(phase === "plan" && executionLimit?.planCorrection ? { planCorrection: executionLimit.planCorrection } : {}),
       ...(phase === "intake" && executionLimit?.intakeValidation ? { intakeValidation: executionLimit.intakeValidation } : {}),
     }),
   };
-  if (activeProvider && executionLimit?.resumeSession) {
-    // Keep native compaction's retained tail within the task context budget.
+  if (activeProvider) {
+    // Adaptive byte targets are advisory; compact at the model's actual capacity.
     // Compatible-provider credentials are registered explicitly by the guard.
     const runtimeHome = `${logFile}.pi-home`;
     const model = activeProvider.models.find(model => model.id === selection.model);
-    const retainedInput = Math.min(Math.floor(modelUsage.maxContextBytes / 4), model.contextWindow - model.maxTokens);
+    const outputTokens = Math.min(project.config.modelParameters.maxOutputTokens ?? model.maxTokens, model.maxTokens);
+    const retainedInput = adaptiveBudget ? model.contextWindow - outputTokens
+      : Math.min(Math.floor(modelUsage.maxContextBytes / 4), model.contextWindow - outputTokens);
     if (!Number.isSafeInteger(retainedInput) || retainedInput < 1) throw new Error("Model context must leave room for task input and output");
     await fs.mkdir(runtimeHome, { mode: 0o700 });
     await fs.writeFile(path.join(runtimeHome, "settings.json"), JSON.stringify({
@@ -401,6 +445,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
     }), { mode: 0o600, flag: "wx" });
     env.PI_CODING_AGENT_DIR = runtimeHome;
   }
+  assertExecutionActive();
   const log = await fs.open(logFile, "wx", 0o600);
   const child = spawn(process.execPath, [project.config.piExecutable, ...args], { cwd, env,
     stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
@@ -423,9 +468,14 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       catch (error) { terminationError = error; child.kill("SIGKILL"); }
     }, 1500);
   };
+  const signal = executionSignal();
+  signal?.addEventListener("abort", terminate, { once: true });
+  if (signal?.aborted) terminate();
   let stderr = "";
   child.stderr.on("data", (part) => { stderr = (stderr + part.toString()).slice(-16000); });
   let timer;
+  let requestTimer;
+  let timeoutScope = "stage";
   const completion = new Promise((resolve, reject) => {
     child.once("error", reject);
     child.once("exit", () => {
@@ -459,34 +509,62 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
   const requestEstimates = [];
   const requestTimings = [];
   const toolTimings = [];
-  const internalChecks = [];
   const developmentChecks = [];
   const budgetExpansions = [];
   const requestBudgetExpansions = [];
   const planValidation = [];
   const intakeValidation = [];
   const contextExpansions = [];
+  const contextReplacements = [];
   const compactions = [];
   let pendingCompactions = 0;
+  const auditStorage = { formatVersion: 1, receivedBytes: 0, omittedEvents: 0,
+    omittedThinkingBlocks: 0, omittedThinkingBytes: 0 };
   const telemetry = () => ({ traceId, phase, ...selection,
     startedAt, durationMs: Date.now() - startedMs, promptBytes, promptHash,
-    responseBytes: Buffer.byteLength(lastText), eventBytes, assistantMessages, requestLimit, tokenLimit, tokenBudgetKind, tokens: { ...tokens },
+    executionMode: phase === "implement" ? "native" : "structured",
+    responseBytes: Buffer.byteLength(lastText), eventBytes, assistantMessages,
+    requestLimit: phase === "implement" ? null : requestLimit, tokenLimit: phase === "implement" ? null : tokenLimit,
+    tokenBudgetKind: phase === "implement" ? "observed" : tokenBudgetKind, tokens: { ...tokens },
     costUsd: completedCost + currentCost, toolCalls, logFile, sessionCheckpoint,
+    sessionSource: executionLimit?.resumeSession ?? null,
+    auditStorage: { ...auditStorage, storedBytes: eventBytes },
     sessionStatus: !sessionFile ? "disabled" : sessionCheckpoint ? "saved" : "unavailable",
-    imageInputs, sourceEvidence, modelSwitches, modelAttempts, requestEstimates,
+    imageInputs, sourceEvidence, modelSwitches, modelAttempts, requestEstimates, contextReplacements,
     requestTimings: requestTimings.map(row => ({ ...row, durationMs: row.durationMs ?? Date.now() - Date.parse(row.startedAt) })),
     toolTimings: toolTimings.map(row => ({ ...row, durationMs: row.durationMs ?? Date.now() - Date.parse(row.startedAt) })),
-    internalChecks, developmentChecks, budgetExpansions, requestBudgetExpansions,
+    developmentChecks, budgetExpansions, requestBudgetExpansions,
     budget: executionLimit?.budget ?? { mode: "strict" }, planValidation, intakeValidation, contextExpansions,
-    compactions, unmeasuredRequests: pendingCompactions,
-    pricingKnown: pendingCompactions === 0 && !(project.config.compatibleProviders ?? []).length,
+    compactions, unmeasuredRequests: pendingCompactions + requestTimings.filter(row => !row.usageMeasured).length,
+    timeouts: { requestMs: project.config.maxPiMs, stageMs: runTimeoutMs, mode: adaptiveBudget ? "per_request" : "stage" },
+    pricingKnown: pendingCompactions === 0 && requestTimings.every(row => row.usageMeasured)
+      && !(project.config.compatibleProviders ?? []).length,
     imageArtifacts: [...imageArtifacts.values()].filter((entry) => entry.persisted).map(({ buffer, persisted, ...entry }) => entry) });
-  timer = setTimeout(() => { timedOut = true; terminate(); }, runTimeoutMs);
+  timer = setTimeout(() => { clearTimeout(requestTimer); timedOut = true; terminate(); }, runTimeoutMs);
+  if (adaptiveBudget) requestTimer = setTimeout(() => { clearTimeout(timer); timedOut = true; timeoutScope = "request"; terminate(); }, project.config.maxPiMs);
   try {
     for await (const line of readline.createInterface({ input: child.stdout })) {
       const event = JSON.parse(line);
+      auditStorage.receivedBytes += Buffer.byteLength(line) + 1;
+      const persistEvent = !["message_update", "message_start", "turn_start", "turn_end", "agent_end", "tool_execution_update"].includes(event.type)
+        && !(event.type === "message_end" && event.message?.role === "toolResult");
+      if (!persistEvent) auditStorage.omittedEvents++;
       const pendingImages = [];
-      const auditedLine = imageInputs.length ? JSON.stringify(event, (_key, value) => {
+      const auditedLine = persistEvent ? JSON.stringify(event, (key, value) => {
+        if (key === "requestLayout") return { hash: sha256(JSON.stringify(value)), messageCount: value.messages.length };
+        if (value?.type === "thinking") {
+          const raw = JSON.stringify(value);
+          const bytes = Buffer.byteLength(raw);
+          auditStorage.omittedThinkingBlocks++;
+          auditStorage.omittedThinkingBytes += bytes;
+          return { type: "thinking_reference", omitted: true, bytes, hash: sha256(raw) };
+        }
+        if (["thinking", "reasoning_content", "thinkingSignature"].includes(key) && typeof value === "string") {
+          const bytes = Buffer.byteLength(value);
+          auditStorage.omittedThinkingBlocks++;
+          auditStorage.omittedThinkingBytes += bytes;
+          return { omitted: true, bytes, hash: sha256(value) };
+        }
         if (value?.type !== "image" || typeof value.data !== "string") return value;
         const buffer = Buffer.from(value.data, "base64");
         const hash = sha256(buffer);
@@ -501,16 +579,16 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
         }
         const { buffer: _buffer, persisted: _persisted, ...artifact } = imageArtifacts.get(hash);
         return { type: "image_reference", ...artifact, mimeType: value.mimeType };
-      }) : line;
+      }) : null;
       for (const entry of pendingImages) {
         const file = path.join(path.dirname(logFile), entry.file);
         await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
         await fs.writeFile(file, entry.buffer, { flag: "wx", mode: 0o600 });
         entry.persisted = true;
       }
-      // Streaming updates repeat the completed message with hundreds of envelopes.
-      // Process them live; persist authoritative message_end and tool events for audit.
-      if (event.type !== "message_update") {
+      // Process the original stream for usage, validation and continuation. Audit
+      // only completed messages, tool results and control events without thoughts.
+      if (persistEvent) {
         eventBytes += Buffer.byteLength(auditedLine) + 1;
         if (eventBytes > project.config.maxEventBytes) {
           terminate();
@@ -537,27 +615,31 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       }
       if (event.type === "entry_appended" && event.entry?.customType === "reqflow_request_budget") {
         const estimate = event.entry.data;
-        if (!["wire_bytes", "measured_prefix"].includes(estimate?.estimationMethod)
+        if (!["wire_bytes", "measured_prefix", "measured_retained"].includes(estimate?.estimationMethod)
             || ["request", "inputReserve", "contextBytes", "remainingTokens", "tokensUsed"].some(key => !Number.isSafeInteger(estimate[key]) || estimate[key] < 0)
             || estimate.request < 1 || estimate.request !== requestEstimates.length + 1) throw new Error("Invalid Pi request budget evidence");
-        requestEstimates.push(estimate);
+        const { requestLayout, ...measuredEstimate } = estimate;
+        requestEstimates.push({ ...measuredEstimate, ...(requestLayout ? {
+          requestLayoutHash: sha256(JSON.stringify(requestLayout)), messageCount: requestLayout.messages.length } : {}) });
         requestTimings.push({ request: estimate.request, provider: estimate.provider, model: estimate.model,
           startedAt: new Date().toISOString(), startedAfterMs: Date.now() - startedMs,
-          firstResponseMs: null, firstTextMs: null, durationMs: null, status: "running", contextBytes: estimate.contextBytes });
+          firstResponseMs: null, firstTextMs: null, durationMs: null, status: "running", usageMeasured: false, contextBytes: estimate.contextBytes });
+        if (adaptiveBudget) {
+          clearTimeout(requestTimer);
+          requestTimer = setTimeout(() => { clearTimeout(timer); timedOut = true; timeoutScope = "request"; terminate(); }, project.config.maxPiMs);
+        }
         reportProgress(`正在进行第 ${estimate.request} 次模型请求，等待分析与输出。`, "", "request");
       }
-      if (event.type === "entry_appended" && event.entry?.customType === "reqflow_internal_verification") {
-        const check = event.entry.data;
-        if (phase !== "implement" || !["passed", "failed", "error"].includes(check?.status)
-            || check.attempt !== internalChecks.length + 1 || check.attempt > internalCheckLimit || !Array.isArray(check.checks)
-            || check.formalVerificationRequired !== true) throw new Error("Invalid internal verification evidence");
-        if (check.reusedDevelopmentCheck !== undefined) {
-          const original = developmentChecks.find(row => row.attempt === check.reusedDevelopmentCheck);
-          if (!original || original.status !== "passed" || check.status !== "passed"
-              || original.beforeHash !== check.beforeHash || original.afterHash !== check.afterHash
-              || JSON.stringify(original.checks) !== JSON.stringify(check.checks)) throw new Error("Reused development check differs from its recorded evidence");
-        }
-        internalChecks.push(check);
+      if (event.type === "entry_appended" && event.entry?.customType === "reqflow_provider_request") {
+        const observed = event.entry.data;
+        if (phase !== "implement" || observed?.executionMode !== "native"
+            || observed.request !== requestTimings.length + 1 || !Number.isSafeInteger(observed.contextBytes)
+            || observed.contextBytes < 0) throw new Error("Invalid native Pi request audit");
+        requestTimings.push({ ...observed, startedAt: new Date().toISOString(), startedAfterMs: Date.now() - startedMs,
+          firstResponseMs: null, firstTextMs: null, durationMs: null, status: "running", usageMeasured: false });
+        clearTimeout(requestTimer);
+        requestTimer = setTimeout(() => { clearTimeout(timer); timedOut = true; timeoutScope = "request"; terminate(); }, project.config.maxPiMs);
+        reportProgress(`Pi 正在进行第 ${observed.request} 次模型请求。`, "", "request");
       }
       if (event.type === "entry_appended" && event.entry?.customType === "reqflow_development_check") {
         const check = event.entry.data;
@@ -593,11 +675,19 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
             || validation.attempt !== intakeValidation.length + 1 || validation.attempt > 3) throw new Error("Invalid intake validation evidence");
         intakeValidation.push(validation);
       }
+      if (event.type === "entry_appended" && event.entry?.customType === "reqflow_context_replaced") {
+        const replacement = event.entry.data;
+        if (replacement?.currentPromptContentHash !== sha256(JSON.stringify([{ type: "text", text: prompt }]))
+            || !Array.isArray(replacement.replaced) || !replacement.replaced.length
+            || replacement.replaced.some(row => !supersededPromptHashes.includes(row.hash)
+              || !Number.isSafeInteger(row.bytes) || row.bytes < 1)) throw new Error("Invalid superseded controller prompt evidence");
+        contextReplacements.push(replacement);
+      }
       if (event.type === "entry_appended" && event.entry?.customType === "reqflow_context_expanded") {
         const expansion = event.entry.data;
         if (!adaptiveBudget || !["previous", "next", "inputReserve", "requestedOutput", "contextWindow"]
           .every(key => Number.isSafeInteger(expansion?.[key]) && expansion[key] > 0)
-          || expansion.next <= expansion.previous || !["measured_prefix", "wire_bytes"].includes(expansion.estimationMethod)
+          || expansion.next <= expansion.previous || !["measured_prefix", "measured_retained", "wire_bytes"].includes(expansion.estimationMethod)
           || expansion.inputReserve + expansion.requestedOutput > expansion.contextWindow) throw new Error("Invalid adaptive context evidence");
         contextExpansions.push(expansion);
       }
@@ -652,7 +742,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
             : ["edit", "write"].includes(event.toolName) ? "正在修改方案涉及的代码。" : "正在检查项目中的相关实现。", "", "tools");
         if (event.toolName === "read") sourceReads.set(event.toolCallId, event.args);
         toolCalls++;
-        if (toolCalls > toolLimit) {
+        if (phase !== "implement" && toolCalls > toolLimit) {
           terminate();
           throw Object.assign(new Error("Pi exceeded configured tool-call limit"), { code: "PI_TOOL_LIMIT" });
         }
@@ -694,6 +784,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
         }
       }
       if (event.type === "message_end" && event.message?.role === "assistant") {
+        clearTimeout(requestTimer);
         if (currentRequest?.status === "running") {
           currentRequest.durationMs = Date.now() - Date.parse(currentRequest.startedAt);
           currentRequest.status = timedOut ? "timed_out" : ["error", "aborted"].includes(event.message.stopReason) ? "failed" : "completed";
@@ -715,6 +806,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
           if (!Number.isSafeInteger(usage[key]) || usage[key] < 0) throw new Error(`Pi reported invalid ${key} tokens`);
           tokens[key] = (tokens[key] ?? 0) + usage[key];
         }
+        if (currentRequest) currentRequest.usageMeasured = true;
         if (!adaptiveBudget && Object.values(tokens).reduce((sum, value) => sum + value, 0) > tokenLimit) {
           throw new Error(`Pi exceeded ${tokenBudgetKind} token budget: limit=${tokenLimit}, reported=${Object.values(tokens).reduce((sum, value) => sum + value, 0)}`);
         }
@@ -726,9 +818,11 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       if (event.type === "agent_settled") settled = true;
     }
     const exit = await completion;
+    if (terminationError) throw terminationError;
+    assertExecutionActive();
     if (sessionFile) {
       const content = await fs.readFile(sessionFile).catch(error => {
-        if (error.code === "ENOENT") return null;
+        if (error.code === "ENOENT" && !developerSession) return null;
         throw error;
       });
       if (content) {
@@ -755,27 +849,23 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       }
     }
     if (terminationError) throw terminationError;
+    assertExecutionActive();
     if (timedOut) {
       const current = requestTimings.at(-1);
       const validation = planValidation.at(-1);
-      throw new Error(`AI ${phase === "plan" ? "研发方案" : phase === "review" ? "方案核对" : phase === "intake" ? "需求分析" : "任务"}超过 ${Math.round(runTimeoutMs / 1000)} 秒执行时限；模型 ${selection.model}，${requestTimings.length} 次模型请求、${toolCalls} 次工具调用。`
+      const limitMs = timeoutScope === "request" ? project.config.maxPiMs : runTimeoutMs;
+      throw new Error(`AI ${phase === "plan" ? "研发方案" : phase === "review" ? "方案核对" : phase === "intake" ? "需求分析" : "任务"}${timeoutScope === "request" ? "单次模型请求" : ""}超过 ${Math.round(limitMs / 1000)} 秒执行时限；模型 ${selection.model}，${requestTimings.length} 次模型请求、${toolCalls} 次工具调用。`
         + (current?.status === "running" ? `当前第 ${current.request} 次请求已用 ${Math.round((Date.now() - Date.parse(current.startedAt)) / 1000)} 秒。` : "")
         + (validation?.status === "invalid" ? `最近未通过的检查：${validation.error}` : "")
         + (["plan", "review"].includes(phase) ? "本轮未成功，不会批准或覆盖旧方案；" : "本轮未成功；")
         + "请查看流程记录中的分轮耗时。");
     }
     if (exit.code !== 0 || !settled || stopReason === "error" || stopReason === "aborted") {
-      throw new Error(`Pi did not complete: code=${exit.code}, signal=${exit.signal}, stop=${stopReason}, model=${modelError}, stderr=${stderr}`);
+      throw new Error(`Pi did not complete: code=${exit.code}, signal=${exit.signal}, stop=${stopReason}, model=${selection.provider}/${selection.model}, error=${modelError}, stderr=${stderr}`);
     }
     if (stopReason === "length" && ["initialize", "intake", "plan", "review"].includes(phase)) {
       const attempt = modelAttempts.at(-1);
       throw new Error(`Pi ${phase} output truncated by the model output limit: ${attempt.provider}/${attempt.model}; output=${attempt.usage.output}, reasoning=${attempt.usage.reasoning ?? "unreported"}. A complete structured result is required; review this model's reasoning and output configuration`);
-    }
-    if (internalChecks.length && internalChecks.at(-1).status !== "passed") {
-      throw new Error(`Pi internal checks failed: ${internalChecks.at(-1).error ?? "checks still fail after one local repair"}`);
-    }
-    if (!internalChecks.length && developmentChecks.length && developmentChecks.at(-1).status !== "passed") {
-      throw new Error("Pi stopped with failed development checks; implementation is incomplete");
     }
     if (planValidation.length && planValidation.at(-1).status !== "valid") {
       throw new Error(`Pi plan validation failed: ${planValidation.at(-1).error}`);
@@ -801,6 +891,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       }
     }
     if (timedOut) error.code = "PI_TIMEOUT";
+    if (timedOut) error.timeoutScope = timeoutScope;
     for (const timing of [...requestTimings, ...toolTimings]) if (timing.status === "running") {
       timing.durationMs = Date.now() - Date.parse(timing.startedAt);
       timing.status = timedOut ? "timed_out" : "interrupted";
@@ -825,7 +916,9 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
     }
     throw error;
   } finally {
+    signal?.removeEventListener("abort", terminate);
     clearTimeout(timer);
+    clearTimeout(requestTimer);
     clearTimeout(escalation);
     await log.close();
   }

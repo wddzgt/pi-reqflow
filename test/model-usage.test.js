@@ -3,8 +3,83 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+
+for (const phase of ["initialize", "intake", "plan", "review", "implement"]) test(`${phase} context deduplicates exact facts while preserving distinct reads and errors`, async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-context-phases-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const contract = { objective: "EXACT_BUSINESS_DECISION", acceptance: [{ id: "AC1", text: "Keep every approved decision. ".repeat(20) }] };
+  const executable = path.join(directory, "pi.mjs");
+  await fs.writeFile(executable, `import assert from 'node:assert/strict';
+const contexts=[];
+(await import(${JSON.stringify(new URL('../src/pi-guard.js', import.meta.url).href)})).default({on:(name,fn)=>{if(name==='context')contexts.push(fn);},appendEntry:(customType,data)=>console.log(JSON.stringify({type:'entry_appended',entry:{customType,data}}))});
+const evidence='EXACT_SOURCE_EVIDENCE '.repeat(100);
+const input=[{role:'user',content:[{type:'text',text:process.argv.at(-1)}]},
+{role:'assistant',provider:'fake',model:'fake',usage:{input:100,output:10,cacheRead:0,cacheWrite:0},content:[
+...['one','two','different'].map(id=>({type:'toolCall',id,name:'read',arguments:{path:'source.py',limit:id==='different'?2:1}}))]},
+...['one','two','different'].map(toolCallId=>({role:'toolResult',toolName:'read',toolCallId,isError:false,content:[{type:'text',text:evidence}]})),
+{role:'toolResult',toolName:'read',toolCallId:'failed',isError:true,content:[{type:'text',text:'HISTORICAL_READ_FAILURE'}]}];
+if(process.env.REQFLOW_PHASE==='intake')input[0].content.push({type:'image',mimeType:'image/png',data:'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+cNu8AAAAASUVORK5CYII='});
+const original=structuredClone(input);
+let messages=input;
+for(const context of contexts){const result=await context({messages});if(result)messages=result.messages;}
+assert.deepEqual(input,original,'active projection must not mutate archived messages');
+assert.equal(JSON.stringify(messages).match(/EXACT_BUSINESS_DECISION/g).length,1);
+assert.match(messages[0].content[0].text,/Exact fields already in the latest controller prompt: contract/);
+assert.match(messages.find(row=>row.toolCallId==='one').content[0].text,/later tool result two/);
+assert.equal(messages.find(row=>row.toolCallId==='two').content[0].text,evidence);
+assert.equal(messages.find(row=>row.toolCallId==='different').content[0].text,evidence);
+assert.equal(messages.find(row=>row.toolCallId==='failed').isError,true);
+assert.match(JSON.stringify(messages),/HISTORICAL_READ_FAILURE/);
+if(process.env.REQFLOW_PHASE==='intake')assert.ok(messages.some(message=>Array.isArray(message.content)&&message.content.some(part=>part.type==='image')));
+console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'done'}],stopReason:'stop',usage:{input:100,output:10,cacheRead:0,cacheWrite:0,cost:{total:0}}}}));
+console.log(JSON.stringify({type:'agent_settled'}));`);
+  const result = await runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
+    environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } },
+    directory, phase, `Current requirement: ${JSON.stringify(contract)}`, path.join(directory, "events.jsonl"), 1, phase === "review" ? "qa" : null, [],
+    { maxTokens: 1000, maxMs: 3000, authoritativeContext: { contract, currentState: "exact_current_state" } });
+  assert.equal(result.text, "done");
+  const events = (await fs.readFile(path.join(directory, "events.jsonl"), "utf8")).trim().split("\n").map(JSON.parse);
+  assert.ok(events.some(event => event.entry?.customType === "reqflow_context_prepared" && event.entry.data.inlineFields.includes("contract")));
+  assert.ok(events.some(event => event.entry?.customType === "reqflow_read_context_replaced"));
+});
 import { runPi } from "../src/pi-runner.js";
 import { validateConfig } from "../src/config.js";
+import { admissionDefaults, modelAllowance } from "../src/admission.js";
+
+test("adaptive requests have separate timeouts and retain a cumulative stage deadline", async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-request-timeout-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const executable = path.join(directory, "pi.mjs");
+  await fs.writeFile(executable, `const slow=process.argv.at(-1)==='slow';
+for(let request=1;request<=2;request++){
+ console.log(JSON.stringify({type:'entry_appended',entry:{customType:'reqflow_request_budget',data:{
+  provider:'fake',model:'fake',estimationMethod:'wire_bytes',request,inputReserve:1,contextBytes:1,remainingTokens:100,tokensUsed:request-1}}}));
+ await new Promise(resolve=>setTimeout(resolve,slow?600:250));
+ console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'done'}],
+  stopReason:request===2?'stop':'toolUse',usage:{input:1,output:1,cacheRead:0,cacheWrite:0,cost:{total:0}}}}));
+}console.log(JSON.stringify({type:'agent_settled'}));`);
+  const project = { config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
+    environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 400, maxToolCalls: 10, maxEventBytes: 10000 } };
+  const allowance = { maxTokens: 100, maxMs: 1600, budget: { mode: "adaptive" } };
+  const result = await runPi(project, directory, "plan", "normal", path.join(directory, "adaptive.log"), 1, null, [], allowance);
+  assert.ok(result.telemetry.durationMs > 400);
+  assert.equal(result.telemetry.requestTimings.length, 2);
+  assert.equal(result.telemetry.unmeasuredRequests, 0);
+  assert.equal(result.telemetry.timeouts.stageMs, 1600);
+  for (const [name, prompt, limit, scope] of [
+    ["strict", "normal", { ...allowance, budget: { mode: "strict" } }, "stage"],
+    ["slow", "slow", allowance, "request"], ["remaining", "normal", { ...allowance, maxMs: 450 }, "stage"]]) {
+    await assert.rejects(runPi(project, directory, "plan", prompt, path.join(directory, name + ".log"), 1, null, [], limit), error => {
+      assert.equal(error.code, "PI_TIMEOUT");
+      assert.equal(error.timeoutScope, scope);
+      assert.equal(error.telemetry.unmeasuredRequests, 1);
+      const events = [{ type: "plan_attempt_failed", detail: { telemetry: error.telemetry } }];
+      assert.throws(() => modelAllowance(events, { ...admissionDefaults, budgetMode: "strict" }), /unmeasured/);
+      assert.equal(modelAllowance(events, admissionDefaults).budget.unmeasuredCalls, 1);
+      return true;
+    });
+  }
+});
 
 test("model usage defaults are explicit and invalid policies are rejected", async () => {
   const config = JSON.parse(await fs.readFile(new URL("../examples/config.local.json", import.meta.url), "utf8"));
@@ -16,9 +91,43 @@ test("model usage defaults are explicit and invalid policies are rejected", asyn
   }
   assert.throws(() => validateConfig({ ...config, thinking: "unknown" }), /thinking/);
   assert.throws(() => validateConfig({ ...config, structuredOutput: "true" }), /structuredOutput/);
+  assert.equal(validateConfig({ ...config, planReview: "full" }).planReview, "full");
+  assert.throws(() => validateConfig({ ...config, planReview: "none" }), /planReview/);
 });
 
-test("raw source evidence is reused, invalidated on source changes and rejects tampering", async (t) => {
+test("compact audit preserves completed results, errors, tools and usage without repeated thoughts", async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-compact-audit-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const executable = path.join(directory, "pi.mjs");
+  await fs.writeFile(executable, `const emit=event=>console.log(JSON.stringify(event));
+const message={role:'assistant',content:[{type:'thinking',thinking:'PRIVATE_THOUGHT'.repeat(10000),thinkingSignature:'private-signature'},
+ {type:'text',text:'Final answer with evidence'}],stopReason:'stop',usage:{input:321,output:123,cacheRead:10,cacheWrite:11,cost:{total:0.01}}};
+emit({type:'message_start',message});emit({type:'message_update',assistantMessageEvent:{type:'thinking_delta',delta:'PRIVATE_THOUGHT'}});
+emit({type:'tool_execution_start',toolCallId:'lookup',toolName:'grep',args:{pattern:'target'}});
+emit({type:'tool_execution_end',toolCallId:'lookup',toolName:'grep',isError:true,result:{content:[{type:'text',text:'missing target'}]}});
+emit({type:'message_end',message});emit({type:'turn_end',message});emit({type:'agent_end',messages:[message]});emit({type:'agent_settled'});`);
+  const project = { config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
+    environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 5000 } };
+  const logFile = path.join(directory, "audit.jsonl");
+  const result = await runPi(project, directory, "plan", "Read evidence", logFile, 1);
+  const raw = await fs.readFile(logFile, "utf8");
+  assert.doesNotMatch(raw, /PRIVATE_THOUGHT|private-signature/);
+  assert.match(raw, /Final answer with evidence|missing target/);
+  const events = raw.trim().split("\n").map(JSON.parse);
+  const thinking = events.find(event => event.type === "message_end").message.content[0];
+  assert.equal(thinking.type, "thinking_reference");
+  assert.match(thinking.hash, /^[a-f0-9]{64}$/);
+  assert.equal(result.text, "Final answer with evidence");
+  assert.equal(result.toolCalls, 1);
+  assert.deepEqual(result.telemetry.tokens, { input: 321, output: 123, cacheRead: 10, cacheWrite: 11 });
+  assert.equal(result.costUsd, 0.01);
+  assert.equal(result.telemetry.auditStorage.omittedEvents, 4);
+  assert.equal(result.telemetry.auditStorage.omittedThinkingBlocks, 1);
+  assert.equal(result.telemetry.auditStorage.storedBytes, Buffer.byteLength(raw));
+  assert.ok(result.telemetry.auditStorage.receivedBytes > Buffer.byteLength(raw) * 50);
+});
+
+test("same-task raw source evidence is reused, invalidated on source changes and rejects tampering", async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-source-evidence-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const executable = path.join(directory, "pi.mjs");
@@ -30,7 +139,9 @@ console.log(JSON.stringify({type:'tool_execution_end',toolName:'read',toolCallId
 console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'{"privateConclusion":"must not reuse"}'}],
 usage:{input:1,output:1,cacheRead:0,cacheWrite:0,cost:{total:0}},stopReason:'stop'}}));
 console.log(JSON.stringify({type:'agent_settled'}));`);
-  const project = { config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
+  const archive = path.join(directory, "archive");
+  await fs.mkdir(archive);
+  const project = { archive, config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000,
     maxToolCalls: 10, maxEventBytes: 10000 } };
   const run = number => runPi(project, directory, "plan", "independently review", path.join(directory, `${number}.jsonl`), 1);
@@ -40,6 +151,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   const second = await run(2);
   assert.equal(second.telemetry.requestLimit, 6, "cached excerpts do not prove that further investigation is unnecessary");
   assert.equal(second.telemetry.sourceEvidence.reused.length, 1);
+  assert.equal(second.telemetry.sourceEvidence.indexed.length, 0, "shared cache must not duplicate the same-task excerpt");
   const prompt = await fs.readFile(path.join(directory, "actual-prompt.txt"), "utf8");
   assert.match(prompt, /1: def existing\(\):/);
   assert.ok(!prompt.includes("privateConclusion"));
@@ -81,7 +193,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
     assert.equal(args.policy.implementationResearchRequests, expected);
     assert.equal(result.telemetry.sourceEvidence.researchRequests, expected);
     assert.equal(args.tools.includes("read"), expected === 1);
-    assert.equal(args.tools.includes("write"), file === "new.py");
+    assert.ok(args.tools.includes("write") && args.tools.includes("bash"));
     assert.ok(args.tools.includes("find") && args.tools.includes("ls"));
     assert.equal(result.telemetry.sourceEvidence.completeFiles.length, file === "small.py" ? 1 : 0);
     if (file === "small.py") assert.match(args.prompt, /small\.py.*complete file/);
@@ -89,8 +201,8 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
       assert.match(args.prompt, /1499: # unrelated/);
       assert.ok(args.prompt.includes("def existing():"));
       assert.ok(result.telemetry.sourceEvidence.selectedBytes < 5000);
-      assert.equal(result.telemetry.sourceEvidence.focusedFiles.length, 2);
-      assert.equal(result.telemetry.sourceEvidence.focusedFiles[0].startLine, 1);
+      assert.equal(result.telemetry.sourceEvidence.focusedFiles.length, 1);
+      assert.equal(result.telemetry.sourceEvidence.focusedFiles[0].startLine, 1499);
     }
     if (file === "tests.py") {
       assert.match(args.prompt, /test_list_datasets_returns_original_envelope/);
@@ -185,7 +297,7 @@ test("diagnosed file and line references work for large files without Python or 
     + "public String result() { return \"original\"; }\n");
   const executable = path.join(directory, "pi.mjs");
   await fs.writeFile(executable, `import assert from 'node:assert/strict';
-assert.equal(process.argv[process.argv.indexOf('--tools')+1],'edit');
+assert.equal(process.argv[process.argv.indexOf('--tools')+1],'read,bash,edit,write,grep,find,ls');
 assert.match(process.argv.at(-1),/501: public String result/);
 console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'done'}],stopReason:'stop',usage:{input:1,output:1,cacheRead:0,cacheWrite:0,cost:{total:0}}}}));
 console.log(JSON.stringify({type:'agent_settled'}));`);
@@ -224,10 +336,10 @@ assert.equal(await tool({toolName:'read',input:{path:'long.py',offset:1,limit:5}
 const successful={role:'toolResult',toolName:'edit',isError:false,content:[{type:'text',text:'diff'.repeat(200)}]};
 const failed={...successful,isError:true};
 const assistant={role:'assistant',usage:{input:7,output:3,cacheRead:2,cacheWrite:0},content:[]};
-const compacted=await handlers.get('context')({messages:[assistant,successful,failed]});
-assert.equal(compacted.messages[0],assistant);assert.equal(compacted.messages[2],failed);
-assert.match(compacted.messages[1].content[0].text,/audit log/);
-assert.ok(compacted.messages[1].content[0].text.length<successful.content[0].text.length);
+const messages=[assistant,successful,failed];
+await handlers.get('context')({messages});
+assert.equal(messages[1],successful);assert.equal(messages[2],failed);
+assert.equal(successful.content[0].text,'diff'.repeat(200));
 assert.equal((await tool({toolName:'write',input:{path:'long.py',content:'replacement'}})).block,true);
 assert.equal((await tool({toolName:'edit',input:{path:'long.py',oldText:'original\\n'.repeat(60),newText:'replacement'}})).block,true);
 assert.equal((await tool({toolName:'edit',input:{path:'long.py',edits:[{oldText:'original',newText:'changed'},{oldText:'original',newText:'replacement\\n'.repeat(51)}]}})).block,true);
@@ -255,7 +367,7 @@ const handlers=new Map();const guard=(await import(${JSON.stringify(guardUrl)}))
 guard({on:(name,handler)=>handlers.set(name,[...(handlers.get(name)??[]),handler]),appendEntry:(customType,data)=>console.log(JSON.stringify({type:'entry_appended',entry:{type:'custom',customType,data}}))});
 const kind=${JSON.stringify(kind)};
 if(kind==='tokens')for(const handler of handlers.get('message_end'))await handler({message:{role:'assistant',content:[],usage:{input:8,output:2,cacheRead:0,cacheWrite:0}}});
-for(const handler of handlers.get('context'))await handler({messages:kind==='tokens'?[{role:'assistant',usage:{input:8,output:2,cacheRead:0,cacheWrite:0}}]:[]});
+for(const handler of handlers.get('context'))await handler({messages:kind==='tokens'?[{role:'assistant',content:[],usage:{input:8,output:2,cacheRead:0,cacheWrite:0}}]:[]});
 await handlers.get('before_provider_request')[0]({payload:{messages:[{content:kind==='context'?'x'.repeat(1001):'small'}]}},{});
 await fs.appendFile(${JSON.stringify(marker)},'call\\n');
 if(kind==='requests')await handlers.get('before_provider_request')[0]({payload:{messages:[]}},{});
@@ -349,7 +461,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   assert.ok(!JSON.stringify(result).includes('x'.repeat(1001)));
 });
 
-test("implementation tool failures stop before another model request", async t => {
+test("native coding receives tool failures and retains the opportunity to correct them", async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-stop-edit-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const executable = path.join(directory, "pi.mjs");
@@ -361,14 +473,16 @@ const event={payload:{messages:[],tools:[{function:{name:'edit',description:'edi
 await handlers.get('before_provider_request')(event,{});
 if(!parameters.properties.edits.items.properties.newText.pattern)throw new Error('Missing line constraint');
 await handlers.get('tool_result')({toolName:'edit',isError:true,content:[{type:'text',text:'Edit exceeds 50 lines'}]});
-await fs.writeFile(${JSON.stringify(marker)},'unexpected provider retry');`);
-  await assert.rejects(runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
+await fs.writeFile(${JSON.stringify(marker)},'correction remains possible');
+console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'Corrected edit.'}],stopReason:'stop',usage:{input:1,output:1,cacheRead:0,cacheWrite:0,cost:{total:0}}}}));
+console.log(JSON.stringify({type:'agent_settled'}));`);
+  await runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } },
-    directory, "implement", "prompt", path.join(directory, "events.jsonl"), 1), /REQFLOW_TOOL_STOP.*Edit exceeds 50 lines/);
-  await assert.rejects(fs.stat(marker), { code: "ENOENT" });
+    directory, "implement", "prompt", path.join(directory, "events.jsonl"), 1);
+  assert.equal(await fs.readFile(marker, "utf8"), "correction remains possible");
 });
 
-test("inactive implementation tools stop at message completion without another provider call", async t => {
+test("native coding reports invalid arguments without terminating recovery", async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-inactive-tool-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const executable = path.join(directory, "pi.mjs");
@@ -378,11 +492,13 @@ const handlers=new Map();(await import(${JSON.stringify(new URL('../src/pi-guard
 const tool=await handlers.get('tool_call')({toolName:'read',input:{path:'pi.mjs',offset:1,limit:0}});
 if(!tool?.block||!tool.reason.includes('positive integer'))throw new Error('Invalid read limit was silently altered');
 await handlers.get('message_end')({message:{role:'toolResult',toolName:'read',isError:true,content:[{type:'text',text:'Tool read not found'}]}});
-await fs.writeFile(${JSON.stringify(marker)},'unexpected retry');`);
-  await assert.rejects(runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
+await fs.writeFile(${JSON.stringify(marker)},'recovery continues');
+console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'Recovery possible.'}],stopReason:'stop',usage:{input:1,output:1,cacheRead:0,cacheWrite:0,cost:{total:0}}}}));
+console.log(JSON.stringify({type:'agent_settled'}));`);
+  await runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } },
-    directory, "implement", "prompt", path.join(directory, "events.jsonl"), 1), /REQFLOW_TOOL_STOP.*Tool read not found/);
-  await assert.rejects(fs.stat(marker), { code: "ENOENT" });
+    directory, "implement", "prompt", path.join(directory, "events.jsonl"), 1);
+  assert.equal(await fs.readFile(marker, "utf8"), "recovery continues");
 });
 
 test("provider allowance is shared across phases and quota errors with paid usage cannot renew it", async t => {
@@ -434,7 +550,7 @@ const before=handlers.get('before_provider_request')[0];const ctx={model:{api:'o
 const event={payload:{messages:[{role:'user',content:'x'.repeat(500)}],max_tokens:2000}};
 await before(event,ctx);assert.ok(event.payload.max_tokens>0&&event.payload.max_tokens<750);
 for(const handler of handlers.get('message_end'))await handler({message:{role:'assistant',content:[],usage:{input:700,output:100,cacheRead:0,cacheWrite:0}}});
-for(const handler of handlers.get('context'))await handler({messages:[{role:'assistant',usage:{input:700,output:100,cacheRead:0,cacheWrite:0}}]});
+for(const handler of handlers.get('context'))await handler({messages:[{role:'assistant',content:[],usage:{input:700,output:100,cacheRead:0,cacheWrite:0}}]});
 await before({payload:{messages:[{role:'user',content:'x'.repeat(500)}]}},ctx);
 throw new Error('Unaffordable request reached provider');`);
   await assert.rejects(runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
@@ -443,25 +559,24 @@ throw new Error('Unaffordable request reached provider');`);
     { maxTokens: 1000, maxMs: 3000 }), /remaining tokens cannot fund request context/);
 });
 
-test("preflight rejects an edit that cannot fund complete arguments without billing a response", async t => {
+test("native coding delegates input and output capacity to Pi rather than advisory byte estimates", async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-edit-reserve-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const executable = path.join(directory, "pi.mjs");
   await fs.writeFile(executable, `const handlers=new Map();
-(await import(${JSON.stringify(new URL('../src/pi-guard.js', import.meta.url).href)})).default({on:(name,handler)=>handlers.set(name,handler)});
+(await import(${JSON.stringify(new URL('../src/pi-guard.js', import.meta.url).href)})).default({on:(name,handler)=>handlers.set(name,handler),appendEntry:(customType,data)=>console.log(JSON.stringify({type:'entry_appended',entry:{customType,data}}))});
 const edit={function:{name:'edit',description:'Exact replacement',parameters:{properties:{edits:{items:{properties:{oldText:{description:'Old'},newText:{description:'New'}}}}}}}};
 await handlers.get('before_provider_request')({payload:{messages:[{role:'user',content:'approved'}],tools:[edit]}},{model:{api:'openai-completions',maxTokens:2000}});
-throw new Error('Unaffordable edit reached provider');`);
-  await assert.rejects(runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
+console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'Native capacity respected.'}],stopReason:'stop',usage:{input:10,output:1,cacheRead:0,cacheWrite:0,cost:{total:0}}}}));
+console.log(JSON.stringify({type:'agent_settled'}));`);
+  const result = await runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } },
-    directory, "implement", "prompt", path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 1000, maxMs: 3000 }), error => {
-      assert.match(error.message, /cannot fund a complete bounded edit/);
-      assert.deepEqual(error.telemetry.tokens, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
-      return true;
-    });
+    directory, "implement", "prompt", path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 1000, maxMs: 3000 });
+  assert.equal(result.telemetry.executionMode, "native");
+  assert.deepEqual(result.telemetry.tokens, { input: 10, output: 1, cacheRead: 0, cacheWrite: 0 });
 });
 
-test("measured prefixes reduce overestimation; changed models, messages and failed measurements invalidate it", async t => {
+test("measured input survives changed context while changed models and failed measurements invalidate it", async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-measured-budget-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const executable = path.join(directory, "pi.mjs");
@@ -472,12 +587,12 @@ const original={role:'user',content:'x'.repeat(1000)};
 const definitions=['edit','write'].map(name=>({type:'function',function:{name,description:'x'.repeat(200)}}));
 await before({payload:{messages:[original],tools:definitions}},ctx);
 await handlers.get('message_end')({message:{role:'assistant',content:[],provider:'fake',model:'model',usage:{input:150,output:20,cacheRead:50,cacheWrite:0}}});
-for(const handler of contextHandlers)await handler({messages:[{role:'assistant',provider:'fake',model:'model',usage:{input:150,output:20,cacheRead:50,cacheWrite:0}}]});
+for(const handler of contextHandlers)await handler({messages:[{role:'assistant',content:[],provider:'fake',model:'model',usage:{input:150,output:20,cacheRead:50,cacheWrite:0}}]});
 const next={payload:{messages:[original,{role:'user',content:'new'}],tools:[definitions[0]]}};await before(next,ctx);
 assert.ok(next.payload.max_tokens>500,'Known prefix should not be reserved as wire bytes again');
 await before({payload:{messages:[{...original,content:'different'}]}},ctx);
 await before({payload:{messages:[{...original,content:'different'}]}},{model:{...ctx.model,id:'other'}});
-for(const handler of contextHandlers)await handler({messages:[{role:'assistant',provider:'fake',model:'other',stopReason:'error',usage:{input:0,output:0,cacheRead:0,cacheWrite:0}}]});
+for(const handler of contextHandlers)await handler({messages:[{role:'assistant',content:[],provider:'fake',model:'other',stopReason:'error',usage:{input:0,output:0,cacheRead:0,cacheWrite:0}}]});
 await before({payload:{messages:[{...original,content:'different'}]}},{model:{...ctx.model,id:'other'}});
 console.log(JSON.stringify({type:'message_end',message:{role:'assistant',provider:'fake',model:'model',content:[{type:'text',text:'done'}],stopReason:'stop',usage:{input:150,output:20,cacheRead:50,cacheWrite:0,cost:{total:0}}}}));
 console.log(JSON.stringify({type:'agent_settled'}));`);
@@ -487,6 +602,42 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
     directory, "plan", "plan", path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 1000, maxMs: 3000, maxRequests: 5 });
   assert.deepEqual(result.telemetry.requestEstimates.map(row => row.estimationMethod), ["wire_bytes", "measured_prefix", "wire_bytes", "wire_bytes", "wire_bytes"]);
   assert.equal(result.telemetry.requestEstimates[1].tokensUsed, 220);
+});
+
+test("JSON schema guidance preserves measured input across tool rounds and the final JSON request", async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-schema-prefix-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const executable = path.join(directory, "pi.mjs");
+  await fs.writeFile(executable, `import assert from 'node:assert/strict';
+const handlers=new Map();const contexts=[];
+(await import(${JSON.stringify(new URL('../src/pi-guard.js', import.meta.url).href)})).default({on:(name,fn)=>name==='context'?contexts.push(fn):handlers.set(name,fn),
+appendEntry:(customType,data)=>console.log(JSON.stringify({type:'entry_appended',entry:{customType,data}}))});
+const ctx={model:{provider:'fake',id:'model',api:'openai-completions',maxTokens:2000,contextWindow:8000}};
+const messages=[{role:'user',content:'Frozen acceptance AC1; keep existing behavior.'}];
+let prefix;
+for(let i=0;i<3;i++){
+const event={payload:{messages:structuredClone(messages),tools:[{type:'function',function:{name:'fixture'}}]}};
+await handlers.get('before_provider_request')(event,ctx);
+assert.equal(event.payload.messages[0].role,'system');
+assert.match(event.payload.messages[0].content,/AC1/);
+if(prefix)assert.deepEqual(event.payload.messages.slice(0,prefix.length),prefix);
+prefix=structuredClone(event.payload.messages);
+if(i===2)assert.equal(event.payload.tools,undefined);
+const assistant={role:'assistant',content:[],provider:'fake',model:'model',usage:{input:200,output:10,cacheRead:0,cacheWrite:0}};
+await handlers.get('message_end')({message:assistant});
+for(const context of contexts)await context({messages:[assistant]});
+messages.push({role:'assistant',content:'Inspect relevant source'},{role:'tool',content:'Evidence '.repeat(500)});
+}
+console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:JSON.stringify({AC1:'Existing behavior retained'})}],stopReason:'stop',usage:{input:200,output:10,cacheRead:0,cacheWrite:0,cost:{total:0}}}}));
+console.log(JSON.stringify({type:'agent_settled'}));`);
+  const result = await runPi({ config: { piExecutable: executable, provider: "fake", model: "model", mode: "local",
+    structuredOutput: true, environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000,
+    maxToolCalls: 10, maxEventBytes: 10000, modelUsage: { maxRequests: 3, readOnlyMaxRequests: 3, maxContextBytes: 7000 } } },
+    directory, "plan", "JSON", path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 24000, maxMs: 3000,
+      budget: { mode: "adaptive", complexity: "planning" }, outputSchema: { name: "frozen", strict: true,
+        schema: { type: "object", properties: { AC1: { type: "string", description: "Existing behavior must remain" } }, required: ["AC1"] } } });
+  assert.deepEqual(result.telemetry.requestEstimates.map(row => row.estimationMethod), ["wire_bytes", "measured_prefix", "measured_prefix"]);
+  assert.equal(result.telemetry.contextExpansions.at(-1).estimationMethod, "measured_prefix");
 });
 
 test("request guard errors cannot be swallowed by Pi before provider dispatch", async t => {
@@ -558,8 +709,8 @@ assert.equal(last.payload.messages[0].content,'original contract');
 assert.equal(await handlers.get('tool_call')({toolName:'edit',input:{path:'source.py',edits:[{oldText:'value = 1',newText:'value = 2'}]}}),undefined);
 await handlers.get('message_end')({message:{role:'assistant',content:[{type:'text',text:'REQFLOW_EDITS_COMPLETE'}],usage:{input:100,output:10,cacheRead:0,cacheWrite:0}}});
 const finished=event();await handlers.get('before_provider_request')(finished,ctx);
-assert.equal(finished.payload.tools,undefined);assert.equal(finished.payload.max_tokens,128);
-assert.match(finished.payload.messages[0].content,/explicitly declared/);
+assert.deepEqual(finished.payload.tools,[]);assert.equal(finished.payload.max_tokens,undefined);
+assert.equal(finished.payload.messages[0].content,'original contract');
 console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'External verification required.'}],usage:{input:100,output:10,cacheRead:0,cacheWrite:0,cost:{total:0}},stopReason:'stop'}}));
 console.log(JSON.stringify({type:'agent_settled'}));`);
   await fs.writeFile(path.join(directory, "source.py"), "value = 1\n");
@@ -569,7 +720,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
     { maxTokens: 1000, maxMs: 3000, approvedFiles: ["source.py"] });
 });
 
-test("adaptive request expansion stops when the candidate makes no further progress", async t => {
+test("native coding does not stop investigation at the former request ceiling", async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-stalled-progress-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const executable = path.join(directory, "pi.mjs");
@@ -584,18 +735,58 @@ fs.writeFileSync('source.py','value = 2\\n');
 await handlers.get('tool_result')({toolName:'edit',isError:false,input:{path:'source.py'},content:[]});
 await handlers.get('before_provider_request')(event(),ctx);
 await handlers.get('before_provider_request')(event(),ctx);
-throw new Error('Unchanged candidate must not dispatch another request');`);
-  let failure;
-  await assert.rejects(runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
+console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'Investigation complete.'}],stopReason:'stop',usage:{input:10,output:1,cacheRead:0,cacheWrite:0,cost:{total:0}}}}));
+console.log(JSON.stringify({type:'agent_settled'}));`);
+  const result = await runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10,
     maxEventBytes: 10000, modelUsage: { maxRequests: 1 } } }, directory, "implement", "prompt",
     path.join(directory, "events.jsonl"), 1, null, [], { maxTokens: 24000, maxMs: 3000,
-      approvedFiles: ["source.py"], budget: { mode: "adaptive", complexity: "small" } }), error => {
-    failure = error;
-    return /model request limit reached/.test(error.message);
-  });
-  assert.equal(failure.telemetry.requestBudgetExpansions.length, 1);
-  assert.equal(failure.telemetry.requestEstimates.length, 2);
+      approvedFiles: ["source.py"], budget: { mode: "adaptive", complexity: "small" } });
+  assert.equal(result.telemetry.requestBudgetExpansions.length, 0);
+  assert.equal(result.telemetry.requestTimings.length, 3);
+  assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 2\n");
+});
+
+for (const scenario of ["expanded", "reserve", "strict"]) test(`native compaction ignores the former ${scenario} coding request ceiling`, async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-compaction-budget-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  await fs.writeFile(path.join(directory, "source.py"), "value = 1\n");
+  const executable = path.join(directory, "pi.mjs");
+  await fs.writeFile(executable, `import fs from 'node:fs';
+const handlers=new Map();
+(await import(${JSON.stringify(new URL('../src/pi-guard.js', import.meta.url).href)})).default({
+  on:(name,fn)=>handlers.set(name,[...(handlers.get(name)||[]),fn]),
+  appendEntry:(customType,data)=>console.log(JSON.stringify({type:'entry_appended',entry:{customType,data}}))});
+const emit=async(name,event,ctx)=>{for(const fn of handlers.get(name)||[]) await fn(event,ctx);};
+const ctx={model:{api:'openai-completions',provider:'fake',id:'fake',maxTokens:2000}};
+const measured={role:'assistant',content:[{type:'text',text:'Continue.'}],stopReason:'toolUse',
+  usage:{input:100,output:5,cacheRead:0,cacheWrite:0,cost:{total:0}}};
+const request=async()=>{
+  await emit('before_provider_request',{payload:{messages:[{role:'user',content:'Frozen requirement.'}],max_tokens:100}},ctx);
+  await emit('message_end',{message:measured});
+  console.log(JSON.stringify({type:'message_end',message:measured}));
+};
+await request();
+fs.writeFileSync('source.py','value = 2\\n');
+await emit('tool_result',{toolName:'edit',isError:false,input:{path:'source.py'},content:[]});
+for(let i=1;i<${scenario === "expanded" ? 5 : 3};i++) await request();
+await emit('session_before_compact',{preparation:{isSplitTurn:true,
+  messagesToSummarize:[{role:'user',content:'Earlier context.'}],turnPrefixMessages:[measured],
+  settings:{reserveTokens:2000}}},ctx);
+await emit('session_compact',{compactionEntry:{summary:'Exact edits are retained; no new authorization.',
+  firstKeptEntryId:'source-edit',tokensBefore:1000,usage:{input:200,output:10,cacheRead:0,cacheWrite:0,cost:{total:0}}}});
+await request();
+console.log(JSON.stringify({type:'agent_settled'}));`);
+  const logFile = path.join(directory, "events.jsonl");
+  const operation = runPi({ config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
+    environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10,
+    maxEventBytes: 20000, modelUsage: { maxRequests: 4 } } }, directory, "implement", "prompt", logFile, 1, null, [],
+    { maxTokens: 24000, maxMs: 3000, approvedFiles: ["source.py"], budget: { mode: scenario === "strict" ? "strict" : "adaptive", complexity: "small" } });
+    const result = await operation;
+    assert.deepEqual(result.telemetry.requestBudgetExpansions, []);
+    assert.equal(result.telemetry.compactions[0].requests, 2);
+    assert.equal(result.telemetry.requestTimings.length, scenario === "expanded" ? 6 : 4);
+    assert.equal(result.telemetry.unmeasuredRequests, 0);
   assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 2\n");
 });
 

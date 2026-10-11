@@ -34,6 +34,13 @@ function relativePath(input) {
 }
 
 export default function (pi) {
+  pi.on("session_start", (_event, ctx) => {
+    if (fs.realpathSync(ctx.cwd) !== root) {
+      process.stderr.write(`REQFLOW_WORKSPACE_STOP: Pi session cwd ${ctx.cwd} differs from authorized workspace ${root}\n`);
+      process.exit(1);
+    }
+    pi.appendEntry("reqflow_workspace_bound", { workspace: root, phase });
+  });
   if (policy.historyProject) {
     const relevantHistory = new Set();
     pi.registerTool({ name: "search_history", label: "Search relevant delivery history",
@@ -97,16 +104,11 @@ export default function (pi) {
         compat: { maxTokensField: "max_tokens", supportsDeveloperRole: false, supportsReasoningEffort: model.supportsReasoningEffort === true } })) });
   }
   let requests = 0;
-  let requestCeiling = policy.modelUsage?.maxRequests;
-  let lastExpansionHash;
+  const requestCeiling = policy.modelUsage?.maxRequests;
   let providerRequests = 0;
-  let completionDeclared = false;
-  const writtenFiles = new Set();
   const recoverableEditErrors = new Set();
   let lastFailure;
-  let verificationAttempt = 0;
   let verificationStopped;
-  let lastCheckedHash;
   let latestAssistant;
   let planCorrections = 0;
   let planStopped;
@@ -136,11 +138,11 @@ export default function (pi) {
     const inputReserve = Math.ceil(Buffer.byteLength(JSON.stringify({ messages: preparation.messagesToSummarize,
       turn: preparation.turnPrefixMessages, previousSummary: preparation.previousSummary })) / 2) + 4000 * compactionCalls;
     const requestedOutput = Math.min(Math.floor(0.8 * preparation.settings.reserveTokens), ctx.model.maxTokens) * compactionCalls;
-    if (policy.modelUsage && (requests + cumulativeCompactionCalls + compactionCalls + 1 > requestCeiling + planCorrections + intakeCorrections
+    if (phase !== "implement" && policy.modelUsage && (requests + cumulativeCompactionCalls + compactionCalls + 1 > requestCeiling + planCorrections + intakeCorrections
         || policy.providerRequestLimit !== undefined && providerRequests + cumulativeCompactionCalls + compactionCalls + 1 > policy.providerRequestLimit)) {
       process.stderr.write("REQFLOW_BUDGET_STOP: native compaction and final response exceed remaining request limit\n"); process.exit(1);
     }
-    if (policy.modelUsage && tokensUsed + inputReserve + requestedOutput > tokenCeiling) {
+    if (phase !== "implement" && policy.modelUsage && tokensUsed + inputReserve + requestedOutput > tokenCeiling) {
       if (policy.modelUsage.budgetMode !== "adaptive") {
         process.stderr.write("REQFLOW_BUDGET_STOP: remaining tokens cannot fund native compaction\n"); process.exit(1);
       }
@@ -174,10 +176,53 @@ export default function (pi) {
     }
     process.stderr.write(`REQFLOW_COMPACTION_STOP: ${event.errorMessage ?? (event.aborted ? "Compaction aborted" : "Compaction failed")}\n`); process.exit(1);
   });
+  let replacementFingerprint;
+  let authorityFingerprint;
   pi.on("context", event => {
-    if (!compacted || !policy.authoritativeContext) return;
+    let messages = event.messages;
+    const hashes = messages.map(message => message.role === "user"
+      ? createHash("sha256").update(JSON.stringify(message.content)).digest("hex") : null);
+    const currentIndex = messages.findLastIndex(message => message.role === "user" && Array.isArray(message.content)
+      && message.content.some(part => part.type === "text" && createHash("sha256")
+        .update(JSON.stringify([{ type: "text", text: part.text }])).digest("hex") === policy.currentPromptContentHash));
+    if (policy.resumedSession) {
+      if (currentIndex >= 0) {
+        const superseded = messages.filter((_message, index) => index !== currentIndex
+          && policy.supersededPromptHashes.includes(hashes[index]));
+        messages = messages.filter((_message, index) => index === currentIndex
+          || !policy.supersededPromptHashes.includes(hashes[index]));
+        const replaced = superseded.map(message => ({ hash: createHash("sha256")
+          .update(JSON.stringify(message.content)).digest("hex"), bytes: Buffer.byteLength(JSON.stringify(message.content)) }));
+        const fingerprint = JSON.stringify(replaced);
+        if (replaced.length && fingerprint !== replacementFingerprint) {
+          pi.appendEntry("reqflow_context_replaced", { replaced,
+            currentPromptContentHash: policy.currentPromptContentHash,
+            reason: "Current controller instructions supersede prior stage prompts; original session and tool evidence retained" });
+          replacementFingerprint = fingerprint;
+        }
+      }
+    }
+    if (!policy.authoritativeContext) return { messages };
+    const current = currentIndex < 0 ? "" : Array.isArray(event.messages[currentIndex].content)
+      ? event.messages[currentIndex].content.filter(part => part.type === "text").map(part => part.text).join("\n")
+      : event.messages[currentIndex].content;
+    const inlineFields = [];
+    const additional = Object.fromEntries(Object.entries(policy.authoritativeContext).filter(([key, value]) => {
+      const text = typeof value === "string" ? value : JSON.stringify(value);
+      if (text !== undefined && Buffer.byteLength(text) >= 256 && current.includes(text)) {
+        inlineFields.push(key); return false;
+      }
+      return true;
+    }));
+    const fingerprint = JSON.stringify({ additional, inlineFields });
+    if (fingerprint !== authorityFingerprint) {
+      pi.appendEntry("reqflow_context_prepared", { phase, inlineFields,
+        protectedHash: createHash("sha256").update(JSON.stringify(policy.authoritativeContext)).digest("hex"),
+        protectedBytes: Buffer.byteLength(JSON.stringify(policy.authoritativeContext)), additionalBytes: Buffer.byteLength(JSON.stringify(additional)) });
+      authorityFingerprint = fingerprint;
+    }
     return { messages: [{ role: "user", timestamp: 0, content: [{ type: "text",
-      text: `Authoritative task state after compaction. This exact confirmed state overrides summary assumptions; it does not authorize new work:\n${JSON.stringify(policy.authoritativeContext)}` }] }, ...event.messages] };
+      text: `Current authoritative task state. This exact confirmed state overrides session history and summary assumptions; it does not authorize new work. Exact fields already in the latest controller prompt: ${inlineFields.join(", ") || "none"}. Additional exact fields:\n${JSON.stringify(additional)}` }] }, ...messages] };
   });
   pi.on("message_end", event => {
     if (event.message?.role === "assistant") latestAssistant = event.message;
@@ -187,9 +232,7 @@ export default function (pi) {
       }
       tokensUsed += event.message.usage[key];
     }
-    if (phase === "implement" && event.message?.role === "assistant") {
-      completionDeclared = event.message.content.some(part => part.type === "text" && /^REQFLOW_EDITS_COMPLETE$/m.test(part.text));
-    }
+    if (phase === "implement") return;
     if (event.message?.role !== "toolResult" || !event.message.isError) return;
     if (recoverableEditErrors.has(event.message.toolCallId)) return;
     const reason = event.message.content.filter(part => part.type === "text").map(part => part.text).join("\n");
@@ -254,9 +297,8 @@ export default function (pi) {
   }
   if (phase === "implement" && policy.implementationChecks !== undefined) {
     let developmentCheckAttempt = 0;
-    let latestDevelopmentCheck;
     pi.registerTool({ name: "run_checks", label: "Run project checks",
-      description: "Run the project's configured checks in the isolated workspace. Use during implementation to diagnose failures. Returns explicit passed/failed status and real logs. Does not accept shell commands or change the check configuration.",
+      description: "Run only the approved plan's scoped checks in the isolated workspace. Diagnose relevant failures; never repair skipped unrelated suites. Returns real logs and passed/failed/manual_pending status. Does not accept commands or change the plan.",
       parameters: { type: "object", properties: {}, additionalProperties: false }, executionMode: "sequential",
       async execute() {
         const checks = policy.implementationChecks;
@@ -273,9 +315,8 @@ export default function (pi) {
           }
           const after = manifestHash(await manifest(root, policy.excludedPaths, checks.maxSnapshotBytes));
           if (before !== after) throw new Error("Development checks modified project files");
-          const result = { attempt: developmentCheckAttempt, status: results.some(row => row.code !== 0) ? "failed" : "passed",
+          const result = { attempt: developmentCheckAttempt, status: !checks.commands.length ? "manual_pending" : results.some(row => row.code !== 0) ? "failed" : "passed",
             beforeHash: before, afterHash: after, checks: results, formalVerificationRequired: true };
-          latestDevelopmentCheck = result;
           pi.appendEntry("reqflow_development_check", result);
           return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
         } catch (error) {
@@ -286,59 +327,47 @@ export default function (pi) {
         }
       },
     });
-    pi.on("agent_before_settle", async () => {
-      if (lastFailure || writtenFiles.size === 0) return;
-      const checks = policy.implementationChecks;
-      verificationAttempt++;
-      const results = [];
-      try {
-        const before = manifestHash(await manifest(root, policy.excludedPaths, checks.maxSnapshotBytes));
-        if (latestDevelopmentCheck?.status === "passed" && latestDevelopmentCheck.afterHash === before) {
-          pi.appendEntry("reqflow_internal_verification", { ...latestDevelopmentCheck, attempt: verificationAttempt,
-            reusedDevelopmentCheck: latestDevelopmentCheck.attempt });
-          return;
-        }
-        if (lastCheckedHash === before) throw new Error("Repair made no source changes after failed checks");
-        lastCheckedHash = before;
-        for (const [index, command] of checks.commands.entries()) {
-          const logFile = `${checks.logPrefix}-${verificationAttempt}-${index + 1}.log`;
-          const result = await runCommand(command, root, checks.timeoutMs, logFile, checks.maxBytes,
-            checks.environment, checks.sandbox);
-          results.push({ command, logFile, ...result });
-          if (result.code !== 0) break;
-        }
-        const after = manifestHash(await manifest(root, policy.excludedPaths, checks.maxSnapshotBytes));
-        if (before !== after) throw new Error("Implementation checks modified project files");
-        const failed = results.find(result => result.code !== 0);
-        pi.appendEntry("reqflow_internal_verification", { attempt: verificationAttempt,
-          status: failed ? "failed" : "passed", beforeHash: before, afterHash: after, checks: results,
-          formalVerificationRequired: true });
-        if (!failed) return;
-        if (verificationAttempt > policy.maxRepairAttempts) {
-          verificationStopped = `checks still fail after ${policy.maxRepairAttempts === 1 ? "one local repair" : `${policy.maxRepairAttempts} local repairs`}; formal verification pending`;
-          process.stderr.write(`REQFLOW_VERIFY_STOP: ${verificationStopped}\n`);
-          return;
-        }
-        completionDeclared = false;
-        pi.setActiveTools(policy.implementationTools);
-        return { continue: true, entries: [{ type: "custom_message", customType: "reqflow_check_feedback",
-          content: `Configured checks failed. Investigate the failure and fix its source cause within ${policy.implementationScope === "project" ? "project allowed paths for the confirmed requirement; necessary caller and test fixes are permitted" : "the same approved files"}. Do not weaken assertions, fabricate fixtures or change checks. Use read/search tools to obtain missing evidence. Ask the owner only for a business decision or an operation outside authorization. Repair round ${verificationAttempt}/${policy.maxRepairAttempts}; original cumulative usage and request limits remain. Checks will run again; formal verification/review remain required.\nCommand: ${JSON.stringify(failed.command)}\nExit: ${failed.code}\nOutput (bounded):\n${failed.tail}`,
-          display: false, details: { attempt: verificationAttempt, logFile: failed.logFile, logHash: failed.logHash } }] };
-      } catch (error) {
-        pi.appendEntry("reqflow_internal_verification", { attempt: verificationAttempt,
-          status: "error", error: error.message, checks: results, formalVerificationRequired: true });
-        verificationStopped = error.message;
-        process.stderr.write(`REQFLOW_VERIFY_STOP: ${error.message}\n`);
-      }
-    });
   }
+  let readReplacementFingerprint;
+  pi.on("context", event => {
+    const calls = new Map(event.messages.filter(message => message.role === "assistant")
+      .flatMap(message => message.content.filter(part => part.type === "toolCall").map(part => [part.id, part])));
+    const latest = new Map();
+    const replaced = [];
+    const messages = [...event.messages];
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index];
+      const call = calls.get(message.toolCallId);
+      if (message.role !== "toolResult" || message.isError || !readTools.has(message.toolName) || !call
+          || message.content.some(part => part.type !== "text")) continue;
+      const text = JSON.stringify(message.content);
+      if (Buffer.byteLength(text) <= 512) continue;
+      const hash = createHash("sha256").update(JSON.stringify([message.toolName, call.arguments, message.content])).digest("hex");
+      if (!latest.has(hash)) { latest.set(hash, message.toolCallId); continue; }
+      const retainedToolCallId = latest.get(hash);
+      messages[index] = { ...message, content: [{ type: "text", text:
+        `Identical ${message.toolName} arguments and result repeated. Exact evidence retained in later tool result ${retainedToolCallId}; sha256=${hash}. Original result remains in audit/session archive.` }] };
+      replaced.push({ toolCallId: message.toolCallId, retainedToolCallId, hash, bytes: Buffer.byteLength(text) });
+    }
+    const fingerprint = JSON.stringify(replaced);
+    if (replaced.length && fingerprint !== readReplacementFingerprint) {
+      pi.appendEntry("reqflow_read_context_replaced", { phase, replaced });
+      readReplacementFingerprint = fingerprint;
+    }
+    return { messages };
+  });
   if (policy.modelUsage !== undefined) {
     let contextCeiling = policy.modelUsage.maxContextBytes;
-    let previousRequest;
+    let previousRequest = policy.priorRequestLayout;
     let lastMeasuredInput;
     let lastMeasuredModel;
+    let lastMeasuredMessageHash;
+    pi.on("session_compact", () => {
+      previousRequest = undefined;
+      lastMeasuredInput = undefined; lastMeasuredModel = undefined; lastMeasuredMessageHash = undefined;
+    });
     pi.on("context", async (event) => {
-      lastMeasuredInput = undefined; lastMeasuredModel = undefined;
+      lastMeasuredInput = undefined; lastMeasuredModel = undefined; lastMeasuredMessageHash = undefined;
       for (const message of event.messages.filter(row => row.role === "assistant")) {
         for (const key of ["input", "output", "cacheRead", "cacheWrite"]) {
           if (!Number.isSafeInteger(message.usage?.[key]) || message.usage[key] < 0) {
@@ -346,9 +375,10 @@ export default function (pi) {
             process.exit(1);
           }
         }
-        lastMeasuredInput = message.stopReason === "error" ? undefined
+        lastMeasuredInput = ["error", "aborted"].includes(message.stopReason) ? undefined
           : message.usage.input + message.usage.cacheRead + message.usage.cacheWrite;
-        lastMeasuredModel = message.stopReason === "error" ? undefined : JSON.stringify([message.provider, message.model]);
+        lastMeasuredModel = ["error", "aborted"].includes(message.stopReason) ? undefined : JSON.stringify([message.provider, message.model]);
+        lastMeasuredMessageHash = createHash("sha256").update(JSON.stringify(message)).digest("hex");
       }
     });
     pi.on("before_provider_request", async (event, ctx) => {
@@ -358,15 +388,9 @@ export default function (pi) {
         process.stderr.write(`REQFLOW_VALIDATION_STOP: ${verificationStopped ?? planStopped ?? intakeStopped}\n`);
         process.exit(1);
       }
-      if (!compacting && phase === "implement" && completionDeclared && writtenFiles.size > 0) {
-        event.payload.messages = [{ role: "user", content: "Edits explicitly declared complete and tool batch succeeded. Reply briefly: external verification pending. Do not claim tests passed." }];
-        delete event.payload.tools;
-        delete event.payload.tool_choice;
-        event.payload[Object.hasOwn(event.payload, "max_completion_tokens") ? "max_completion_tokens" : "max_tokens"] = 128;
-        pi.setActiveTools([]);
-      }
       for (const tool of event.payload.tools ?? []) {
         const name = tool.function?.name;
+        if (phase === "implement") continue;
         if (!readTools.has(name)) continue;
         const limit = tool.function.parameters?.properties?.limit;
         if (limit) {
@@ -381,7 +405,7 @@ export default function (pi) {
       if (phase === "implement") {
         const edit = event.payload.tools?.find(tool => tool.function?.name === "edit")?.function;
         if (edit) {
-          const guidance = " Each replacement must contain at most 50 old and 50 new lines. For tests, put ONE test function in each edits item. Build long new methods in separate bounded logical blocks, extending the exact text already committed. Do not repeat a successful insertion at an unchanged anchor: that duplicates code. Known matching, no-op or line-count errors permit at most two corrections; other errors stop this run.";
+          const guidance = " Each replacement must contain at most 50 old and 50 new lines; edit one logical unit at a time.";
           if (!edit.description.endsWith(guidance)) edit.description += guidance;
           const properties = edit.parameters?.properties?.edits?.items?.properties;
           for (const key of ["oldText", "newText"]) {
@@ -410,7 +434,8 @@ export default function (pi) {
         event.payload.response_format = policy.outputSchema && format !== "json_object" && schemaCapable
            ? { type: "json_schema", json_schema: policy.outputSchema } : { type: "json_object" };
         if (policy.outputSchema && event.payload.response_format.type === "json_object") {
-          event.payload.messages.push({ role: "user", content: `Final JSON must match this schema exactly; preserve every required field and version: ${JSON.stringify(policy.outputSchema.schema)}` });
+          // Keep format instructions in a stable prefix so measured provider input can be reused after tool results.
+          event.payload.messages.unshift({ role: "system", content: `Final JSON must match this schema exactly; preserve every required field and version: ${JSON.stringify(policy.outputSchema.schema)}` });
         }
       }
       if (!compacting) {
@@ -419,27 +444,58 @@ export default function (pi) {
         if (policy.modelParameters?.maxOutputTokens !== undefined) event.payload.max_tokens = Math.min(
           policy.modelParameters.maxOutputTokens, ctx.model.maxTokens, event.payload.max_tokens ?? ctx.model.maxTokens);
       }
-      if (!compacting && policy.structuredOutput && (phase === "initialize" || requests + cumulativeCompactionCalls + 1 === policy.modelUsage.maxRequests || planCorrections > 0)) {
+      if (phase === "implement") {
+        requests++;
+        pi.appendEntry("reqflow_provider_request", { request: requests,
+          contextBytes: Buffer.byteLength(JSON.stringify(event.payload)),
+          provider: ctx.model?.provider, model: ctx.model?.id, executionMode: "native" });
+        return;
+      }
+      if (!compacting && policy.structuredOutput && (phase === "initialize" || requests + cumulativeCompactionCalls + 1 === policy.modelUsage.maxRequests
+          || (planCorrections > 0 && !policy.planCorrection))) {
         delete event.payload.tools;
         delete event.payload.tool_choice;
         if (phase !== "initialize") event.payload.messages.push({ role: "user", content:
-          "Research is finished. Return one FULL JSON object with the original task schema and version hashes. Include every required field and acceptance condition; do not add fields absent from that schema. Tool results are evidence, not the answer. No further tools, prose or fences." });
+          policy.planCorrection
+            ? "Research is finished. Return one modification JSON object matching the original modification schema; unchanged fields and design sections are null. Preserve all required modification keys, and use acceptance IDs as keys if verification changes. Do not return a full plan or copy tool results. No further tools, prose or fences."
+            : "Research is finished. Return one FULL JSON object with the original task schema and version hashes. Include every required field and acceptance condition; do not add fields absent from that schema. Tool results are evidence, not the answer. No further tools, prose or fences." });
       }
       const bytes = Buffer.byteLength(JSON.stringify(event.payload, (key, value) =>
         key === "image_url" || key === "inlineData" || key === "inline_data" ? "[image input]" : value));
       let remainingTokens = tokenCeiling - tokensUsed;
       // Reserve input before dispatch; provider usage remains the authoritative measurement.
       const modelKey = JSON.stringify([ctx.model?.provider, ctx.model?.id]);
-      const prefixMatches = ctx.model?.api === "openai-completions" && previousRequest && ctx.model?.provider && ctx.model?.id
+      let measuredLayout = ctx.model?.api === "openai-completions" && previousRequest && ctx.model?.provider && ctx.model?.id
         && previousRequest.modelKey === modelKey && lastMeasuredModel === modelKey
+        && (!previousRequest.assistantHash || previousRequest.assistantHash === lastMeasuredMessageHash);
+      const messageLayout = event.payload.messages.map(message => {
+        const text = JSON.stringify(message);
+        return { hash: createHash("sha256").update(text).digest("hex"), bytes: Buffer.byteLength(text) };
+      });
+      measuredLayout = measuredLayout && messageLayout.some(message => previousRequest.messages.some(row => row.hash === message.hash));
+      const prefixMatches = measuredLayout
         && previousRequest.messages.length <= event.payload.messages.length
-        && previousRequest.messages.every((message, index) => message === JSON.stringify(event.payload.messages[index]));
-      const appendedBytes = prefixMatches ? Buffer.byteLength(JSON.stringify(event.payload.messages.slice(previousRequest.messages.length))) : 0;
-      const toolDefinitions = (event.payload.tools ?? []).map(tool => JSON.stringify(tool));
-      const additionalToolsBytes = prefixMatches ? toolDefinitions
-        .filter(tool => !previousRequest.toolDefinitions.includes(tool)).reduce((bytes, tool) => bytes + Buffer.byteLength(tool), 0) : 0;
-      const inputReserve = prefixMatches ? lastMeasuredInput + Math.ceil((appendedBytes + additionalToolsBytes) / 2) : Math.ceil(bytes / 2);
-      const estimationMethod = prefixMatches ? "measured_prefix" : "wire_bytes";
+        && previousRequest.messages.every((message, index) => message.hash === messageLayout[index].hash);
+      const toolDefinitions = (event.payload.tools ?? []).map(tool => {
+        const text = JSON.stringify(tool);
+        return { hash: createHash("sha256").update(text).digest("hex"), bytes: Buffer.byteLength(text) };
+      });
+      const optionsText = JSON.stringify(Object.fromEntries(Object.entries(event.payload).filter(([key]) => !["messages", "tools"].includes(key))));
+      const inputOptions = { hash: createHash("sha256").update(optionsText).digest("hex"), bytes: Buffer.byteLength(optionsText) };
+      let addedBytes = 0;
+      if (measuredLayout) {
+        const retained = [...previousRequest.messages];
+        for (const message of messageLayout) {
+          const match = retained.findIndex(row => row.hash === message.hash);
+          if (match >= 0) retained.splice(match, 1); else addedBytes += message.bytes + 1;
+        }
+        addedBytes += toolDefinitions.filter(tool => !previousRequest.toolDefinitions.some(row => row.hash === tool.hash))
+          .reduce((bytes, tool) => bytes + tool.bytes + 1, 0);
+        if (previousRequest.inputOptions.hash !== inputOptions.hash) addedBytes += inputOptions.bytes;
+      }
+      // Removed messages never subtract measured tokens; only new/changed content adds a reserve.
+      const inputReserve = measuredLayout ? lastMeasuredInput + Math.ceil(addedBytes / 2) : Math.ceil(bytes / 2);
+      const estimationMethod = prefixMatches ? "measured_prefix" : measuredLayout ? "measured_retained" : "wire_bytes";
       const editing = phase === "implement" && (event.payload.tools ?? []).some(tool => writeTools.has(tool.function?.name));
       const requestedOutput = event.payload.max_completion_tokens ?? event.payload.max_tokens ?? ctx.model?.maxTokens;
       if (policy.modelUsage.budgetMode === "adaptive" && bytes > contextCeiling && ctx.model?.api === "openai-completions"
@@ -459,26 +515,9 @@ export default function (pi) {
         pi.appendEntry("reqflow_budget_expanded", { previous, next: tokenCeiling, tokensUsed, inputReserve,
           reason: "Continue within approved scope; token estimate is advisory, cumulative usage is retained" });
       }
-      if (phase === "implement" && policy.modelUsage.budgetMode === "adaptive"
-          && requests + cumulativeCompactionCalls + 1 > requestCeiling && writtenFiles.size > 0) {
-        const progressHash = createHash("sha256");
-        for (const file of [...writtenFiles].sort()) {
-          progressHash.update(JSON.stringify(file));
-          progressHash.update(createHash("sha256").update(fs.readFileSync(path.join(root, file))).digest());
-        }
-        const afterHash = progressHash.digest("hex");
-        if (afterHash !== lastExpansionHash) {
-          const previous = requestCeiling;
-          requestCeiling += policy.modelUsage.maxRequests;
-          lastExpansionHash = afterHash;
-          pi.appendEntry("reqflow_request_budget_expanded", { previous, next: requestCeiling, afterHash,
-            reason: "Audited source edits progressed; continue within unchanged time, tool and repair limits" });
-        }
-      }
       requests++;
       providerRequests++;
-      const adaptiveImplementation = phase === "implement" && policy.modelUsage.budgetMode === "adaptive";
-       const reason = !adaptiveImplementation && policy.providerRequestLimit !== undefined && providerRequests + cumulativeCompactionCalls > policy.providerRequestLimit ? "remaining requirement provider request limit reached"
+       const reason = policy.providerRequestLimit !== undefined && providerRequests + cumulativeCompactionCalls > policy.providerRequestLimit ? "remaining requirement provider request limit reached"
          : requests + cumulativeCompactionCalls > requestCeiling + planCorrections + intakeCorrections ? "model request limit reached"
         : bytes > contextCeiling ? "request context byte limit exceeded"
           : tokensUsed >= tokenCeiling ? "cumulative token budget exhausted"
@@ -501,48 +540,19 @@ export default function (pi) {
         }
       }
       if (ctx.model?.api === "openai-completions") {
-        previousRequest = { modelKey, messages: event.payload.messages.map(message => JSON.stringify(message)), toolDefinitions };
+        previousRequest = { modelKey, messages: messageLayout, toolDefinitions, inputOptions };
       }
       pi.appendEntry("reqflow_request_budget", { request: providerRequests,
         inputReserve, estimationMethod, contextBytes: bytes, remainingTokens, tokensUsed,
-        model: ctx.model?.id ?? null, provider: ctx.model?.provider ?? null });
+        model: ctx.model?.id ?? null, provider: ctx.model?.provider ?? null,
+        ...(previousRequest ? { requestLayout: previousRequest } : {}) });
       } catch (error) {
         process.stderr.write(`REQFLOW_GUARD_STOP: request guard failed: ${error.message}\n`);
         process.exit(1);
       }
     });
     pi.on("tool_result", async (event) => {
-      if (phase === "implement" && event.isError) {
-        const reason = event.content.filter(part => part.type === "text").map(part => part.text).join("\n");
-        if (event.toolName === "grep" && /^Path not found: /i.test(reason)
-            && typeof event.toolCallId === "string" && event.toolCallId && recoverableEditErrors.size < 2) {
-          recoverableEditErrors.add(event.toolCallId);
-          completionDeclared = false;
-          pi.appendEntry("reqflow_tool_retry", { toolCallId: event.toolCallId, toolName: event.toolName,
-            reason, remainingCorrections: 2 - recoverableEditErrors.size,
-            decision: "Correct the nonexistent search path using verified module filenames or search an existing parent; do not invent contents or bypass permissions" });
-          return;
-        }
-        if (event.toolName === "edit" && typeof event.toolCallId === "string" && event.toolCallId
-            && recoverableEditErrors.size < 2
-            && /Edit one logical unit at a time, at most 50 lines per replacement|Could not find (?:the exact|exactly|matching) (?:text|oldText)|Could not find edits\[\d+\]|Found \d+ occurrences of the text in .*The text must be unique|No changes made to .*replacement produced identical content|oldText.*(?:not found|matches multiple|not unique)/i.test(reason)) {
-          recoverableEditErrors.add(event.toolCallId);
-          completionDeclared = false;
-          pi.appendEntry("reqflow_tool_retry", { toolCallId: event.toolCallId, toolName: event.toolName,
-            reason, remainingCorrections: 2 - recoverableEditErrors.size,
-            decision: "Correct bounded edit arguments within original approved scope; do not bypass policy" });
-          return;
-        }
-        process.stderr.write(`REQFLOW_TOOL_STOP: ${event.toolName} failed: ${reason}\n`);
-        process.exit(1);
-      }
-      if (phase === "implement" && policy.approvedFiles !== undefined && writeTools.has(event.toolName) && event.isError === false) {
-        const file = relativePath(event.input.path);
-        if (policy.implementationScope !== "project" && !policy.approvedFiles.includes(file)) {
-          process.stderr.write("REQFLOW_TOOL_STOP: completed write outside approved scope\n"); process.exit(1);
-        }
-        writtenFiles.add(file);
-      }
+      if (phase === "implement") return;
       if (!readTools.has(event.toolName)) return;
       const bytes = event.content.reduce((sum, part) => sum + (part.type === "text" ? Buffer.byteLength(part.text) : 0), 0);
       if (bytes > policy.modelUsage.maxToolResultBytes) {
@@ -562,7 +572,7 @@ export default function (pi) {
   }
   pi.on("session_start", async (_event, ctx) => {
     if (phase === "intake" && process.env.REQFLOW_HAS_IMAGES === "true" && !ctx.model?.input.includes("image")) {
-      process.stderr.write("Intake model does not support image input; configure agentModels.intake with a vision model.\n");
+      process.stderr.write("Requirement model does not support image input; configure agentModels.requirement with a vision model.\n");
       process.exit(1);
     }
   });
@@ -575,20 +585,13 @@ export default function (pi) {
       process.exit(1);
     }
   });
-  if (phase === "implement") {
-    pi.on("context", async event => ({ messages: event.messages.map(message =>
-      message.role === "toolResult" && writeTools.has(message.toolName) && message.isError === false
-        && message.content.reduce((bytes, part) => bytes + (part.type === "text" ? Buffer.byteLength(part.text) : 0), 0) > 512
-        ? { ...message, content: [{ type: "text", text: `${message.toolName} completed successfully. newText in the prior call is the committed replacement. Full original arguments and diff remain in the audit log.` }] }
-        : message) }));
-  }
   pi.on("tool_call", async (event) => {
     const name = event.toolName;
+    if (phase === "implement" && name === "bash") return;
     if (policy.historyProject && ["search_history", "read_history"].includes(name)) return;
     if (policy.historyProject && policy.discussionTask && ["read_discussion", "read_plan"].includes(name)) return;
     if (name === "run_checks" && phase === "implement" && policy.implementationChecks !== undefined) return;
     if (!readTools.has(name) && !writeTools.has(name)) return { block: true, reason: `Tool ${name} is not allowed` };
-    if (phase === "implement" && readTools.has(name) && policy.implementationResearchRequests === 0) return { block: true, reason: "Research is complete; use supplied source evidence or stop explicitly" };
     if (writeTools.has(name) && phase !== "implement") return { block: true, reason: "Plan phase is read only" };
     try {
       const relative = relativePath(event.input.path);
@@ -613,22 +616,14 @@ export default function (pi) {
         const counts = (event.input.edits ?? [event.input]).map((edit, index) =>
           `edits[${index}]: old=${edit.oldText?.split("\n").length}, new=${edit.newText?.split("\n").length}`).join("; ");
         const reason = `Edit one logical unit at a time, at most 50 lines per replacement. ${counts}. Include unchanged anchor lines in the count. Insert the first bounded part, then extend that exact newly written block in a separate call; do not refactor into unapproved helpers.`;
-        // Pi bypasses tool_result for calls blocked by tool_call; record here.
-        if (phase === "implement" && recoverableEditErrors.size < 2) {
-          recoverableEditErrors.add(event.toolCallId);
-          completionDeclared = false;
-          pi.appendEntry("reqflow_tool_retry", { toolCallId: event.toolCallId, toolName: name,
-            reason,
-            remainingCorrections: 2 - recoverableEditErrors.size,
-            decision: "Split replacement arguments into bounded logical units within approved scope" });
-        }
+        pi.appendEntry("reqflow_edit_rejected", { toolCallId: event.toolCallId, reason });
         return { block: true, reason };
       }
       if (policy.modelUsage !== undefined && readTools.has(name)) {
         if (event.input.limit !== undefined && (!Number.isSafeInteger(event.input.limit) || event.input.limit < 1)) {
           return { block: true, reason: `${name} limit must be a positive integer` };
         }
-        if (event.input.limit === undefined) event.input.limit = name === "read" ? 80 : 30;
+        if (phase !== "implement" && event.input.limit === undefined) event.input.limit = name === "read" ? 80 : 30;
       }
       return undefined;
     } catch (error) {

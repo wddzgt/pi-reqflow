@@ -279,7 +279,7 @@ export async function baselineAgentContext(project, baseline, focusFiles = null,
   if (mode.mode !== "agent") throw new Error("Invalid project documentation mode");
   const { readInitialization } = await import("./project-initialization.js");
   const initialized = await readInitialization(project, baseline);
-  const ruleFiles = Object.keys(baseline.files).filter(file => /(^|\/)(AGENTS(?:\.override)?|CLAUDE)\.md$/.test(file));
+  const ruleFiles = Object.keys(baseline.files).filter(file => /(^|\/)(agent|AGENTS(?:\.override)?|CLAUDE)\.md$/.test(file));
   if (detail === "index") {
     const understanding = initialized.metadata.understanding;
     return JSON.stringify({ baselineHash: baseline.snapshotHash, sourceHash: baseline.sourceHash,
@@ -315,7 +315,7 @@ export async function baselineAgentContext(project, baseline, focusFiles = null,
       architecture: initialized.metadata.understanding.architecture.filter(row => focusFiles === null || row.evidence.some(reference => focusFiles.some(file => reference.startsWith(`${file}:`)))),
       conventions: initialized.metadata.understanding.conventions,
       notes: initialized.metadata.understanding.notes }, projectRules, ruleFiles, navigation,
-    documentationFiles: Object.keys(baseline.files).filter(file => /^(?:docs\/.*|README|AGENTS|CLAUDE)\.md$/i.test(file)
+    documentationFiles: Object.keys(baseline.files).filter(file => /^(?:docs\/.*|README|agent|AGENTS|CLAUDE)\.md$/i.test(file)
       && (focusFiles === null || focusFiles.includes(file))).slice(0, 40),
     testFiles: baseline.paths.tests.filter(file => focusFiles === null || focusFiles.includes(file)).slice(0, 80), testFileCount: baseline.paths.tests.length });
 }

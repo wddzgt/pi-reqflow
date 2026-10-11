@@ -36,7 +36,9 @@ export function admissionInput(value, files) {
         || typeof item.evidence !== "string" || !item.evidence.trim() || item.evidence.length > 1000)) throw new Error("Admission needs named business modules, file scope and evidence");
   const scoped = value.modules.flatMap((item) => item.files);
   if (new Set(value.modules.map((item) => item.name)).size !== value.modules.length
-      || scoped.length !== files.length || new Set(scoped).size !== files.length) throw new Error("Admission modules must cover every affected file exactly once");
+      || scoped.length !== files.length || new Set(scoped).size !== files.length) {
+    throw new Error(`Admission modules must cover every affected file exactly once; missing files: ${JSON.stringify(files.filter(file => !scoped.includes(file)))}; repeated files: ${JSON.stringify([...new Set(scoped.filter((file, index) => scoped.indexOf(file) !== index))])}; module names must be unique`);
+  }
   if (!Array.isArray(value.deliveryUnits) || !value.deliveryUnits.length || value.deliveryUnits.length > 10
       || new Set(value.deliveryUnits.map((item) => item?.name)).size !== value.deliveryUnits.length
       || value.deliveryUnits.some((item) => !item || typeof item.name !== "string" || !item.name.trim() || item.name.length > 100
@@ -102,25 +104,36 @@ export function executionUsage(events) {
   let totalTokens = 0;
   let modelMs = 0;
   let unmeasuredCalls = 0;
+  let unmeasuredDuration = false;
   let calls = 0;
   for (const event of runs) {
     const telemetry = event.detail.run?.telemetry ?? event.detail.telemetry;
-    if (telemetry?.unmeasuredRequests > 0) { unmeasuredCalls++; continue; }
+    if (Number.isSafeInteger(telemetry?.durationMs) && telemetry.durationMs >= 0) modelMs += telemetry.durationMs;
+    else unmeasuredDuration = true;
     const values = ["input", "output", "cacheRead", "cacheWrite"].map((key) => telemetry?.tokens?.[key]);
     if (!values.every((value) => Number.isSafeInteger(value) && value >= 0)
         || !Number.isSafeInteger(telemetry?.durationMs) || telemetry.durationMs < 0
         || !Number.isSafeInteger(telemetry?.assistantMessages) || telemetry.assistantMessages < 0) { unmeasuredCalls++; continue; }
+    if (telemetry.unmeasuredRequests > 0 || telemetry.requestTimings?.some(row => row.usageMeasured === false
+        || ["running", "timed_out", "interrupted"].includes(row.status))) unmeasuredCalls++;
     calls += telemetry.assistantMessages;
     totalTokens += values.reduce((sum, value) => sum + value, 0);
-    modelMs += telemetry.durationMs;
   }
-  return { calls, totalTokens, modelMs, unmeasuredCalls };
+  return { calls, totalTokens, modelMs, unmeasuredCalls, unmeasuredDuration };
 }
 
 export function modelAllowance(events, policy, calls = 1) {
   const usage = executionUsage(events);
-  if (usage.unmeasuredCalls) throw new Error("Execution budget has unmeasured model calls; further model execution is blocked");
-  if ((policy.budgetMode === "strict" && (usage.calls + calls > policy.maxModelCalls || usage.totalTokens >= policy.maxTotalTokens)) || usage.modelMs >= policy.maxModelMs) {
+  let maxModelMs = policy.maxModelMs;
+  for (const event of events.filter(event => event.type === "execution_budget_extended")) {
+    const additionalMs = event.detail.additionalModelMs;
+    if (!Number.isSafeInteger(additionalMs) || additionalMs < 60000 || additionalMs > 3600000)
+      throw new Error("Execution budget extension requires an explicit duration between one and sixty minutes");
+    maxModelMs += additionalMs;
+  }
+  if (usage.unmeasuredDuration || (policy.budgetMode === "strict" && usage.unmeasuredCalls))
+    throw new Error("Execution budget has unmeasured model calls or duration; further model execution is blocked");
+  if ((policy.budgetMode === "strict" && (usage.calls + calls > policy.maxModelCalls || usage.totalTokens >= policy.maxTotalTokens)) || usage.modelMs >= maxModelMs) {
     throw new Error("Requirement execution budget exhausted; hand off to the responsible developer");
   }
   const scope = events.findLast(event => event.type === "plan_draft_completed")?.detail.admission?.scope;
@@ -128,18 +141,20 @@ export function modelAllowance(events, policy, calls = 1) {
     ? "small" : scope.files <= 6 && scope.estimatedChangedLines <= 400 ? "standard" : "bounded_complex";
   const expectedTokens = { planning: 60000, small: 30000, standard: 60000, bounded_complex: 120000 }[complexity];
   return { maxTokens: policy.budgetMode === "strict" ? policy.maxTotalTokens - usage.totalTokens : expectedTokens,
-    maxMs: policy.maxModelMs - usage.modelMs,
+    maxMs: maxModelMs - usage.modelMs,
     maxRequests: policy.budgetMode === "strict" ? policy.maxModelCalls - usage.calls : policy.maxModelCalls,
     budget: { mode: policy.budgetMode, complexity, expectedTokens, usedTokens: usage.totalTokens,
+      unmeasuredCalls: usage.unmeasuredCalls,
       projectTokenTarget: policy.maxTotalTokens, estimateExceeded: usage.totalTokens >= expectedTokens,
       projectCallTarget: policy.maxModelCalls, usedCalls: usage.calls, callEstimateExceeded: usage.calls >= policy.maxModelCalls,
       maxRepairAttempts: complexity === "bounded_complex" ? 4 : complexity === "standard" ? 3 : 2 } };
 }
 
 export function firstVerificationQuality(tasks) {
-  const outcomes = tasks.map((task) => task.events.find((event) => ["verified", "verification_failed"].includes(event.type)
+  const outcomes = tasks.map((task) => task.events.find((event) => (["verified", "verification_failed"].includes(event.type)
+    && event.detail?.verificationMode !== "manual_pending")
     || (event.type === "implemented" && [...event.detail?.telemetry?.internalChecks ?? [],
-      ...event.detail?.telemetry?.developmentChecks ?? []].some(check => check.status !== "passed")))).filter(Boolean);
+      ...event.detail?.telemetry?.developmentChecks ?? []].some(check => !["passed", "manual_pending"].includes(check.status))))).filter(Boolean);
   const passed = outcomes.filter((event) => event.type === "verified").length;
   return { sampleSize: outcomes.length, passed, failed: outcomes.length - passed,
     rate: outcomes.length ? passed / outcomes.length : null,
@@ -147,11 +162,12 @@ export function firstVerificationQuality(tasks) {
 }
 
 export function firstDeliveryQuality(tasks) {
-  const outcomes = tasks.map((task) => task.events.find((event) => ["verified", "verification_failed",
+  const outcomes = tasks.map((task) => task.events.find((event) => (["verified", "verification_failed",
     "implementation_failed", "implementation_inspection_failed", "implementation_interrupted"].includes(event.type)
+    && event.detail?.verificationMode !== "manual_pending")
     || (event.type === "implemented" && (event.detail?.source === "owner_reviewed_replacement"
       || [...event.detail?.telemetry?.internalChecks ?? [], ...event.detail?.telemetry?.developmentChecks ?? []]
-        .some(check => check.status !== "passed"))))).filter(Boolean);
+        .some(check => !["passed", "manual_pending"].includes(check.status)))))).filter(Boolean);
   const passed = outcomes.filter((event) => event.type === "verified").length;
   return { sampleSize: outcomes.length, passed, failed: outcomes.length - passed,
     rate: outcomes.length ? passed / outcomes.length : null,

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { admissionDefaults, admissionInput, assessAdmission, executionUsage, firstDeliveryQuality, firstVerificationQuality,
   modelAllowance, validateAdmissionPolicy } from "../src/admission.js";
+import { taskObservability } from "../src/report.js";
 
 const policy = { ...admissionDefaults, restrictedPaths: [] };
 function draft() {
@@ -73,7 +74,7 @@ test("explicit policies and admission evidence are complete and unambiguous", ()
   assert.throws(() => validateAdmissionPolicy({ maxFiles: 12 }), /budgetMode/);
   assert.throws(() => validateAdmissionPolicy({ ...policy, bypass: true }), /Unknown/);
   const value = draft(); value.boundaries.modules[0].files.pop();
-  assert.throws(() => admissionInput(value.boundaries, value.affectedFiles), /exactly once/);
+  assert.throws(() => admissionInput(value.boundaries, value.affectedFiles), /exactly once; missing files: \["test\/order.mjs"\]/);
   const duplicate = draft(); duplicate.boundaries.deliveryUnits.push(duplicate.boundaries.deliveryUnits[0]);
   assert.throws(() => admissionInput(duplicate.boundaries, duplicate.affectedFiles), /deployable units/);
 });
@@ -81,7 +82,7 @@ test("explicit policies and admission evidence are complete and unambiguous", ()
 test("engineering budgets count failed calls, caches and duration without counting wrappers", () => {
   const measured = { type: "plan_draft_completed", detail: { telemetry: { tokens: { input: 10, output: 5, cacheRead: 3, cacheWrite: 2 }, durationMs: 100, assistantMessages: 2 } } };
   const events = [measured, { ...measured, type: "implementation_failed" }, { type: "plan_attempt_failed", detail: { modelRun: false } }];
-  assert.deepEqual(executionUsage(events), { calls: 4, totalTokens: 40, modelMs: 200, unmeasuredCalls: 0 });
+  assert.deepEqual(executionUsage(events), { calls: 4, totalTokens: 40, modelMs: 200, unmeasuredCalls: 0, unmeasuredDuration: false });
   assert.throws(() => modelAllowance(events, { ...policy, budgetMode: "strict", maxModelCalls: 2 }), /budget exhausted/);
   assert.throws(() => modelAllowance(events, { ...policy, budgetMode: "strict", maxTotalTokens: 40 }), /budget exhausted/);
   assert.throws(() => modelAllowance([{ type: "implemented", detail: {} }], policy), /unmeasured/);
@@ -95,6 +96,40 @@ test("product alignment successes and failures share the later engineering token
   assert.equal(modelAllowance(events, { ...policy, budgetMode: "strict", maxTotalTokens: 101 }).maxTokens, 1);
   assert.throws(() => modelAllowance(events, { ...policy, budgetMode: "strict", maxTotalTokens: 100 }), /budget exhausted/);
   assert.throws(() => modelAllowance([{ type: "intake_analysis_failed", detail: {} }], policy), /unmeasured/);
+});
+
+test("interrupted requests retain measured usage and mark legacy partial totals as unknown", () => {
+  const telemetry = { tokens: { input: 10, output: 5, cacheRead: 3, cacheWrite: 2 }, durationMs: 180000,
+    assistantMessages: 2, promptBytes: 100, toolCalls: 3, modelSwitches: [], pricingKnown: true,
+    unmeasuredRequests: 0, requestTimings: [{ status: "completed" }, { status: "completed" }, { status: "timed_out" }] };
+  const event = { type: "plan_attempt_failed", detail: { modelRun: true, error: "timeout", costUsd: .1, telemetry } };
+  assert.deepEqual(executionUsage([event]), { calls: 2, totalTokens: 20, modelMs: 180000, unmeasuredCalls: 1, unmeasuredDuration: false });
+  assert.throws(() => modelAllowance([event], { ...policy, budgetMode: "strict" }), /unmeasured/);
+  const allowance = modelAllowance([event], { ...policy, budgetMode: "adaptive" });
+  assert.equal(allowance.maxMs, policy.maxModelMs - 180000);
+  assert.equal(allowance.budget.unmeasuredCalls, 1);
+  assert.throws(() => modelAllowance([event], { ...policy, budgetMode: "adaptive", maxModelMs: 180000 }), /budget exhausted/);
+  assert.throws(() => modelAllowance([{ ...event, detail: { ...event.detail, telemetry: { ...telemetry, durationMs: undefined } } }],
+    { ...policy, budgetMode: "adaptive" }), /unmeasured/);
+  const report = taskObservability({ meta: { id: "partial", state: "contract_confirmed" }, events: [event] });
+  assert.equal(report.summary.tokens.input.total, 10);
+  assert.equal(report.summary.unmeasuredAttempts, 1);
+  assert.equal(report.summary.providerRequests, null);
+  assert.equal(report.summary.costUsd, null);
+  assert.equal(report.summary.knownCostUsd, .1);
+});
+
+test("explicit time extensions retain historical consumption and do not waive strict token limits", () => {
+  const telemetry = { tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 }, durationMs: 100000, assistantMessages: 1 };
+  const events = [{ type: "plan_attempt_failed", detail: { telemetry } }];
+  const limit = { ...policy, maxModelMs: 100000 };
+  assert.throws(() => modelAllowance(events, limit), /budget exhausted/);
+  events.push({ type: "execution_budget_extended", detail: { additionalModelMs: 60000 } });
+  assert.equal(modelAllowance(events, limit).maxMs, 60000);
+  assert.equal(executionUsage(events).modelMs, 100000);
+  assert.throws(() => modelAllowance(events, { ...limit, budgetMode: "strict", maxTotalTokens: 15 }), /budget exhausted/);
+  events.at(-1).detail.additionalModelMs = 3600001;
+  assert.throws(() => modelAllowance(events, limit), /explicit duration/);
 });
 
 test("first verification rate uses concluded first outcomes without retry inflation", () => {

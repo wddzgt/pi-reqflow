@@ -34,35 +34,61 @@ function input(setup, key = "test-secret-opaque") {
 test("settings preserve inheritance, encrypt credentials and never return secret material", async t => {
   const root = await fixture(t); const setup = await readModelSettings(root); const body = input(setup);
   const originalBaseline = await readProjectBaseline(await loadProject(root));
-  body.agents.plan = { ...body.default, model: "glm-5.3", apiKey: "another-plan-secret", thinking: "low",
+  body.agents.development = { ...body.default, model: "glm-5.3", apiKey: "another-plan-secret", thinking: "low",
     modelParameters: { outputFormat: "json_object", topP: 0.8 }, maxPiMs: 90000 };
   const saved = await configureModels(root, "admin", body); const project = await loadProject(root);
-  assert.equal(saved.default.credentialConfigured, true); assert.equal(saved.agents.intake, null);
+  assert.equal(saved.default.credentialConfigured, true); assert.equal(saved.agents.requirement, null);
   assert.equal(resolveAgentModel(project.config, "intake").selectionSource, "project");
   assert.equal(resolveAgentModel(project.config, "plan").model, "glm-5.3");
   assert.equal(resolveAgentModel(project.config, "plan").maxPiMs, 90000);
   assert.equal(project.config.modelFallbacks, undefined);
   assert.equal(await readModelCredential(project.archive, project.config.compatibleProviders[0].credentialId), body.default.apiKey);
   const returned = JSON.stringify(saved); const configured = JSON.stringify(project.config);
-  for (const secret of [body.default.apiKey, body.agents.plan.apiKey]) { assert.ok(!returned.includes(secret)); assert.ok(!configured.includes(secret)); }
+  for (const secret of [body.default.apiKey, body.agents.development.apiKey]) { assert.ok(!returned.includes(secret)); assert.ok(!configured.includes(secret)); }
   const credentials = path.join(project.archive, "model-credentials");
   for (const file of await fs.readdir(credentials)) assert.ok(!(await fs.readFile(path.join(credentials, file), "utf8")).includes("secret"));
   const next = input(saved, ""); next.default = { ...saved.default, apiKey: "" }; delete next.default.credentialConfigured;
   const restored = await configureModels(root, "admin", next);
-  assert.equal(restored.agents.plan, null);
+  assert.equal(restored.agents.development, null);
   await assert.rejects(configureModels(root, "admin", body), /已改变/);
   const changedHost = input(restored, ""); changedHost.default.baseUrl = "https://other.example/v1";
   await assert.rejects(configureModels(root, "admin", changedHost), /变更服务地址/);
-  const pinned = input(restored, ""); pinned.agents.plan = { ...pinned.default };
+  const pinned = input(restored, ""); pinned.agents.development = { ...pinned.default };
   const pinnedSettings = await configureModels(root, "admin", pinned);
-  assert.equal(pinnedSettings.agents.plan.model, pinnedSettings.default.model);
+  assert.equal(pinnedSettings.agents.development.model, pinnedSettings.default.model);
   const changedDefault = input(pinnedSettings, ""); changedDefault.default.model = "glm-5.3";
-  changedDefault.agents.plan = { ...pinnedSettings.agents.plan, apiKey: "" };
-  delete changedDefault.agents.plan.credentialConfigured;
+  changedDefault.agents.development = { ...pinnedSettings.agents.development, apiKey: "" };
+  delete changedDefault.agents.development.credentialConfigured;
   const changedSettings = await configureModels(root, "admin", changedDefault);
   assert.equal(changedSettings.default.model, "glm-5.3");
-  assert.equal(changedSettings.agents.plan.model, "qwen3.8-27b");
+  assert.equal(changedSettings.agents.development.model, "qwen3.8-27b");
   assert.equal((await readProjectBaseline(await loadProject(root))).snapshotHash, originalBaseline.snapshotHash);
+});
+
+test("all three agents resolve independent models and can return to live default inheritance", async t => {
+  const root = await fixture(t); const body = input(await readModelSettings(root));
+  for (const agent of modelAgents) body.agents[agent] = { ...body.default, model: `independent-${agent}`, apiKey: "" };
+  const saved = await configureModels(root, "admin", body);
+  let project = await loadProject(root);
+  for (const agent of modelAgents) {
+    const selection = resolveAgentModel(project.config, { requirement: "intake", development: "plan", review: "review" }[agent],
+      agent === "review" ? "all" : null);
+    assert.equal(selection.model, `independent-${agent}`);
+    assert.equal(selection.selectionSource, "agent");
+  }
+  const next = input(saved, ""); next.default.model = "new-project-default";
+  for (const agent of modelAgents) {
+    const { credentialConfigured, ...profile } = saved.agents[agent];
+    next.agents[agent] = { ...profile, apiKey: "" };
+  }
+  next.agents.development = null;
+  await configureModels(root, "admin", next);
+  project = await loadProject(root);
+  assert.equal(resolveAgentModel(project.config, "implement").model, "new-project-default");
+  assert.equal(resolveAgentModel(project.config, "implement").selectionSource, "project");
+  assert.equal(resolveAgentModel(project.config, "plan").model, "new-project-default");
+  assert.equal(resolveAgentModel(project.config, "initialize").model, "new-project-default");
+  assert.equal(resolveAgentModel(project.config, "intake").model, "independent-requirement");
 });
 
 test("connection test uses one short request, keeps unsaved keys private and reports quota explicitly", async t => {
@@ -99,7 +125,7 @@ test("execution bindings ignore model controls but retain source, permissions an
   const root = await fixture(t); const { config } = await loadProject(root);
   const expected = describePolicy(config).executionConfigHash;
   const models = { ...config, model: "another-model", thinking: "high", modelParameters: { temperature: 0.8 },
-    agentModels: { implement: { provider: "separate", model: "coding" } },
+    agentModels: { development: { provider: "separate", model: "coding" } },
     maxPiMs: config.maxPiMs + 1, maxToolCalls: config.maxToolCalls + 1, maxCostUsd: config.maxCostUsd + 1,
     modelUsage: { ...config.modelUsage, maxRequests: config.modelUsage.maxRequests + 1 } };
   assert.equal(describePolicy(models).executionConfigHash, expected);

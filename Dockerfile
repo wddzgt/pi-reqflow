@@ -3,7 +3,7 @@ FROM ${NODE_IMAGE}
 ARG PI_VERSION=0.87.1
 ARG APP_UID=1000
 ARG APP_GID=1000
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates ripgrep \
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates ripgrep fd-find \
     && rm -rf /var/lib/apt/lists/*
 RUN npm install --global @earendil-works/pi-coding-agent@${PI_VERSION} \
     && npm cache clean --force

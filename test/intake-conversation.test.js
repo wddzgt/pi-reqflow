@@ -372,7 +372,7 @@ test("web discussion accepts image messages, enforces ownership and exposes audi
 });
 
 test("real Pi sends image content to a vision provider and blocks text-only model selection", {
-  skip: !process.env.REQFLOW_REAL_PI, timeout: 60000,
+  skip: !process.env.REQFLOW_TEST_PI, timeout: 60000,
 }, async (t) => {
   const requests = [];
   const api = createServer(async (req, res) => {
@@ -399,7 +399,7 @@ test("real Pi sends image content to a vision provider and blocks text-only mode
     contextWindow: 128000, maxTokens: 2048, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }));
   await fs.writeFile(path.join(stateDir, "models.json"), JSON.stringify({ providers: { "local-fixture": {
     api: "openai-completions", baseUrl: `http://127.0.0.1:${api.address().port}/v1`, apiKey: "fixture-only", models } } }));
-  const { root, project } = await fixture(t, { piExecutable: process.env.REQFLOW_REAL_PI, provider: "local-fixture", model: "vision",
+  const { root, project } = await fixture(t, { piExecutable: process.env.REQFLOW_TEST_PI, provider: "local-fixture", model: "vision",
     environment: { pi: ["PI_CODING_AGENT_DIR"], checks: [], localDeployment: [] } }, true);
   await createRequirement(root, product, { id: "REQ-CHAT", title: "Image", request: "扩展计算器", images: [image] });
   assert.equal((await action(root, { action: "analyze-intake" })).state, "intake_clarifying");

@@ -1,7 +1,29 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { sha256 } from "../src/files.js";
-import { planAnalysisInput } from "../src/plan-analysis.js";
+import { planAnalysisInput, planSpecialists } from "../src/plan-analysis.js";
+
+test("risk-based review distinguishes ordinary coupling from data and external effects", () => {
+  const analysis = { domains: ["frontend", "backend"],
+    impacts: Object.fromEntries(["existingBehavior", "interfaces", "data"].map(key => [key, { status: "none" }])),
+    boundaries: { externalEffects: { status: "none" } } };
+  assert.deepEqual(planSpecialists(analysis, "full"), ["all"]);
+  assert.deepEqual(planSpecialists(analysis, "risk-based"), []);
+  analysis.impacts.interfaces.status = "changed";
+  analysis.impacts.existingBehavior.status = "changed";
+  assert.deepEqual(planSpecialists(analysis, "risk-based"), []);
+  for (const status of ["changed", "unknown"]) {
+    analysis.impacts.data.status = status;
+    assert.deepEqual(planSpecialists(analysis, "risk-based"), ["all"]);
+  }
+  analysis.impacts.data.status = "none";
+  for (const status of ["reversible", "irreversible", "unknown"]) {
+    analysis.boundaries.externalEffects.status = status;
+    assert.deepEqual(planSpecialists(analysis, "risk-based"), ["all"]);
+  }
+  assert.throws(() => planSpecialists(analysis, "skip-everything"), /Invalid plan review policy/);
+  assert.throws(() => planSpecialists(analysis), /Invalid plan review policy/);
+});
 
 test("plan validation identifies an oversized description instead of blaming file order", () => {
   const contract = { objective: "Add a names-only listing", acceptance: [{ id: "AC1", text: "Names only" }] };
@@ -10,6 +32,7 @@ test("plan validation identifies an oversized description instead of blaming fil
     affectedFiles: ["src/cli.py", "tests/test_cli.py"], domains: ["backend"],
     impacts: Object.fromEntries(["existingBehavior", "interfaces", "data"].map(key => [key, { status: "none", evidence: "Existing behavior preserved" }])),
     verification: [{ acceptanceId: "AC1", scenario: "Names only", regression: "Original list output unchanged" }], openQuestions: [],
+    validation: { checks: [], skipped: [], manualReason: "按场景执行 CLI 断言", startup: [] },
     changes: [{ file: "src/cli.py", description: "Add a flag" }, { file: "tests/test_cli.py", description: "x".repeat(525) }],
     boundaries: { modules: [{ name: "CLI", files: ["src/cli.py", "tests/test_cli.py"], evidence: "One CLI command" }],
       deliveryUnits: [{ name: "CLI", evidence: "One application" }], designStages: 1, estimatedChangedLines: 40,

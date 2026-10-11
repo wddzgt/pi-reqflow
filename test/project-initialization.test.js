@@ -9,6 +9,9 @@ import { loadProject } from "../src/config.js";
 import { baselineAgentContext, readProjectBaseline, refreshProjectBaseline } from "../src/baseline.js";
 import { initializeProjectContext } from "../src/project-initialization.js";
 import { saveModelCredential } from "../src/model-credentials.js";
+import { sha256 } from "../src/files.js";
+import { setTimeout as delay } from "node:timers/promises";
+import { controlledExecution, pauseExecution } from "../src/action-progress.js";
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 async function fixture(t, mode = "success") {
@@ -59,11 +62,45 @@ console.log(JSON.stringify({type:'agent_settled'}));`}
   return { root, configFile, counter };
 }
 
+test("project document generation can pause with an audited attempt and then continue", async t => {
+  const { root, configFile } = await fixture(t);
+  const config = JSON.parse(await fs.readFile(configFile, "utf8"));
+  const marker = path.join(path.dirname(configFile), "pause"), entered = `${marker}-entered`;
+  const original = await fs.readFile(config.piExecutable, "utf8");
+  await fs.writeFile(config.piExecutable, `${original}\n`);
+  await initialize(root, configFile, { inventoryOnly: true });
+  await fs.writeFile(config.piExecutable, original.replace("assert.equal(process.env.REQFLOW_PHASE, 'initialize');",
+    `assert.equal(process.env.REQFLOW_PHASE,'initialize');
+     if((await fs.readdir(${JSON.stringify(path.dirname(marker))})).includes('pause')) {
+       await fs.writeFile(${JSON.stringify(entered)},'ready');await new Promise(()=>setInterval(()=>{},1000));
+     }`));
+  await fs.writeFile(marker, "block");
+  const project = await loadProject(root), baseline = await readProjectBaseline(project);
+  const key = path.join(project.archive, "initialization");
+  const running = controlledExecution(key, "initialize", "admin", () => initializeProjectContext(project, baseline));
+  const rejected = assert.rejects(running, { code: "EXECUTION_PAUSED" });
+  const deadline = Date.now() + 5000;
+  while (!(await fs.readdir(path.dirname(marker))).includes(path.basename(entered)) && Date.now() < deadline) await delay(20);
+  assert.equal(await fs.readFile(entered, "utf8"), "ready");
+  pauseExecution(key, "admin"); await rejected;
+  const attempts = path.join(project.archive, "initialization/attempts");
+  const ids = await fs.readdir(attempts);
+  assert.equal(JSON.parse(await fs.readFile(path.join(attempts, ids[0], "attempt.json"), "utf8")).status, "paused");
+  await fs.unlink(marker);
+  const completed = await controlledExecution(key, "initialize", "admin", () => initializeProjectContext(project, baseline));
+  assert.match(completed.documents["agent.md"], /Project context/);
+  assert.equal((await fs.readdir(attempts)).length, 2);
+  await assert.rejects(fs.access(path.join(project.archive, "initialization.lock")), { code: "ENOENT" });
+});
+
 test("automatic initialization preserves project rules, skips commands and reuses verified guides", async (t) => {
   const { root, configFile, counter } = await fixture(t);
   const initialized = await initialize(root, configFile);
   assert.equal(initialized.documentation.mode, "agent");
   assert.match(await fs.readFile(initialized.documentation.developerFile, "utf8"), /项目开发指南/);
+  assert.equal(path.basename(initialized.documentation.agentFile), "agent.md");
+  assert.match(await fs.readFile(initialized.documentation.agentFile, "utf8"), /Project context/);
+  await assert.rejects(fs.stat(path.join(initialized.archive, "CLAUDE.md")), { code: "ENOENT" });
   assert.equal(await fs.readFile(path.join(root, "AGENTS.md"), "utf8"), "Preserve existing API behavior.\n");
   assert.equal(await fs.readFile(path.join(root, "CLAUDE.md"), "utf8"), "@AGENTS.md\n");
   const project = await loadProject(root);
@@ -78,10 +115,33 @@ test("automatic initialization preserves project rules, skips commands and reuse
   const metadata = JSON.parse(await fs.readFile(path.join(project.archive, "initialization.json"), "utf8"));
   assert.equal(metadata.telemetry.phase, "initialize");
   assert.equal(path.isAbsolute(metadata.telemetry.logFile), false);
-  await fs.appendFile(path.join(project.archive, metadata.documents["AGENTS.md"].file), "changed");
+  await fs.appendFile(path.join(project.archive, metadata.documents["agent.md"].file), "changed");
   await assert.rejects(baselineAgentContext(project, baseline), /Initialization guide changed/);
   await assert.rejects(initializeProjectContext(project, baseline), /Initialization guide changed/);
   assert.equal(await fs.readFile(counter, "utf8"), "call\n");
+});
+
+test("legacy generated documents migrate to agent.md without another model call", async t => {
+  const { root, configFile, counter } = await fixture(t);
+  await initialize(root, configFile);
+  const project = await loadProject(root);
+  const baseline = await readProjectBaseline(project);
+  const metadataFile = path.join(project.archive, "initialization.json");
+  const metadata = JSON.parse(await fs.readFile(metadataFile, "utf8"));
+  metadata.documents["AGENTS.md"] = metadata.documents["agent.md"];
+  delete metadata.documents["agent.md"];
+  const file = "initialization/generated/legacy-claude.md";
+  const content = "@AGENTS.md\n";
+  await fs.writeFile(path.join(project.archive, file), content);
+  metadata.documents["CLAUDE.md"] = { file, hash: sha256(content) };
+  await fs.writeFile(metadataFile, JSON.stringify(metadata));
+  const migrated = await initializeProjectContext(project, baseline);
+  assert.deepEqual(Object.keys(migrated.documents).sort(), ["PROJECT_REFERENCE.md", "agent.md"]);
+  assert.match(migrated.documents["agent.md"], /Project context/);
+  assert.equal(await fs.readFile(counter, "utf8"), "call\n");
+  assert.equal(await fs.readFile(path.join(root, "CLAUDE.md"), "utf8"), "@AGENTS.md\n");
+  await fs.appendFile(path.join(project.archive, migrated.metadata.documents["agent.md"].file), "tampered");
+  await assert.rejects(initializeProjectContext(project, baseline), /Initialization guide changed/);
 });
 
 test("focused context preserves applicable directory rules and rejects changed rule text", async t => {
@@ -89,6 +149,7 @@ test("focused context preserves applicable directory rules and rejects changed r
   await fs.mkdir(path.join(root, "src/features"), { recursive: true });
   await fs.mkdir(path.join(root, "docs"));
   await fs.writeFile(path.join(root, "src/features/AGENTS.override.md"), "Preserve feature data formats.\n");
+  await fs.writeFile(path.join(root, "src/features/agent.md"), "Preserve task-specific interfaces.\n");
   await fs.writeFile(path.join(root, "src/features/task.py"), "value = 1\n");
   await fs.writeFile(path.join(root, "docs/CLAUDE.md"), "Documentation conventions.\n");
   await initialize(root, configFile);
@@ -98,8 +159,9 @@ test("focused context preserves applicable directory rules and rejects changed r
   assert.deepEqual(full.projectRules.map(rule => rule.file).sort(), ["AGENTS.md", "CLAUDE.md"]);
   assert.ok(full.ruleFiles.includes("docs/CLAUDE.md"));
   const focused = JSON.parse(await baselineAgentContext(project, baseline, ["src/features/task.py"]));
-  assert.deepEqual(focused.projectRules.map(rule => rule.file).sort(), ["AGENTS.md", "CLAUDE.md", "src/features/AGENTS.override.md"]);
-  assert.equal(focused.projectRules.at(-1).text, "Preserve feature data formats.\n");
+  assert.deepEqual(focused.projectRules.map(rule => rule.file).sort(), ["AGENTS.md", "CLAUDE.md", "src/features/AGENTS.override.md", "src/features/agent.md"]);
+  assert.equal(focused.projectRules.find(rule => rule.file === "src/features/AGENTS.override.md").text, "Preserve feature data formats.\n");
+  assert.equal(focused.projectRules.find(rule => rule.file === "src/features/agent.md").text, "Preserve task-specific interfaces.\n");
   await fs.writeFile(path.join(root, "src/features/AGENTS.override.md"), "Changed policy.\n");
   await assert.rejects(baselineAgentContext(project, baseline, ["src/features/task.py"]), /Project rule source changed/);
 });

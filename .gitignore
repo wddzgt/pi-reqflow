@@ -20,6 +20,7 @@ node_modules/
 /.codex/
 /.agents/
 /.claude/
+/AGENTS.md
 /config.demo.json
 /config.local.json
 /config.*.local.json

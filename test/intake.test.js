@@ -142,8 +142,7 @@ test("approved contract is hashed and changes block planning", async (t) => {
 test("Pi roles independently review one contract before planning", async (t) => {
   const { root, project } = await fixture(t);
   await fs.writeFile(path.join(project.archive, "config.json"), JSON.stringify({ ...project.config,
-    agentModels: { backendReview: { provider: "review-provider", model: "backend-large" },
-      qaReview: { provider: "qa-provider", model: "qa-medium" } } }));
+    agentModels: { review: { provider: "review-provider", model: "review-large" } } }));
   await refreshProjectBaseline(await loadProject(root));
   await recordDevFeedback(root, "REQ-001", "reviewer", { summary: "Check implementation and regression",
     questions: [], requiredRoles: ["backend", "qa"] });
@@ -166,9 +165,9 @@ test("Pi roles independently review one contract before planning", async (t) => 
   assert.equal(observed.summary.tokens.input.total, 240);
   assert.equal(observed.summary.tokens.cacheRead.total, 20);
   assert.equal(observed.summary.costUsd, 0.14);
-  assert.equal(observed.runs[0].telemetry.model, "backend-large");
-  assert.equal(observed.runs[1].telemetry.model, "qa-medium");
-  assert.equal(observed.runs[0].telemetry.agent, "backendReview");
+  assert.equal(observed.runs[0].telemetry.model, "review-large");
+  assert.equal(observed.runs[1].telemetry.model, "review-large");
+  assert.equal(observed.runs[0].telemetry.agent, "review");
   assert.notEqual(observed.runs[0].traceId, observed.runs[1].traceId);
   await assert.rejects(getTaskObservability(root, { id: "outsider", roles: ["developer"] }, "REQ-001"),
     /cannot read this requirement/);

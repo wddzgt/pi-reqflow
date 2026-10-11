@@ -6,7 +6,7 @@ export function bailianModelPreset(apiKeyEnv = "DASHSCOPE_API_KEY") {
     agentModels: {},
     compatibleProviders: [{ name: "reqflow-bailian", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
       apiKeyEnv, thinkingToggle: true, models: models.map(id => ({ id, input: ["text"],
-        reasoning: true, supportsReasoningEffort: id === "glm-5.3", supportsJsonSchema: id === models[0], contextWindow: 65536,
+        reasoning: true, supportsReasoningEffort: ["glm-5.3", "qwen3.8-2.4t-a95b"].includes(id), supportsJsonSchema: id === models[0], contextWindow: 65536,
         maxTokens: ["glm-5.3", "qwen3.8-2.4t-a95b"].includes(id) ? 16384 : 8192 })) }],
   };
 }

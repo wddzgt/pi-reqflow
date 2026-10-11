@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { assertExecutionActive } from "./action-progress.js";
 import { allowedFile, loadProject } from "./config.js";
 import { manifestHash, sha256 } from "./files.js";
 import { readPlanAnalysis } from "./plan-analysis.js";
@@ -86,6 +87,7 @@ export async function runFastPath(projectPath, id, initiator) {
   try {
     let eligibilityChecked = false;
     for (let step = 0; step < 12; step++) {
+      assertExecutionActive();
       const { meta, directory } = await readTask(project, id);
       if (meta.state === "test_deployed") return { id, state: meta.state, next: "human-test-acceptance" };
       if (!["contract_confirmed", "role_review", "review_passed", "plan_review", "approved",
@@ -121,6 +123,7 @@ export async function runFastPath(projectPath, id, initiator) {
     }
     throw new Error("Fast path exceeded its stage limit");
   } catch (error) {
+    assertExecutionActive();
     const { meta } = await readTask(project, id);
     await withLock(path.join(taskPath(project, id), "task.lock"), async () => {
       const current = await readTask(project, id);

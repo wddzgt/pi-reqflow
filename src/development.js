@@ -3,7 +3,7 @@ import { describePolicy, loadProject } from "./config.js";
 import { appendEvent, readTask, taskPath, withLock } from "./store.js";
 import { readPlanAnalysis } from "./plan-analysis.js";
 import { implement, plan, resumeImplementation, verify } from "./workflow.js";
-import { reportProgress } from "./action-progress.js";
+import { reportProgress, assertExecutionActive } from "./action-progress.js";
 
 export async function develop(projectPath, id, actor, authorizeImplementation, expected = {}) {
   if (authorizeImplementation !== true) throw new Error("Develop requires explicit authorization for isolated implementation");
@@ -27,6 +27,7 @@ export async function develop(projectPath, id, actor, authorizeImplementation, e
     let automaticRetries = 0;
     let pendingFailure = null;
     for (let step = 0; step < 9; step++) {
+      assertExecutionActive();
       const { meta, directory, events } = await readTask(project, id);
       if (["implementation_failed", "verification_failed"].includes(meta.state)) {
         const failure = events.findLast(event => event.type === meta.state);
@@ -47,7 +48,7 @@ export async function develop(projectPath, id, actor, authorizeImplementation, e
             reportProgress(automatic ? "已保留本轮现场，正在自动继续或修复；本次最多自动恢复一次。" : "正在从已保存的代码和上下文继续执行。", "", "resuming");
             pendingFailure = null;
             continue;
-          } catch (error) { reason = error.message; }
+          } catch (error) { assertExecutionActive(); reason = error.message; }
         }
         await withLock(path.join(taskPath(project, id), "task.lock"), async () => {
           const current = await readTask(project, id);
@@ -69,6 +70,7 @@ export async function develop(projectPath, id, actor, authorizeImplementation, e
         }
         try { await implement(projectPath, id); }
         catch (error) {
+          assertExecutionActive();
           if ((await readTask(project, id)).meta.state !== "implementation_failed") throw error;
           pendingFailure = error;
         }
@@ -76,6 +78,7 @@ export async function develop(projectPath, id, actor, authorizeImplementation, e
       else if (meta.state === "implemented") {
         try { await verify(projectPath, id); }
         catch (error) {
+          assertExecutionActive();
           if ((await readTask(project, id)).meta.state !== "verification_failed") throw error;
           pendingFailure = error;
         }

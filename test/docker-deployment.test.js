@@ -12,6 +12,20 @@ import { promisify } from "node:util";
 const exec = promisify(execFile);
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
+async function validationPortRange() {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const first = 20000 + randomBytes(2).readUInt16BE(0) % 20000;
+    const sockets = Array.from({ length: 5 }, () => createServer());
+    try {
+      for (const [index, socket] of sockets.entries())
+        await new Promise((resolve, reject) => { socket.once("error", reject); socket.listen(first + index, "127.0.0.1", resolve); });
+      return `${first}-${first + 4}`;
+    } catch (error) { if (error.code !== "EADDRINUSE") throw error; }
+    finally { await Promise.all(sockets.filter(socket => socket.listening).map(socket => new Promise(resolve => socket.close(resolve)))); }
+  }
+  throw new Error("No free contiguous validation port range for Docker fixture");
+}
+
 test("default Compose provisions a demo and administrator before importing user projects", {
   skip: !process.env.REQFLOW_DOCKER_DEPLOYMENT_TEST, timeout: 90000,
 }, async t => {
@@ -27,7 +41,7 @@ test("default Compose provisions a demo and administrator before importing user 
   const origin = `http://localhost:${port}`;
   const name = `reqflow-onboarding-${randomUUID().slice(0, 8)}`;
   const env = { ...process.env, REQFLOW_PROJECT_DIR: project, REQFLOW_PORT: String(port),
-    REQFLOW_PUBLIC_ORIGIN: origin, REQFLOW_UID: "1000", REQFLOW_GID: "1000" };
+    REQFLOW_PUBLIC_ORIGIN: origin, REQFLOW_LOCAL_PORT_RANGE: await validationPortRange(), REQFLOW_UID: "1000", REQFLOW_GID: "1000" };
   delete env.REQFLOW_CONFIG_FILE;
   const compose = (...args) => exec("docker", ["compose", "-p", name, "-f", path.join(repository, "compose.yaml"), ...args],
     { cwd: repository, env, timeout: 45000, maxBuffer: 1024 * 1024 });
@@ -37,6 +51,22 @@ test("default Compose provisions a demo and administrator before importing user 
   });
   await compose("up", "-d", "--no-build", "--wait", "--wait-timeout", "30");
   assert.equal((await fetch(`${origin}/healthz`)).status, 200);
+  await compose("exec", "-d", "reqflow", "node", "--input-type=module", "-e", `
+import {promises as fs} from 'node:fs';
+import {startLocalRuntime,stopAllLocalRuntimes,localRuntimePorts} from '/opt/reqflow/src/local-runtime.js';
+const directory=await fs.mkdtemp('/tmp/local-runtime-');
+const port=localRuntimePorts[0];
+await startLocalRuntime(directory,directory,[{name:'fixture',url:'http://127.0.0.1:'+port+'/',
+command:[process.execPath,'-e',"require('node:http').createServer((req,res)=>res.end('container local validation')).listen("+port+",'0.0.0.0')"]}],directory,[]);
+process.on('SIGTERM',async()=>{await stopAllLocalRuntimes();process.exit(0)});`);
+  let localReady = false;
+  for (let attempt = 0; attempt < 30 && !localReady; attempt++) {
+    const result = await fetch(`http://127.0.0.1:${env.REQFLOW_LOCAL_PORT_RANGE.split("-")[0]}/`, { signal: AbortSignal.timeout(500) })
+      .then(response => response.text(), error => { if (error.name !== "TypeError") throw error; return error.message; });
+    localReady = result === "container local validation";
+    if (!localReady) await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.equal(localReady, true, "Local project must be reachable through Compose's mapped validation port");
   assert.equal((await fetch(`${origin}/api/bootstrap`)).status, 401);
   const login = await fetch(`${origin}/api/login`, { method: "POST", headers: { Origin: origin, "Content-Type": "application/json" },
     body: JSON.stringify({ username: "admin", password: "admin123" }) });
@@ -86,7 +116,8 @@ test("Compose starts a restricted service with persistent audit, workspaces and 
   const name = `reqflow-smoke-${randomUUID().slice(0, 8)}`;
   const token = randomBytes(32).toString("hex");
   const env = { ...process.env, REQFLOW_PROJECT_DIR: project, REQFLOW_CONFIG_FILE: configFile,
-    REQFLOW_PORT: String(port), REQFLOW_PUBLIC_ORIGIN: origin, REQFLOW_UID: "1000", REQFLOW_GID: "1000", SMOKE_TOKEN: token, SMOKE_PASSWORD: randomBytes(24).toString("hex") };
+    REQFLOW_PORT: String(port), REQFLOW_PUBLIC_ORIGIN: origin, REQFLOW_LOCAL_PORT_RANGE: await validationPortRange(),
+    REQFLOW_UID: "1000", REQFLOW_GID: "1000", SMOKE_TOKEN: token, SMOKE_PASSWORD: randomBytes(24).toString("hex") };
   const compose = (...args) => exec("docker", ["compose", "-p", name, "-f", path.join(repository, "compose.yaml"),
     "-f", path.join(repository, "compose.project.yaml"), ...args],
     { cwd: repository, env, timeout: 45000, maxBuffer: 1024 * 1024 });

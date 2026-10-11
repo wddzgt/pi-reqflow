@@ -9,6 +9,9 @@ import { runGit, inspectGit } from "./git-project.js";
 import { inspectChanges, publishedRevision, workspacePath } from "./workspace.js";
 import { approveChanges, deployTest, pollTestDeployment, recordPublished, verify } from "./workflow.js";
 import { runCommand } from "./commands.js";
+import { readPlanAnalysis } from "./plan-analysis.js";
+import { localRuntimePorts, startLocalRuntime, stopLocalRuntime } from "./local-runtime.js";
+import { reportProgress } from "./action-progress.js";
 
 export async function readGitSetup(projectPath) {
   const project = await loadProject(projectPath);
@@ -36,25 +39,19 @@ export async function localValidation(projectPath, id, actor, input) {
     const { meta, directory, events } = await readTask(project, id);
     if (meta.assignments?.developer?.userId !== actor || meta.assignments.developer.status !== "accepted") throw new Error("本地验证需要负责研发操作。");
     const preparing = input.stage === "development";
-    if (preparing && input.environment !== undefined) throw new Error("开发准备仅用于读取检查配置，本地启动设置在开发测试完成后保存。");
+    if (input.environment !== undefined) throw new Error("启动方式由已确认方案确定，不接受手填命令或地址。");
     if (preparing && (!["plan_review", "approved"].includes(meta.state) || input.expectedPlanHash !== meta.planHash))
       throw new Error("请刷新当前方案后准备开发检查。");
     if (!preparing) await assertReviewedWorkspace(project, meta, input);
     const workspace = preparing ? events.findLast(event => event.type === "plan_created").detail.planningWorkspace : meta.workspace;
     if (preparing && manifestHash(await manifest(workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== meta.baseHash)
       throw new Error("方案基础代码已改变，请重新核对方案。");
-    if (input.environment !== undefined) {
-      const value = input.environment;
-      if (!value || typeof value !== "object" || Array.isArray(value)
-          || Object.keys(value).some(key => !["instructions", "url"].includes(key))
-          || typeof value.instructions !== "string" || value.instructions.length > 8000
-          || typeof value.url !== "string" || value.url.length > 2000
-          || (!value.instructions.trim() && !value.url.trim())) throw new Error("请填写本地启动方式或测试地址，配置只保存到当前需求。");
-      if (value.url.trim()) {
-        const url = new URL(value.url.trim());
-        if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("本地测试地址应使用 HTTP/HTTPS，不能包含账号密码。");
-      }
-    }
+    const validation = (await readPlanAnalysis(meta, directory)).draft.validation;
+    if (!validation) throw new Error("当前方案缺少验证与启动约定，请重新生成研发方案；历史代码与日志仍保留。");
+    if (process.env.REQFLOW_LOCAL_RUNTIME_CONTAINER === "1" && validation.startup.some(service =>
+      !localRuntimePorts.includes(new URL(service.url).port)))
+      throw new Error(`Docker 本地启动方案必须使用已映射的 ${localRuntimePorts.join("、")} 端口，请修正研发方案。`);
+    if (preparing) return { id, planHash: meta.planHash, validation, checks: validation.checks.map(item => item.command), checksSource: "plan" };
     let patch = null;
     if (!preparing && project.config.mode === "git") {
       const report = JSON.parse(await fs.readFile(path.join(directory, "changes.json"), "utf8"));
@@ -70,38 +67,25 @@ export async function localValidation(projectPath, id, actor, input) {
         await fs.unlink(index);
       }
     }
-    const startupScripts = [];
-    const checkScripts = [];
-    const source = await manifest(workspace, project.config.excludedPaths, project.config.maxSnapshotBytes);
-    for (const file of Object.keys(source).filter(file => path.posix.basename(file) === "package.json")) {
-      if (source[file].bytes > 262144) throw new Error(`启动配置文件超过 256 KiB：${file}`);
-      const packageJson = JSON.parse(await fs.readFile(path.join(workspace, file), "utf8"));
-      if (!packageJson || typeof packageJson !== "object" || Array.isArray(packageJson)) throw new Error(`项目启动配置格式不正确：${file}`);
-      if (packageJson.scripts === undefined) continue;
-      if (!packageJson.scripts || typeof packageJson.scripts !== "object" || Array.isArray(packageJson.scripts)) throw new Error(`项目脚本配置格式不正确：${file}`);
-      for (const [name, command] of Object.entries(packageJson.scripts)) {
-        if (typeof command !== "string" || !command.trim()) throw new Error(`项目脚本无效：${file} 的 ${name}`);
-        if (/^(?:start|dev|serve)(?::[\w-]+)?$/.test(name)) startupScripts.push({ sourceFile: file,
-          directory: path.posix.dirname(file), command: quote(["npm", "run", name]) });
-        if (/^(?:test|check|lint|typecheck|build)(?::[\w-]+)?$/.test(name)) checkScripts.push({ sourceFile: file,
-          directory: path.posix.dirname(file),
-          kind: /^test(?::|$)/.test(name) ? "test" : "check", command: quote(["npm", "--prefix", path.posix.dirname(file), "run", name]),
-          ...(command.trim() === 'echo "Error: no test specified" && exit 1'
-            ? { unavailableReason: "npm 初始化占位脚本，项目尚未配置真实测试" } : {}) });
-      }
+    if (![undefined, "start", "stop"].includes(input.operation)) throw new Error("无效的本地服务操作。");
+    let runtime;
+    try {
+      reportProgress(input.operation === "stop" ? "正在停止本地环境。" : "正在按研发方案启动本地环境，等待服务地址就绪。", "", "local-validation");
+      runtime = input.operation === "stop" ? await stopLocalRuntime(directory)
+        : await startLocalRuntime(directory, workspace, validation.startup, directory, project.config.environment.localDeployment, project.config.maxPiMs);
+    } catch (error) {
+      await appendEvent(project, id, "local_validation_failed", { ...meta,
+        localValidation: { actor, afterHash: meta.afterHash, status: "failed", error: error.message, at: new Date().toISOString() } },
+        { actor, afterHash: meta.afterHash, error: error.message, services: error.runtime?.services ?? [] });
+      throw error;
     }
-    for (const file of Object.keys(source).filter(file => path.posix.basename(file) === "pom.xml"))
-      checkScripts.push({ sourceFile: file, directory: path.posix.dirname(file), kind: "test", command: quote(["mvn", "-f", file, "test"]) });
-    if (preparing) return { id, checks: meta.developmentChecks ?? project.config.checks, checkScripts,
-      planHash: meta.planHash, checksSource: meta.developmentChecks === undefined ? "project" : "developer" };
-    const environment = input.environment === undefined ? meta.localValidation?.environment : {
-      instructions: input.environment.instructions.trim(), url: input.environment.url.trim() };
+    const environment = { instructions: validation.startup.map(service => `${service.name}: ${quote(service.command)}`).join("\n")
+      || validation.manualReason || "按研发方案中的验收场景验证此 CLI/库。", url: validation.startup[0]?.url ?? "" };
     await appendEvent(project, id, "local_validation_requested", { ...meta, localValidation: { actor, afterHash: meta.afterHash,
-      ...(environment === undefined ? {} : { environment }), at: new Date().toISOString() } },
-    { actor, afterHash: meta.afterHash, patchHash: patch === null ? null : sha256(patch),
-      ...(input.environment === undefined ? {} : { environment }) });
+      environment, ...runtime, at: new Date().toISOString() } },
+      { actor, afterHash: meta.afterHash, patchHash: patch === null ? null : sha256(patch), environment, ...runtime });
     return { id, workspace: meta.workspace, branch: meta.branch, baseRevision: meta.baseRevision, baseHash: meta.baseHash,
-      afterHash: meta.afterHash, checks: meta.developmentChecks ?? project.config.checks, patch, startupScripts, environment: environment ?? null };
+      afterHash: meta.afterHash, checks: meta.developmentChecks, patch, validation, environment, ...runtime };
   });
 }
 
@@ -113,6 +97,7 @@ export async function recheckLocalChanges(projectPath, id, actor, input) {
       if (!["verified", "verification_failed"].includes(meta.state) || input.expectedAfterHash !== meta.afterHash
           || input.expectedPlanHash !== meta.planHash || describePolicy(project.config).executionConfigHash !== meta.configHash) throw new Error("请刷新当前待验证代码和方案。");
       if (meta.assignments?.developer?.userId !== actor || meta.assignments.developer.status !== "accepted") throw new Error("本地修改检查需要负责研发操作。");
+      await stopLocalRuntime(directory);
       if (project.config.mode === "git" && (await runGit(meta.workspace, ["branch", "--show-current"]) !== meta.branch
           || await runGit(meta.workspace, ["rev-parse", "HEAD"]) !== (meta.gitCommit?.revision ?? meta.branchStartRevision))) throw new Error("需求分支已有未纳入审核的提交，请由研发核对。");
       if (input.patch !== undefined) {
@@ -139,7 +124,7 @@ export async function recheckLocalChanges(projectPath, id, actor, input) {
       const inspected = await inspectChanges(project, id, meta.workspace);
       const next = { ...meta, state: inspected.violations.length ? "implementation_failed" : "implemented",
         afterHash: inspected.afterHash, changeCount: inspected.changes.length, changeApproval: null, publishedRevision: null,
-        testCandidate: null, gitCandidate: null, gitDeliveryError: null, localValidation: { ...meta.localValidation, actor, at: new Date().toISOString(), afterHash: inspected.afterHash }, updatedAt: new Date().toISOString() };
+        testCandidate: null, gitCandidate: null, gitDeliveryError: null, localValidation: null, updatedAt: new Date().toISOString() };
       await appendEvent(project, id, inspected.violations.length ? "implementation_failed" : "implemented", next,
         { actor, source: "local-validation", modelRun: false, changes: inspected.changes, violations: inspected.violations,
           error: inspected.violations.length ? `本地修改超出已确认范围：${inspected.violations.join("、")}` : null });
@@ -206,7 +191,7 @@ async function mergeForTest(project, id, actor, input) {
       if (changed.split("\n").filter(Boolean).some(file => !report.changes.some(change => change.file === file))) throw new Error("候选版本修改了本需求以外的文件，请研发核对。");
       const before = manifestHash(await manifest(candidate.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes));
       const checks = [];
-      for (const [index, command] of (meta.developmentChecks ?? project.config.checks).entries()) {
+      for (const [index, command] of (meta.developmentChecks).entries()) {
         const logFile = path.join(directory, `test-integration-${candidate.attempt}-check-${index + 1}-${randomUUID()}.log`);
         const result = await runCommand(command, candidate.workspace, project.config.maxPiMs, logFile,
           project.config.maxEventBytes, project.config.environment.checks, project.config.checkSandbox);

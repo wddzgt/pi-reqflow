@@ -7,8 +7,8 @@ const stages = {
   release: ["merge_verifying", "merge_verified", "merge_verification_failed", "release_approved", "release_submitting", "release_running", "release_outcome_unknown", "release_failed", "released"],
   closed: ["archived", "archived_test_only"],
 };
-const closedStates = new Set(["archived", "archived_test_only", "rolled_back"]);
-const humanStates = new Set(["intake_assigned", "intake_clarifying", "intake_ready", "intake_feedback", "assignment_pending", "plan_review", "verified", "test_deployed", "merge_verified", "released"]);
+const closedStates = new Set(["archived", "archived_test_only"]);
+const humanStates = new Set(["intake_assigned", "intake_clarifying", "intake_ready", "intake_feedback", "assignment_pending", "plan_review", "verified", "test_deployed", "merge_verified", "released", "rolled_back"]);
 const diagnosticTypes = new Set(["intake_analysis_started", "intake_message", "plan_analysis_started", "plan_draft_completed", "plan_correction_started", "plan_correction_completed", "plan_correction_reused", "plan_artifacts_prepared", "plan_specialist_completed", "pi_run_skipped", "fast_path_eligible", "test_deploy_running", "release_running"]);
 
 export function lifecycleStage(state) {
@@ -53,6 +53,8 @@ export function lifecycleStatus(meta, events, now) {
     boundary: ["execution_boundary_stopped", "plan_created", "implemented"],
   };
   for (const event of events) {
+    if (["workspace_rolled_back", "development_restarted"].includes(event.type)) failures.clear();
+    if (event.detail.executionOutcome === "paused") continue;
     if (event.type === "role_review_attempt_failed") failures.set(`review:${event.detail.role}`, event);
     if (event.type === "role_review_submitted") failures.delete(`review:${event.detail.role}`);
     if (event.type === "plan_specialist_failed") failures.set(`specialist:${event.detail.role}`, event);
@@ -75,7 +77,7 @@ export function lifecycleStatus(meta, events, now) {
   const unresolved = closed ? [] : [...failures.values()];
   const responsibility = lifecycleResponsibility(meta);
   return { stage: lifecycleStage(meta.state), closed,
-    waitingHuman: !closed && (humanStates.has(meta.state) || meta.executionBoundary?.length > 0 || (meta.state === "contract_confirmed" && responsibility.role === "product")),
+    waitingHuman: !closed && (last.type === "execution_paused" || humanStates.has(meta.state) || meta.executionBoundary?.length > 0 || (meta.state === "contract_confirmed" && responsibility.role === "product")),
     responsible: responsibility, stateSince: transition.at,
     stateAgeMs: Math.max(0, now - Date.parse(transition.at)),
     cycleMs: Math.max(0, Date.parse(closed ? transition.at : last.at) - Date.parse(events[0].at)),
@@ -88,7 +90,7 @@ export function lifecycleEvents(events) {
   return events.flatMap((event, sequence) => {
     if (diagnosticTypes.has(event.type)) return [];
     const detail = event.detail;
-    const outcome = event.type.endsWith("_outcome_unknown") ? "unknown"
+    const outcome = detail.executionOutcome === "paused" || event.type === "execution_paused" ? "paused" : event.type.endsWith("_outcome_unknown") ? "unknown"
       : event.type.endsWith("_failed") || event.type === "rollback_rejected" || detail.outcome === "failed" ? "failed"
       : ["role_review_blocked", "pi_budget_exhausted", "execution_boundary_stopped"].includes(event.type) || (event.type === "plan_created" && detail.blockers?.length) ? "blocked" : "recorded";
     const references = ["requestHash", "contractHash", "planHash", "feedbackHash", "reviewHash", "evidenceHash", "planResolutionHash"]
