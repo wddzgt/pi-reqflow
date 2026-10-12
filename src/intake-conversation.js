@@ -11,8 +11,7 @@ import { persistImages, readImage, validateImages } from "./intake-images.js";
 import { admissionPolicy, modelAllowance } from "./admission.js";
 
 const editableStates = ["intake_draft", "intake_clarifying", "intake_ready"];
-const maxMessages = 50;
-const intakePolicyVersion = 3;
+const intakePolicyVersion = 5;
 
 export function intakeDiscussion(task) {
   const messages = task.events.filter((event) => ["intake_draft", "intake_message", "intake_analysis_completed", "intake_analysis_failed"].includes(event.type))
@@ -39,7 +38,6 @@ export async function addIntakeMessage(projectPath, id, actor, input) {
     const knownImages = task.events.flatMap((event) => event.detail.attachments ?? []);
     if (!Array.isArray(withdrawn) || withdrawn.length > 12 || new Set(withdrawn).size !== withdrawn.length
         || withdrawn.some((imageId) => !knownImages.some((image) => image.id === imageId))) throw new Error("Withdrawn image IDs must belong to this requirement");
-    if (task.events.filter((event) => event.type === "intake_message").length >= maxMessages) throw new Error("Requirement discussion reached its 50-message limit");
     const attachments = await persistImages(directory, images);
     const next = { ...meta, state: "intake_clarifying", intakeRevision: meta.intakeRevision + 1,
       intakeAnalysisHash: null, reviewHashes: {}, reviewBaselineHash: null, reviewStandardsHash: null,
@@ -72,7 +70,6 @@ export function analysisInput(value, inputHash, sourceFiles) {
     if (value.questions.length) throw new Error("AI cannot declare agreement with unresolved questions");
     contractInput(value.contract, value, { sourceFiles });
     if (!value.contract.inScope.length) throw new Error("AI agreement must define a nonempty requirement scope");
-    if (Buffer.byteLength(JSON.stringify(value.contract)) > 16000) throw new Error("AI contract exceeds 16,000 bytes");
   } else if (!value.questions.length || value.contract !== null) {
     throw new Error("Clarification needs explicit questions and cannot freeze a speculative contract");
   }
@@ -89,7 +86,8 @@ async function analysisContext(project, task, baseline) {
   const recentMessages = humanMessages.filter(row => task.events.findIndex(event => event.hash === row.eventHash) > checkpointIndex);
   const history = [...recentMessages, ...(latest ? [latest] : [])]
     .sort((a, b) => task.events.findIndex((event) => event.hash === a.eventHash) - task.events.findIndex((event) => event.hash === b.eventHash))
-    .map((row) => row.type === "intake_message" ? { role: "product", text: row.text,
+    .map((row) => row.type === "intake_message" ? { role: "product", text: row.text.slice(0, 2000),
+      eventHash: row.eventHash, partial: row.text.length > 2000,
       images: row.attachments, withdrawnImageIds: row.withdrawnImageIds }
       : { role: "ai_developer", reply: row.analysis.reply, questions: row.analysis.questions,
          summary: row.analysis.summary, suggestions: row.analysis.suggestions });
@@ -103,7 +101,6 @@ async function analysisContext(project, task, baseline) {
   const context = JSON.stringify({ originalRequest: original, history, candidate, workingCandidate: checkpoint?.analysis.contract ?? null,
     earlierDiscussion: earlierMessages.map(row => ({ eventHash: row.eventHash, preview: row.text.slice(0, 60), partial: true })),
     note: "Working candidates and AI summaries are short-term unconfirmed understanding. Latest product decisions prevail. Read exact original messages by eventHash when omitted details or contradictions matter." });
-  if (Buffer.byteLength(context) > 64000) throw new Error("当前未解决的业务讨论超过上下文预算；请先整理明确的业务目标和仍需决定的问题，历史原文仍完整保留。");
   const images = discussion.messages.flatMap((row) => row.attachments ?? []).filter((image) => !discussion.withdrawnImageIds.includes(image.id));
   if (images.length > 12 || images.reduce((sum, image) => sum + image.bytes, 0) > 8 * 1024 * 1024) throw new Error("Requirement exceeds its 12-image / 8 MiB context budget");
   return { inputHash, context, candidate, images, guide: await baselineAgentContext(project, baseline, null, "index") };
@@ -127,10 +124,9 @@ export async function analyzeIntake(projectPath, id, actor) {
       await appendEvent(project, id, "intake_budget_exhausted", meta, { actor, error: error.message });
       throw error;
     }
-    const remaining = project.config.maxCostUsd - meta.reviewCostUsd - meta.intakeCostUsd;
+    const remaining = (project.config.maxCostUsd ?? Infinity) - meta.reviewCostUsd - meta.intakeCostUsd;
     if (remaining <= 0) throw new Error("Requirement cost budget exhausted before AI product alignment");
     const attempt = meta.intakeAnalysisAttempts + 1;
-    if (attempt > 50) throw new Error("Requirement reached its 50-analysis limit");
     const logFile = path.join(directory, `intake-attempt-${attempt}.events.jsonl`);
     const active = { ...meta, state: "intake_analyzing", intakeAnalysisAttempts: attempt,
       intakeAnalysisHash: null, updatedAt: new Date().toISOString() };
@@ -149,7 +145,7 @@ async function runAnalysis(project, id, actor, task, active, baseline, source, c
 项目参考：${context.guide}
 沟通输入：${context.context}
 输入版本哈希：${context.inputHash}
-按完整用户场景组织验收，项目承接上限为 ${admissionPolicy(project.config).maxAcceptance} 条；同场景的输出模式、帮助和回归要求可合并表述，但不能遗漏业务边界或隐藏超范围功能。
+按完整用户场景组织验收，${admissionPolicy(project.config).maxAcceptance} 条仅为规划参考值，不能为了数量合并不同场景、遗漏业务边界或隐藏超范围功能。
 ready仅表示需求理解已对齐，下一步由产品定版后进入研发方案分析；不表示方案已批准，不得向产品说可以开始实施或改代码。
 只返回JSON：schemaVersion=1,inputHash（上述哈希）,status=needs_clarification或ready,reply（向产品说明，最多600字）,summary（当前共识，最多600字）,suggestions（最多6条，每条一句）,questions（最多6个真正阻断理解的问题，格式{id:Q1,text}）,requiredRoles（frontend/backend/qa，必须含qa及至少一个研发角色）,contract。
 有未解决问题时status=needs_clarification，questions非空、contract=null。只有目标、现状、期望行为、验收和边界已明确，才能ready且questions=[]，contract={objective,currentBehavior,desiredBehavior,acceptance:[{id:AC1,text}],inScope:[本次包含的业务功能],outOfScope:[本次不包含的业务事项],answers:{}}。把所有已确认的关键业务决定完整写入这些最终字段；历史问答仅供回看，answers必须为空，不携带旧建议、被否决要求或讨论过程。验收用用户操作与业务结果表述，不用函数调用或接口定义。最终需求交给下一阶段，各研发Agent再独立定位代码和设计接口。不得把猜测包装成共识，无法看懂图片必须追问。`;
@@ -179,7 +175,8 @@ ready仅表示需求理解已对齐，下一步由产品定版后进入研发方
               required: ["objective", "currentBehavior", "desiredBehavior", "acceptance", "inScope", "outOfScope", "answers"],
               properties: { objective: { type: "string", minLength: 1 }, currentBehavior: { type: "string", minLength: 1 },
                 desiredBehavior: { type: "string", minLength: 1 },
-                acceptance: { type: "array", minItems: 1, items: { type: "object", additionalProperties: false,
+                acceptance: { type: "array", minItems: 1,
+                  description: "Complete user scenarios within the configured admission limit; combine related outcomes without omitting business boundaries.", items: { type: "object", additionalProperties: false,
                   required: ["id", "text"], properties: { id: { type: "string" }, text: { type: "string", minLength: 1 } } } },
                 inScope: { type: "array", minItems: 1, items: { type: "string", minLength: 1 } },
                 outOfScope: { type: "array", items: { type: "string", minLength: 1 } },

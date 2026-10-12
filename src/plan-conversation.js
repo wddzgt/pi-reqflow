@@ -48,11 +48,10 @@ export async function discussPlan(projectPath, id, actor, input) {
     if (describePolicy(project.config).executionConfigHash !== meta.configHash) throw new Error("项目执行规则已变化，请重新核对研发方案；模型和密钥设置变化不会使方案失效。");
     const contract = await readJson(path.join(directory, `contract-v${meta.contractVersion}.json`));
     const allowance = modelAllowance(task.events, admissionPolicy(project.config));
-    const remaining = project.config.maxCostUsd - meta.intakeCostUsd - meta.reviewCostUsd - meta.planCostUsd;
+    const remaining = (project.config.maxCostUsd ?? Infinity) - meta.intakeCostUsd - meta.reviewCostUsd - meta.planCostUsd;
     if (remaining <= 0) throw new Error("Requirement cost budget exhausted before plan discussion");
     const messages = task.events.filter(event => event.type === "plan_message");
     const attempt = task.events.filter(event => event.type === "plan_context_prepared").length + 1;
-    if (messages.length + (input.retryEventHash ? 0 : 1) > 30) throw new Error("Plan discussion reached its 30-message limit; hand off unresolved design to a human");
     const active = { ...meta, updatedAt: new Date().toISOString() };
     if (input.retryEventHash) {
       const message = messages.at(-1);

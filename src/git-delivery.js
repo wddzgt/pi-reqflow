@@ -2,6 +2,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { quote } from "shell-quote";
+import Ajv from "ajv";
 import { allowedFile, describePolicy, loadProject } from "./config.js";
 import { manifest, manifestHash, sha256, writeJson } from "./files.js";
 import { appendEvent, readTask, taskPath, withLock } from "./store.js";
@@ -9,7 +10,7 @@ import { runGit, inspectGit } from "./git-project.js";
 import { inspectChanges, publishedRevision, workspacePath } from "./workspace.js";
 import { approveChanges, deployTest, pollTestDeployment, recordPublished, verify } from "./workflow.js";
 import { runCommand } from "./commands.js";
-import { readPlanAnalysis } from "./plan-analysis.js";
+import { readPlanAnalysis, planOutputSchema } from "./plan-analysis.js";
 import { localRuntimePorts, startLocalRuntime, stopLocalRuntime } from "./local-runtime.js";
 import { reportProgress } from "./action-progress.js";
 import { inspectLocalEnvironment, environmentStartup } from "./local-environment.js";
@@ -49,8 +50,11 @@ export async function localValidation(projectPath, id, actor, input) {
       throw new Error("方案基础代码已改变，请重新核对方案。");
     const validation = (await readPlanAnalysis(meta, directory)).draft.validation;
     if (!validation) throw new Error("当前方案缺少验证与启动约定，请重新生成研发方案；历史代码与日志仍保留。");
+    const validateStartup = new Ajv({ allErrors: true }).compile(planOutputSchema.schema.properties.validation);
+    if (!validateStartup(validation)) throw new Error(`当前方案启动约定无效，请重新生成并审核研发方案；原证据保留：${JSON.stringify(validateStartup.errors)}`);
     if (process.env.REQFLOW_LOCAL_RUNTIME_CONTAINER === "1" && validation.startup.some(service =>
-      !localRuntimePorts.includes(new URL(service.url).port)))
+      !localRuntimePorts.includes(new URL(service.healthUrl).port)
+      || (service.applicationUrl !== null && !localRuntimePorts.includes(new URL(service.applicationUrl).port))))
       throw new Error(`Docker 本地启动方案必须使用已映射的 ${localRuntimePorts.join("、")} 端口，请修正研发方案。`);
     if (preparing) return { id, planHash: meta.planHash, validation, checks: validation.checks.map(item => item.command), checksSource: "plan" };
     let patch = null;
@@ -86,7 +90,7 @@ export async function localValidation(projectPath, id, actor, input) {
     try {
       reportProgress(input.operation === "stop" ? "正在停止本地环境。" : "正在按研发方案启动本地环境，等待服务地址就绪。", "", "local-validation");
       runtime = input.operation === "stop" ? await stopLocalRuntime(directory)
-        : await startLocalRuntime(directory, workspace, selected.startup, directory, [], project.config.maxPiMs, {}, selected.environments);
+        : await startLocalRuntime(directory, workspace, selected.startup, directory, [], project.config.executionTimeouts.startupMs, {}, selected.environments);
     } catch (error) {
       await appendEvent(project, id, "local_validation_failed", { ...meta,
         localValidation: { actor, afterHash: meta.afterHash, status: "failed", error: error.message, at: new Date().toISOString() } },
@@ -94,7 +98,10 @@ export async function localValidation(projectPath, id, actor, input) {
       throw error;
     }
     const environment = { instructions: selected.startup.map(service => `${service.name}: ${quote(service.command)}`).join("\n")
-      || validation.manualReason || "按研发方案中的验收场景验证此 CLI/库。", url: selected.startup[0]?.url ?? "", target: inspected?.report.target ?? meta.localValidation?.environment?.target };
+      || validation.manualReason || "按研发方案中的验收场景验证此 CLI/库。",
+      applications: selected.startup.filter(service => service.applicationUrl !== null)
+        .map(service => ({ name: service.name, url: service.applicationUrl })),
+      target: inspected?.report.target ?? meta.localValidation?.environment?.target };
     await appendEvent(project, id, "local_validation_requested", { ...meta, localValidation: { actor, afterHash: meta.afterHash,
       environment, ...runtime, prerequisites: inspected?.report ?? meta.localValidation?.prerequisites ?? null, at: new Date().toISOString() } },
       { actor, afterHash: meta.afterHash, patchHash: patch === null ? null : sha256(patch), environment, ...runtime });
@@ -207,8 +214,8 @@ async function mergeForTest(project, id, actor, input) {
       const checks = [];
       for (const [index, command] of (meta.developmentChecks).entries()) {
         const logFile = path.join(directory, `test-integration-${candidate.attempt}-check-${index + 1}-${randomUUID()}.log`);
-        const result = await runCommand(command, candidate.workspace, project.config.maxPiMs, logFile,
-          project.config.maxEventBytes, project.config.environment.checks, project.config.checkSandbox);
+        const result = await runCommand(command, candidate.workspace, project.config.executionTimeouts.checksMs, logFile,
+          project.config.maxAuditBytes ?? null, project.config.environment.checks, project.config.checkSandbox);
         checks.push({ command, logFile, ...result });
         if (result.code !== 0) throw new Error(`合并后测试未通过：${result.tail}`);
       }

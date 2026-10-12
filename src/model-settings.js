@@ -16,6 +16,7 @@ function profile(config, selection = config) {
     thinking: selection.thinking ?? config.thinking ?? "off", thinkingToggle: provider?.thinkingToggle ?? false,
     contextWindow: model?.contextWindow ?? 65536, maxTokens: model?.maxTokens ?? 8192,
     reasoning: model?.reasoning ?? false, supportsReasoningEffort: model?.supportsReasoningEffort ?? false,
+    cost: model?.cost ?? null,
     supportsJsonSchema: model?.supportsJsonSchema ?? false, imageInput: model?.input.includes("image") ?? false,
     credentialConfigured: Boolean(provider && (provider.credentialId || process.env[provider.apiKeyEnv])),
     modelParameters: { ...config.modelParameters, ...selection.modelParameters },
@@ -35,7 +36,7 @@ export async function readModelSettings(projectPath) {
 
 function validateProfile(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)
-      || Object.keys(input).some(key => !["provider", "model", "baseUrl", "apiKey", "thinking", "thinkingToggle", "contextWindow", "maxTokens", "reasoning", "supportsReasoningEffort", "supportsJsonSchema", "imageInput", "modelParameters", "modelUsage", "maxPiMs", "maxToolCalls"].includes(key))) throw new Error("模型配置格式不正确。");
+      || Object.keys(input).some(key => !["provider", "model", "baseUrl", "apiKey", "thinking", "thinkingToggle", "contextWindow", "maxTokens", "reasoning", "supportsReasoningEffort", "supportsJsonSchema", "imageInput", "modelParameters", "modelUsage", "maxPiMs", "maxToolCalls", "cost"].includes(key))) throw new Error("模型配置格式不正确。");
   validateModelParameters(input.modelParameters);
   if (input.apiKey !== undefined && (typeof input.apiKey !== "string" || input.apiKey.length > 16384 || /[\r\n\0]/.test(input.apiKey))) throw new Error("API Key 格式不正确。");
   for (const field of ["thinkingToggle", "reasoning", "supportsReasoningEffort", "supportsJsonSchema", "imageInput"]) if (typeof input[field] !== "boolean") throw new Error(`模型能力 ${field} 必须明确配置。`);
@@ -45,7 +46,8 @@ function providerFor(input, name, apiKeyEnv) {
   return { name, displayName: input.provider, apiKeyEnv, baseUrl: input.baseUrl, thinkingToggle: input.thinkingToggle,
     models: [{ id: input.model, input: input.imageInput ? ["text", "image"] : ["text"],
       contextWindow: input.contextWindow, maxTokens: input.maxTokens, reasoning: input.reasoning,
-      supportsReasoningEffort: input.supportsReasoningEffort, supportsJsonSchema: input.supportsJsonSchema }] };
+      supportsReasoningEffort: input.supportsReasoningEffort, supportsJsonSchema: input.supportsJsonSchema,
+      ...(input.cost === null || input.cost === undefined ? {} : { cost: input.cost }) }] };
 }
 
 function settingsConfig(current, input) {

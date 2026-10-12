@@ -247,7 +247,7 @@ export async function runRoleReviewWithPi(projectPath, id, role, initiator) {
     if (meta.reviewStandardsHash && meta.reviewStandardsHash !== standards.hash) {
       throw new Error("Coding standards changed between role reviews; revise the contract and review one standard version");
     }
-    const remainingCost = project.config.maxCostUsd - meta.reviewCostUsd - meta.intakeCostUsd - (meta.planCostUsd ?? 0);
+    const remainingCost = (project.config.maxCostUsd ?? Infinity) - meta.reviewCostUsd - meta.intakeCostUsd - (meta.planCostUsd ?? 0);
     if (remainingCost <= 0) {
       await appendEvent(project, id, "pi_budget_exhausted", meta, { phase: "review", role, initiatedBy: initiator,
         reason: "Requirement cost budget exhausted" });

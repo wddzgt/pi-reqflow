@@ -13,12 +13,24 @@ import { createServer } from "node:http";
 import { runPi } from "../src/pi-runner.js";
 import { admissionDefaults } from "../src/admission.js";
 import { readDiscussionEvidence } from "../src/history.js";
+import { analysisInput } from "../src/intake-conversation.js";
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const product = { id: "product", roles: ["product"] };
 const other = { id: "other", roles: ["product"] };
 const developer = { id: "developer", roles: ["developer"] };
 const image = { name: "设计图.png", mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNQKt8NAAITAVXMpdPnAAAAAElFTkSuQmCC" };
+
+test("ready intake preserves all acceptance scenarios beyond the planning estimate", () => {
+  const value = { schemaVersion: 1, inputHash: "current", status: "ready", reply: "核对完成", summary: "批量状态更新",
+    suggestions: [], questions: [], requiredRoles: ["backend", "qa"], contract: {
+      objective: "批量状态更新", currentBehavior: "只能单条更新", desiredBehavior: "当前页整批更新并保留筛选",
+      acceptance: Array.from({ length: 9 }, (_, index) => ({ id: `AC${index + 1}`, text: `验收场景${index + 1}` })),
+      inScope: ["批量状态更新"], outOfScope: ["跨页选择"], answers: {} } };
+  assert.equal(analysisInput(value, "current", []).status, "ready");
+  assert.equal(value.contract.acceptance.length, 9, "never merge or discard valid scenarios to fit a count");
+  assert.throws(() => analysisInput({ ...value, inputHash: "old" }, "current", []), /current discussion version/);
+});
 
 async function fixture(t, overrides = {}, inventoryOnly = false, files = {}) {
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-discussion-"));

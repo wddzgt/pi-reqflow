@@ -641,7 +641,7 @@ assert.equal(event.payload.messages[0].role,'system');
 assert.match(event.payload.messages[0].content,/AC1/);
 if(prefix)assert.deepEqual(event.payload.messages.slice(0,prefix.length),prefix);
 prefix=structuredClone(event.payload.messages);
-if(i===2)assert.equal(event.payload.tools,undefined);
+if(i===2)assert.ok(event.payload.tools,'Adaptive research keeps evidence tools at the planning target');
 const assistant={role:'assistant',content:[],provider:'fake',model:'model',usage:{input:200,output:10,cacheRead:0,cacheWrite:0}};
 await handlers.get('message_end')({message:assistant});
 for(const context of contexts)await context({messages:[assistant]});
@@ -766,7 +766,7 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 2\n");
 });
 
-for (const scenario of ["expanded", "reserve", "strict"]) test(`native compaction ignores the former ${scenario} coding request ceiling`, async t => {
+for (const scenario of ["expanded", "reserve", "strict"]) test(`native compaction uses ${scenario} coding budget semantics`, async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-compaction-budget-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   await fs.writeFile(path.join(directory, "source.py"), "value = 1\n");
@@ -801,6 +801,11 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
     environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10,
     maxEventBytes: 20000, modelUsage: { maxRequests: 4 } } }, directory, "implement", "prompt", logFile, 1, null, [],
     { maxTokens: 24000, approvedFiles: ["source.py"], budget: { mode: scenario === "strict" ? "strict" : "adaptive", complexity: "small" } });
+    if (scenario === "strict") {
+      await assert.rejects(operation, /native compaction and final response exceed remaining request limit/);
+      assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 2\n", "retain the interrupted workspace");
+      return;
+    }
     const result = await operation;
     assert.deepEqual(result.telemetry.requestBudgetExpansions, []);
     assert.equal(result.telemetry.compactions[0].requests, 2);

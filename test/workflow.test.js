@@ -366,7 +366,7 @@ test("approved startup uses the root command catalogue for a nested frontend and
   const commandCatalogue = JSON.parse(prompt.match(/^项目根目录命令目录：(.*)。复用/m)[1]);
   const frontendCommand = commandCatalogue.find(row => row.id === 'frontend/package.json#serve');
   if (!frontendCommand || frontendCommand.cwd !== '.') throw new Error('Missing root-scoped frontend command');
-  analysis.validation.startup = [{ name: 'frontend', command: frontendCommand.argv, url: ${JSON.stringify(url)} }];
+  analysis.validation.startup = [{ name: 'frontend', command: frontendCommand.argv, healthUrl: ${JSON.stringify(url)}, applicationUrl: ${JSON.stringify(url)} }];
   analysis.changes =`]], { checks: [] });
   await fs.mkdir(path.join(projectRoot, "frontend"));
   await fs.writeFile(path.join(projectRoot, "frontend/package.json"), JSON.stringify({ scripts: { serve: "node service.cjs" } }));
@@ -396,6 +396,7 @@ test("approved startup uses the root command catalogue for a nested frontend and
   t.after(() => stopLocalRuntime(task.directory));
   assert.equal(result.status, "running");
   assert.deepEqual(result.validation.startup[0].command, ["npm", "--prefix", "frontend", "run", "serve"]);
+  assert.deepEqual(result.environment.applications, [{ name: "frontend", url }]);
   assert.equal(await (await fetch(url)).text(), "working project");
   await assert.rejects(configureLocalEnvironment(project, "reviewer", { ...settings,
     expectedRevision: readySetup.revision }), /仍在运行/);
@@ -450,7 +451,7 @@ test("database initialization cannot start without confirmation of the checked e
   t.after(() => new Promise(resolve => dependency.close(resolve)));
   const port = dependency.address().port;
   const { projectRoot, project } = await analysisFixture(t, [["  analysis.changes =", `
-  analysis.validation.startup=[{name:'backend',command:['mvn','spring-boot:run'],url:'http://127.0.0.1:9/'}];
+  analysis.validation.startup=[{name:'backend',command:['mvn','spring-boot:run'],healthUrl:'http://127.0.0.1:9/',applicationUrl:null}];
   analysis.changes =`]], { checks: [] });
   await fs.writeFile(path.join(projectRoot, "pom.xml"), "<project>spring-boot</project>");
   await fs.mkdir(path.join(projectRoot, "src/main/resources"), { recursive: true });
@@ -478,7 +479,7 @@ test("local startup failure preserves reviewed code and adds an explicit failure
   const port = listener.address().port;
   await new Promise(resolve => listener.close(resolve));
   const startup = [{ name: "broken", command: [process.execPath, "-e", "console.error('local dependency missing');process.exit(2)"],
-    url: `http://127.0.0.1:${port}/` }];
+    healthUrl: `http://127.0.0.1:${port}/`, applicationUrl: null }];
   const { projectRoot, project } = await analysisFixture(t, [["  analysis.changes =", `
   analysis.validation.startup = ${JSON.stringify(startup)};
   analysis.changes =`]]);
@@ -513,7 +514,7 @@ createServer((req,res)=>res.end(String(multiply(2,3)))).listen(${port},'127.0.0.
       await fs.writeFile(path.join(process.cwd(),"src/local-server.mjs"),${JSON.stringify(script)});`],
     ['  analysis.changes =', `
       analysis.affectedFiles.push("src/local-server.mjs");
-      analysis.validation.startup=${JSON.stringify([{ name: "calculator", command: [process.execPath, "src/local-server.mjs"], url }])};
+      analysis.validation.startup=${JSON.stringify([{ name: "calculator", command: [process.execPath, "src/local-server.mjs"], healthUrl: url, applicationUrl: url }])};
       analysis.changes =`],
   ], { checks: [] });
   await plan(projectRoot, "REQ-001"); await approvePlan(projectRoot, "REQ-001", "reviewer");
@@ -592,7 +593,7 @@ test("development repairs one failed verification from the retained workspace th
   assert.equal((await fs.readFile(path.join(task.meta.workspace, "src/calculator.mjs"), "utf8")).match(/export function multiply/g).length, 1);
 });
 
-test("development stops after one automatic repair and rejects stale manual continuation", async t => {
+test("development pauses after three identical check failures and rejects stale manual continuation", async t => {
   const { projectRoot, project } = await analysisFixture(t, [['return left * right;', 'return left - right;']]);
   await plan(projectRoot, "REQ-001");
   const meta = (await readTask(project, "REQ-001")).meta;
@@ -600,8 +601,8 @@ test("development stops after one automatic repair and rejects stale manual cont
   const result = await executeRequirementAction(projectRoot, "REQ-001", { action: "approve-plan", expectedPlanHash: meta.planHash }, principal);
   assert.equal(result.ok, false); assert.equal(result.next, "needs-attention");
   const task = await readTask(project, "REQ-001");
-  assert.equal(task.events.filter(event => event.type === "implementation_resumed").length, 1);
-  assert.equal(task.meta.developmentPause.automaticRetries, 1);
+  assert.equal(task.events.filter(event => event.type === "implementation_resumed").length, 3, "the first business assertion and subsequent repeated syntax failure are different diagnoses");
+  assert.equal(task.meta.developmentPause.automaticRetries, 3);
   assert.ok(task.meta.workspace); assert.ok(task.meta.developmentPause.reason);
   await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", {
     action: "develop", authorizeImplementation: true, expectedPlanHash: meta.planHash, expectedAfterHash: "stale",
@@ -658,11 +659,11 @@ test("specialist handoffs retain shared contracts and retrieve deferred design b
     const packet = JSON.parse(prompt.match(/方案及验收依据：([^\\n]+)/)[1]);
     assert.equal(policy.discussionTask, "REQ-001");
     assert.ok(process.argv[process.argv.indexOf("--tools")+1].split(",").includes("read_plan"));
-    assert.equal(packet.contractHash, policy.authoritativeContext.contractHash);
-    assert.deepEqual(packet.verification, policy.authoritativeContext.verification);
-    assert.deepEqual(packet.impacts, policy.authoritativeContext.impacts);
-    assert.deepEqual(packet.design.interfaces, policy.authoritativeContext.design.interfaces);
-    assert.deepEqual(packet.boundaries, policy.authoritativeContext.boundaries);
+    assert.equal(packet.contractHash, policy.authoritativeContext.plan.contractHash);
+    assert.deepEqual(packet.verification, policy.authoritativeContext.plan.verification);
+    assert.deepEqual(packet.impacts, policy.authoritativeContext.plan.impacts);
+    assert.deepEqual(packet.design.interfaces, policy.authoritativeContext.plan.design.interfaces);
+    assert.deepEqual(packet.boundaries, policy.authoritativeContext.plan.boundaries);
     assert.equal(packet.design.interfaces[0].path, "multiply(left, right)");
     assert.ok(!JSON.stringify(packet).includes("pseudocode-retained"));
     assert.equal(Object.hasOwn(packet.design, "backend"), policy.authoritativeContext.role !== "frontend");
@@ -689,6 +690,22 @@ test("specialist handoffs retain shared contracts and retrieve deferred design b
   const reviews = task.events.filter(event => event.type === "plan_specialist_completed");
   assert.deepEqual(reviews.map(event => event.detail.role), ["all"]);
   assert.ok(reviews.every(event => event.detail.handoff.inlineBytes < event.detail.handoff.fullPlanBytes));
+  const material = await readPlanMaterial(project, "REQ-001", { planHash: task.meta.planHash,
+    section: "components", offset: 0, maxChars: 3000 });
+  assert.ok(material.text.length > 1000, "one read now covers multiple old pages");
+  assert.ok(Buffer.byteLength(JSON.stringify(material)) <= project.config.modelUsage.maxToolResultBytes);
+  project.config.modelUsage.maxToolResultBytes = 1000;
+  const pages = [];
+  for (let offset = 0; offset < material.totalChars;) {
+    const page = await readPlanMaterial(project, "REQ-001", { planHash: task.meta.planHash,
+      section: "components", offset, maxChars: 3000 });
+    assert.ok(page.text.length > 0);
+    assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 1000);
+    pages.push(page.text); offset += page.text.length;
+  }
+  assert.ok(pages.length > 1);
+  assert.equal(pages.join("").slice(0, material.text.length), material.text);
+  assert.match(pages.join(""), /pseudocode-retained/);
   assert.equal(task.meta.workspace, undefined);
 });
 
@@ -710,7 +727,7 @@ test("technical contradictions are corrected internally before one human plan re
   assert.deepEqual(final.draft.affectedFiles, original.affectedFiles);
   assert.equal(final.draft.contractHash, original.contractHash);
   assert.equal(final.draft.design.interfaces[0].path, "multiply(left, right)");
-  assert.deepEqual(final.blockers, []); assert.deepEqual(final.internalCorrection, { attempts: 1, maxAttempts: 1 });
+  assert.deepEqual(final.blockers, []); assert.deepEqual(final.internalCorrection, { attempts: 1, repeatedTechnicalFailures: 1 });
   assert.equal((await getTaskObservability(projectRoot, {id:"reviewer",roles:["developer"]}, "REQ-001")).summary.attempts, 4);
   assert.equal((await approvePlan(projectRoot, "REQ-001", "reviewer")).state, "approved");
   assert.equal((await implement(projectRoot,"REQ-001")).state,"implemented");
@@ -766,7 +783,7 @@ test("internal correction retains unmodified interfaces and rejects invented imp
   }
 });
 
-test("business decisions skip internal correction and technical non-convergence stops after one correction", async t => {
+test("business decisions skip internal correction and repeated technical non-convergence pauses", async t => {
   const business = await analysisFixture(t, [['openQuestions: []', 'openQuestions: ["业务负责人需要选择新的计算规则"]']]);
   assert.equal((await plan(business.projectRoot, "REQ-001")).blocked, true);
   assert.equal((await readTask(business.project, "REQ-001")).events.some(event => event.type === "plan_correction_started"), false);
@@ -775,7 +792,7 @@ test("business decisions skip internal correction and technical non-convergence 
   const task = await readTask(unresolved.project, "REQ-001");
   assert.equal(task.events.filter(event => event.type === "plan_correction_started").length, 1);
   assert.equal(task.events.filter(event => event.type === "plan_specialist_completed").length, 1);
-  assert.equal(task.events.filter(event => event.type === "plan_specialist_reused").length, 1);
+  assert.equal(task.events.filter(event => event.type === "plan_specialist_reused").length, 2);
   assert.equal(task.meta.workspace, undefined);
   await assert.rejects(approvePlan(unresolved.projectRoot, "REQ-001", "reviewer"), /unresolved blockers/);
 });
@@ -930,7 +947,7 @@ test("real Pi reads the saved draft and submits a section patch before human rev
   Object.assign(config,{piExecutable:process.env.REQFLOW_TEST_PI,provider:"local-fixture",model:"local",thinking:"off",structuredOutput:true,
     environment:{...config.environment,pi:["SMOKE_MODEL_KEY","PI_CODING_AGENT_DIR","NODE_EXTRA_CA_CERTS"]},
     compatibleProviders:[{name:"local-fixture",baseUrl:`https://127.0.0.1:${server.address().port}/v1`,apiKeyEnv:"SMOKE_MODEL_KEY",thinkingToggle:false,
-      models:[{id:"local",input:["text"],contextWindow:32000,maxTokens:4000,reasoning:false,supportsJsonSchema:true}]}]});
+      models:[{id:"local",input:["text"],contextWindow:32000,maxTokens:4000,reasoning:false,supportsJsonSchema:true,cost:{input:0,output:0,cacheRead:0,cacheWrite:0}}]}]});
   await fs.writeFile(configFile,JSON.stringify(config));
   await refreshProjectBaseline(await loadProject(target.projectRoot));
   const before=await fs.readFile(path.join(target.projectRoot,"src/calculator.mjs"),"utf8");
@@ -1007,7 +1024,7 @@ test("native Pi carries planning history into the authorized development workspa
     structuredOutput: true, environment: { ...config.environment, pi: ["SMOKE_MODEL_KEY", "PI_CODING_AGENT_DIR", "NODE_EXTRA_CA_CERTS"] },
     compatibleProviders: [{ name: "isolated-fixture", baseUrl: `https://127.0.0.1:${server.address().port}/v1`,
       apiKeyEnv: "SMOKE_MODEL_KEY", thinkingToggle: false, models: [{ id: "local", input: ["text"], contextWindow: 32000,
-        maxTokens: 4000, reasoning: false, supportsJsonSchema: true }] }] });
+        maxTokens: 4000, reasoning: false, supportsJsonSchema: true, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] }] });
   await fs.writeFile(configFile, JSON.stringify(config));
   await refreshProjectBaseline(await loadProject(target.projectRoot));
   assert.equal((await plan(target.projectRoot, "REQ-001")).blocked, false);
@@ -2028,6 +2045,38 @@ test("implementation receives the exact approved design and preserves it through
   assert.equal(result.state, "implemented");
 });
 
+test("implementation progress is readable before the first audited changes exist", async t => {
+  const control = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-progress-read-"));
+  t.after(() => fs.rm(control, { recursive: true, force: true }));
+  const check = `if (phase === "implement") {
+    await fs.writeFile(${JSON.stringify(path.join(control, "started"))},"ready");
+    while (!(await fs.readdir(${JSON.stringify(control)})).includes("release")) {
+      await new Promise(resolve => setTimeout(resolve,20));
+    }
+  }
+  const text = phase ===`;
+  const { projectRoot, project } = await analysisFixture(t, [["const text = phase ===", check]]);
+  await plan(projectRoot, "REQ-001");
+  await approvePlan(projectRoot, "REQ-001", "reviewer");
+  const running = implement(projectRoot, "REQ-001");
+  try {
+    const deadline = Date.now() + 3000;
+    while (!(await fs.readdir(control)).includes("started")) {
+      assert.ok(Date.now() < deadline, "implementation must reach the controlled coding step");
+      await new Promise(resolve => setTimeout(resolve,20));
+    }
+    const progress = await getRequirementEvidence(projectRoot, { id: "reviewer", roles: ["developer"] }, "REQ-001");
+    assert.equal(progress.meta.state, "implementing");
+    assert.equal(progress.changes, null, "no unaudited report may be exposed as archived changes");
+  } finally {
+    await fs.writeFile(path.join(control, "release"), "continue");
+    await running;
+  }
+  const completed = await getRequirementEvidence(projectRoot, { id: "reviewer", roles: ["developer"] }, "REQ-001");
+  assert.equal(completed.meta.state, "implemented");
+  assert.ok(completed.changes.changes.length > 0);
+});
+
 test("implementation distinguishes a planned new file from missing source evidence", async t => {
   const check = `if (phase === "plan") {
     analysis.affectedFiles.push("test/new-regression.mjs");
@@ -2057,6 +2106,7 @@ test("admin model settings preserve dialogue, plan approval, tested changes and 
   const baseline = await readProjectBaseline(project);
   const setup = await readModelSettings(projectRoot);
   const profile = { ...setup.default, provider: "Fixture", model: "dialogue-model", baseUrl: "https://models.example/v1",
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     apiKey: "fixture-model-key", supportsJsonSchema: true, modelParameters: { outputFormat: "auto", temperature: 0.2 } };
   delete profile.credentialConfigured;
   const input = { expectedConfigHash: setup.expectedConfigHash, default: profile,
@@ -2551,6 +2601,7 @@ test("rollback preserves changes made after the agent", async () => {
 for (const unknownPricing of [false, true]) test(`test-only archive preserves verified candidate and ${unknownPricing ? "unknown" : "known"} pricing`, async () => {
   const { temporary, projectRoot, project } = await fixture(false, fakePi,
     "Add multiply(left, right) and keep add working.", unknownPricing ? {
+      maxCostUsd: null,
       environment: { pi: ["PATH"], checks: [], localDeployment: [] },
       compatibleProviders: [{ name: "fake", baseUrl: "https://example.invalid/v1", apiKeyEnv: "PATH", thinkingToggle: false,
         models: [{ id: "fake-model", input: ["text"], reasoning: false, contextWindow: 32000, maxTokens: 2000 }] }],

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import readline from "node:readline";
 import Ajv from "ajv";
@@ -46,8 +47,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       || executionLimit.contextFiles.some(file => typeof file !== "string" || !file || path.posix.isAbsolute(file)
          || file.includes("\\") || path.posix.normalize(file) !== file || file.split("/").includes("..")))) throw new Error("Context files must be unique project-relative read-only paths");
   if (executionLimit?.authoritativeContext !== undefined && (!executionLimit.authoritativeContext
-      || typeof executionLimit.authoritativeContext !== "object" || Array.isArray(executionLimit.authoritativeContext)
-      || Buffer.byteLength(JSON.stringify(executionLimit.authoritativeContext)) > 48000)) throw new Error("Authoritative task context must be a bounded object");
+      || typeof executionLimit.authoritativeContext !== "object" || Array.isArray(executionLimit.authoritativeContext))) throw new Error("Authoritative task context must be an object");
   const selected = resolveAgentModel(project.config, phase, role);
   if (selected.provider === "unconfigured" || selected.model === "unconfigured")
     throw new Error("尚未配置模型，请先在工作台的模型设置中保存模型连接。");
@@ -79,7 +79,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
   if (executionLimit?.maxRequests !== undefined) requestLimit = Math.min(requestLimit, executionLimit.maxRequests);
   const tokenLimit = Math.min(executionLimit?.maxTokens ?? modelUsage.maxTokens,
     phase === "initialize" ? modelUsage.initializationMaxTokens : modelUsage.maxTokens);
-  const adaptiveBudget = phase === "implement" || executionLimit?.budget?.mode === "adaptive";
+  const adaptiveBudget = executionLimit?.budget?.mode === "adaptive" || (phase === "implement" && executionLimit?.budget === undefined);
   const tokenBudgetKind = executionLimit !== null && executionLimit.maxTokens <= (phase === "initialize"
     ? modelUsage.initializationMaxTokens : modelUsage.maxTokens) ? "remaining requirement" : "phase";
   const toolLimit = phase === "initialize"
@@ -96,6 +96,10 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
   }
   const traceId = randomUUID();
   const activeProvider = project.config.compatibleProviders?.find(provider => provider.name === selection.provider);
+  const configuredPrice = activeProvider?.models.find(model => model.id === selection.model)?.cost;
+  if (project.config.maxCostUsd !== null && project.config.maxCostUsd !== undefined && activeProvider && !configuredPrice) {
+    throw new Error("模型价格未知，无法执行 USD 费用上限；请管理员配置四项 Token 单价，或明确取消费用上限。未知价格不代表免费。");
+  }
   if (activeProvider) {
     const credentialNames = new Set(project.config.compatibleProviders.map(provider => provider.apiKeyEnv));
     project = { ...project, config: { ...project.config, compatibleProviders: [activeProvider],
@@ -372,7 +376,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
   ];
   if (["initialize", "intake", "plan", "review"].includes(phase)) {
     args.splice(args.indexOf("--"), 0, "--system-prompt",
-      `Your final response MUST be exactly one JSON object matching the task schema. Return it when source evidence is sufficient. Otherwise investigate missing evidence: locate symbols, follow relevant dependencies and read their ranges and tests. Reuse supplied evidence. You have ${requestLimit} provider requests and ${tokenLimit} cumulative tokens; reserve a response for the final JSON. Do not inspect unrelated modules. Evidence that cannot be established must remain unknown. Final response: JSON only, no analysis, prose or fences.`);
+      `Your final response MUST be exactly one JSON object matching the task schema. Return it when source evidence is sufficient. Otherwise investigate missing evidence: locate symbols, follow relevant dependencies and read their ranges and tests. Reuse supplied evidence. ${adaptiveBudget ? `Initial planning targets are ${requestLimit} requests and ${tokenLimit} tokens, not termination limits. Continue only while obtaining new relevant evidence or resolving validation errors.` : `You have ${requestLimit} provider requests and ${tokenLimit} cumulative tokens; reserve a response for the final JSON.`} Do not inspect unrelated modules. Evidence that cannot be established must remain unknown. Final response: JSON only, no analysis, prose or fences.`);
   }
   args.splice(args.indexOf("--"), 0, "--append-system-prompt",
     phase === "implement"
@@ -400,7 +404,8 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       implementationResearchRequests: researchRequests,
       ...(phase === "implement" && executionLimit?.approvedFiles && project.config.checks ? {
         implementationChecks: { commands: project.config.checks, environment: project.config.environment.checks,
-          sandbox: project.config.checkSandbox, timeoutMs: project.config.maxPiMs, maxBytes: project.config.maxEventBytes,
+          sandbox: project.config.checkSandbox, timeoutMs: project.config.executionTimeouts?.checksMs ?? 300000,
+          maxBytes: project.config.maxAuditBytes ?? null,
           maxSnapshotBytes: project.config.maxSnapshotBytes, logPrefix: `${logFile}.internal` },
       } : {}),
       providerRequestLimit: Math.min(executionLimit?.maxRequests ?? (phase === "implement" ? requestLimit : modelUsage.maxRequests),
@@ -427,6 +432,12 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       ...(phase === "intake" && executionLimit?.intakeValidation ? { intakeValidation: executionLimit.intakeValidation } : {}),
     }),
   };
+  // Tool binaries are shared across calls; settings and credentials remain per-run.
+  const sharedPiDirectory = env.PI_CODING_AGENT_DIR?.replace(/^~(?=$|[/\\])/, env.HOME ?? os.homedir())
+    ?? path.join(env.HOME ?? os.homedir(), ".pi", "agent");
+  const toolDirectory = path.resolve(cwd, sharedPiDirectory, "bin");
+  env.PATH = [toolDirectory, env.PATH].filter(Boolean).join(path.delimiter);
+  env.PI_OFFLINE = "1";
   if (activeProvider) {
     // Adaptive byte targets are advisory; compact at the model's actual capacity.
     // Compatible-provider credentials are registered explicitly by the guard.
@@ -447,18 +458,22 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
   const log = await fs.open(logFile, "wx", 0o600);
   const child = spawn(process.execPath, [project.config.piExecutable, ...args], { cwd, env,
     stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" });
+  let groupTerminated = false;
   const signalGroup = (signal) => {
+    if (groupTerminated) return;
     try {
       if (process.platform === "win32") child.kill(signal);
       else if (child.pid) process.kill(-child.pid, signal);
+      if (signal === "SIGKILL") groupTerminated = true;
     } catch (error) {
       if (error.code !== "ESRCH") throw error;
+      groupTerminated = true;
     }
   };
   let escalation;
   let terminationError;
   const terminate = () => {
-    if (escalation) return;
+    if (groupTerminated || escalation) return;
     try { signalGroup("SIGTERM"); }
     catch (error) { terminationError = error; child.kill("SIGKILL"); }
     escalation = setTimeout(() => {
@@ -515,16 +530,18 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
   const compactions = [];
   let pendingCompactions = 0;
   const auditStorage = { formatVersion: 1, receivedBytes: 0, omittedEvents: 0,
-    omittedThinkingBlocks: 0, omittedThinkingBytes: 0 };
+    omittedThinkingBlocks: 0, omittedThinkingBytes: 0,
+    segmentTargetBytes: project.config.maxEventBytes, segmentOffsets: [0] };
   const telemetry = () => ({ traceId, phase, ...selection,
     startedAt, durationMs: Date.now() - startedMs, promptBytes, promptHash,
     executionMode: phase === "implement" ? "native" : "structured",
     responseBytes: Buffer.byteLength(lastText), eventBytes, assistantMessages,
-    requestLimit: phase === "implement" ? null : requestLimit, tokenLimit: phase === "implement" ? null : tokenLimit,
-    tokenBudgetKind: phase === "implement" ? "observed" : tokenBudgetKind, tokens: { ...tokens },
+    requestLimit: adaptiveBudget ? null : requestLimit, tokenLimit: adaptiveBudget ? null : tokenLimit,
+    requestTarget: requestLimit, tokenTarget: tokenLimit,
+    tokenBudgetKind: adaptiveBudget ? "observed" : tokenBudgetKind, tokens: { ...tokens },
     costUsd: completedCost + currentCost, toolCalls, logFile, sessionCheckpoint,
     sessionSource: executionLimit?.resumeSession ?? null,
-    auditStorage: { ...auditStorage, storedBytes: eventBytes },
+    auditStorage: { ...auditStorage, segmentOffsets: [...auditStorage.segmentOffsets], storedBytes: eventBytes },
     sessionStatus: !sessionFile ? "disabled" : sessionCheckpoint ? "saved" : "unavailable",
     imageInputs, sourceEvidence, modelSwitches, modelAttempts, requestEstimates, contextReplacements,
     requestTimings: requestTimings.map(row => ({ ...row, durationMs: row.durationMs ?? Date.now() - Date.parse(row.startedAt) })),
@@ -534,7 +551,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
     compactions, unmeasuredRequests: pendingCompactions + requestTimings.filter(row => !row.usageMeasured).length,
     timeouts: { requestMs: project.config.maxPiMs, mode: "per_request" },
     pricingKnown: pendingCompactions === 0 && requestTimings.every(row => row.usageMeasured)
-      && !(project.config.compatibleProviders ?? []).length,
+      && (!activeProvider || Boolean(configuredPrice)),
     imageArtifacts: [...imageArtifacts.values()].filter((entry) => entry.persisted).map(({ buffer, persisted, ...entry }) => entry) });
   requestTimer = setTimeout(() => { timedOut = true; terminate(); }, project.config.maxPiMs);
   try {
@@ -584,10 +601,13 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       // Process the original stream for usage, validation and continuation. Audit
       // only completed messages, tool results and control events without thoughts.
       if (persistEvent) {
+        if (eventBytes - auditStorage.segmentOffsets.at(-1) >= project.config.maxEventBytes) {
+          auditStorage.segmentOffsets.push(eventBytes);
+        }
         eventBytes += Buffer.byteLength(auditedLine) + 1;
-        if (eventBytes > project.config.maxEventBytes) {
+        if (project.config.maxAuditBytes !== undefined && eventBytes > project.config.maxAuditBytes) {
           terminate();
-          throw new Error("Pi event log exceeded configured byte limit");
+          throw new Error("Pi event log exceeded explicit audit storage cap");
         }
         await log.writeFile(`${auditedLine}\n`);
       }
@@ -662,7 +682,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       if (event.type === "entry_appended" && event.entry?.customType === "reqflow_plan_validation") {
         const validation = event.entry.data;
         if (phase !== "plan" || !["valid", "invalid"].includes(validation?.status)
-            || validation.attempt !== planValidation.length + 1 || validation.attempt > 3) throw new Error("Invalid plan validation evidence");
+            || validation.attempt !== planValidation.length + 1) throw new Error("Invalid plan validation evidence");
         planValidation.push(validation);
         reportProgress(validation.status === "valid" ? "研发方案格式与内容检查已通过。"
           : `第 ${validation.attempt} 轮方案检查未通过，正在修正：${validation.error}`, "", "validation");
@@ -670,7 +690,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       if (event.type === "entry_appended" && event.entry?.customType === "reqflow_intake_validation") {
         const validation = event.entry.data;
         if (phase !== "intake" || !["valid", "invalid"].includes(validation?.status)
-            || validation.attempt !== intakeValidation.length + 1 || validation.attempt > 3) throw new Error("Invalid intake validation evidence");
+            || validation.attempt !== intakeValidation.length + 1) throw new Error("Invalid intake validation evidence");
         intakeValidation.push(validation);
       }
       if (event.type === "entry_appended" && event.entry?.customType === "reqflow_context_replaced") {
@@ -685,8 +705,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
         const expansion = event.entry.data;
         if (!adaptiveBudget || !["previous", "next", "inputReserve", "requestedOutput", "contextWindow"]
           .every(key => Number.isSafeInteger(expansion?.[key]) && expansion[key] > 0)
-          || expansion.next <= expansion.previous || !["measured_prefix", "measured_retained", "wire_bytes"].includes(expansion.estimationMethod)
-          || expansion.inputReserve + expansion.requestedOutput > expansion.contextWindow) throw new Error("Invalid adaptive context evidence");
+          || expansion.next <= expansion.previous || !["measured_prefix", "measured_retained", "wire_bytes"].includes(expansion.estimationMethod)) throw new Error("Invalid adaptive context evidence");
         contextExpansions.push(expansion);
       }
       if (event.type === "entry_appended" && event.entry?.customType === "reqflow_model_switch") {
@@ -740,7 +759,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
             : ["edit", "write"].includes(event.toolName) ? "正在修改方案涉及的代码。" : "正在检查项目中的相关实现。", "", "tools");
         if (event.toolName === "read") sourceReads.set(event.toolCallId, event.args);
         toolCalls++;
-        if (phase !== "implement" && toolCalls > toolLimit) {
+        if (!adaptiveBudget && toolCalls > toolLimit) {
           terminate();
           throw Object.assign(new Error("Pi exceeded configured tool-call limit"), { code: "PI_TOOL_LIMIT" });
         }

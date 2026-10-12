@@ -165,8 +165,8 @@ export async function initializeProjectContext(project, baseline, options = {}) 
       if (!Number.isFinite(attempt.costUsd) || attempt.costUsd < 0) throw new Error("Initialization cost audit is invalid");
       spent += attempt.costUsd;
     }
-    if (spent >= project.config.maxCostUsd) throw new Error("Initialization model budget exhausted");
-    return analyzeSnapshot(project, baseline, initializationCommands(baseline), attemptsRoot, cacheKey, project.config.maxCostUsd - spent);
+    if (spent >= (project.config.maxCostUsd ?? Infinity)) throw new Error("Initialization model budget exhausted");
+    return analyzeSnapshot(project, baseline, initializationCommands(baseline), attemptsRoot, cacheKey, (project.config.maxCostUsd ?? Infinity) - spent);
   }, 10000);
 }
 

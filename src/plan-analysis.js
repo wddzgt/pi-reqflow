@@ -14,7 +14,7 @@ export const planMaterialSections = ["approach", "frontend", "backend", "data", 
 export async function readPlanMaterial(project, id, input) {
   if (!input || !planMaterialSections.includes(input.section) || !/^[a-f0-9]{64}$/.test(input.planHash ?? "")
       || !Number.isSafeInteger(input.offset) || input.offset < 0 || !Number.isSafeInteger(input.maxChars)
-      || input.maxChars < 1 || input.maxChars > 1000) throw new Error("Plan material reads need the exact version, section and a bounded character range");
+      || input.maxChars < 1 || input.maxChars > 3000) throw new Error("Plan material reads need the exact version, section and a bounded character range");
   const task = await readTask(project, id);
   let analysis;
   if (task.meta.planHash === input.planHash) analysis = await readPlanAnalysis(task.meta, task.directory);
@@ -40,9 +40,23 @@ export async function readPlanMaterial(project, id, input) {
   if (material === undefined) throw new Error("Requested design section is absent from this plan version");
   const text = typeof material === "string" ? material : JSON.stringify(material);
   if (input.offset >= text.length && (text.length > 0 || input.offset > 0)) throw new Error("Plan material offset exceeds the selected section");
-  return { taskId: id, planHash: input.planHash, contractHash: task.meta.contractHash, baseHash: task.meta.baseHash,
+  const result = { taskId: id, planHash: input.planHash, contractHash: task.meta.contractHash, baseHash: task.meta.baseHash,
     section: input.section, offset: input.offset, totalChars: text.length, text: text.slice(input.offset, input.offset + input.maxChars),
     partial: input.offset > 0 || text.length > input.maxChars, note: "Verified archived plan material. Proposals and AI advice are not approval; source and frozen requirements remain authoritative." };
+  const byteLimit = project.config.modelUsage?.maxToolResultBytes ?? 8000;
+  let low = 0, high = result.text.length;
+  const page = result.text;
+  while (low < high) {
+    const length = Math.ceil((low + high) / 2);
+    result.text = page.slice(0, length);
+    if (Buffer.byteLength(JSON.stringify(result)) <= byteLimit) low = length;
+    else high = length - 1;
+  }
+  result.text = page.slice(0, low);
+  result.partial = input.offset > 0 || input.offset + low < text.length;
+  if ((!low && page.length) || Buffer.byteLength(JSON.stringify(result)) > byteLimit)
+    throw new Error("Configured tool result budget cannot contain a plan material page");
+  return result;
 }
 export const candidateReviewSchema = { type: "object", additionalProperties: false,
   required: ["proposalHash", "status", "reasons"], properties: {
@@ -54,8 +68,8 @@ export const planOutputSchema = { name: "delivery_plan", strict: true, schema: {
   required: ["schemaVersion", "contractHash", "affectedFiles", "changes", "domains", "impacts", "verification", "validation", "openQuestions", "boundaries", "design"],
   properties: {
     schemaVersion: { type: "integer", enum: [2] }, contractHash: { type: "string" }, design: designSchema,
-    affectedFiles: { type: "array", minItems: 1, maxItems: 30, description: "Each project-relative file appears exactly once.", items: { type: "string", minLength: 1 } },
-    changes: { type: "array", minItems: 1, maxItems: 30, items: { type: "object", additionalProperties: false,
+    affectedFiles: { type: "array", minItems: 1, description: "Each project-relative file appears exactly once within project policy; file count is a planning estimate.", items: { type: "string", minLength: 1 } },
+    changes: { type: "array", minItems: 1, items: { type: "object", additionalProperties: false,
       required: ["file", "description"], properties: { file: { type: "string", minLength: 1 },
         description: { type: "string", minLength: 1, maxLength: 500 } } } },
     domains: { type: "array", minItems: 1, maxItems: 5, description: "Distinct affected domains; never repeat an enum value. Uniqueness is checked by the application.", items: { type: "string", enum: ["frontend", "backend", "database", "infrastructure", "documentation"] } },
@@ -68,26 +82,28 @@ export const planOutputSchema = { name: "delivery_plan", strict: true, schema: {
         acceptanceId: { type: "string" }, scenario: { type: "string", minLength: 1, maxLength: 1000 },
         regression: { type: "string", minLength: 1, maxLength: 1000 } } } },
     validation: { type: "object", additionalProperties: false, required: ["checks", "skipped", "manualReason", "startup"], properties: {
-      checks: { type: "array", maxItems: 20, items: { type: "object", additionalProperties: false,
+      checks: { type: "array", items: { type: "object", additionalProperties: false,
         required: ["command", "reason"], properties: { command: { type: "array", minItems: 1, maxItems: 64, items: { type: "string", minLength: 1 } },
           reason: { type: "string", minLength: 1, maxLength: 1000 } } } },
-      skipped: { type: "array", maxItems: 20, items: { type: "object", additionalProperties: false,
+      skipped: { type: "array", items: { type: "object", additionalProperties: false,
         required: ["command", "reason"], properties: { command: { type: "array", minItems: 1, maxItems: 64, items: { type: "string", minLength: 1 } },
           reason: { type: "string", minLength: 1, maxLength: 1000 } } } },
       manualReason: { type: "string", maxLength: 1000 },
-      startup: { type: "array", maxItems: 5, items: { type: "object", additionalProperties: false,
-        required: ["name", "command", "url"], properties: { name: { type: "string", minLength: 1, maxLength: 100 },
+      startup: { type: "array", items: { type: "object", additionalProperties: false,
+        required: ["name", "command", "healthUrl", "applicationUrl"], properties: { name: { type: "string", minLength: 1, maxLength: 100 },
           command: { type: "array", minItems: 1, maxItems: 64, items: { type: "string", minLength: 1 } },
-          url: { type: "string", minLength: 1, maxLength: 2000 } } } },
+          healthUrl: { type: "string", minLength: 1, maxLength: 2000 },
+          applicationUrl: { anyOf: [{ type: "string", minLength: 1, maxLength: 2000 }, { type: "null" }],
+            description: "Browser entry for this service; null for a service without an application page. Never substitute a health endpoint." } } } },
     } },
     openQuestions: { type: "array", maxItems: 6, items: { type: "string", minLength: 1, maxLength: 500 } },
     boundaries: { type: "object", additionalProperties: false,
       required: ["modules", "deliveryUnits", "designStages", "estimatedChangedLines", "coordination", "verification", "recovery", "externalEffects", "exclusions"],
       properties: {
-        modules: { type: "array", minItems: 1, maxItems: 30, items: { type: "object", additionalProperties: false,
+        modules: { type: "array", minItems: 1, items: { type: "object", additionalProperties: false,
           required: ["name", "files", "evidence"], properties: { name: { type: "string", minLength: 1, maxLength: 100 },
             files: { type: "array", minItems: 1, items: { type: "string" } }, evidence: { type: "string", minLength: 1, maxLength: 1000 } } } },
-        deliveryUnits: { type: "array", minItems: 1, maxItems: 10, items: { type: "object", additionalProperties: false,
+        deliveryUnits: { type: "array", minItems: 1, items: { type: "object", additionalProperties: false,
           required: ["name", "evidence"], properties: { name: { type: "string", minLength: 1, maxLength: 100 },
             evidence: { type: "string", minLength: 1, maxLength: 1000 } } } },
         designStages: { type: "integer", minimum: 1 }, estimatedChangedLines: { type: "integer", minimum: 1 },
@@ -165,7 +181,7 @@ export function planAnalysisInput(value, contract, project, correction = null) {
     }
   }
   if (!value || ![1, 2].includes(value.schemaVersion) || value.contractHash !== sha256(JSON.stringify(contract))) throw new Error("Plan analysis must reference the frozen requirement");
-  if (!Array.isArray(value.affectedFiles) || !value.affectedFiles.length || value.affectedFiles.length > 30
+  if (!Array.isArray(value.affectedFiles) || !value.affectedFiles.length
       || new Set(value.affectedFiles).size !== value.affectedFiles.length
       || value.affectedFiles.some((file) => typeof file !== "string" || !file.trim() || path.posix.isAbsolute(file)
         || file.includes("\\") || path.posix.normalize(file) !== file || file.split("/").includes("..") || !allowedFile(file, project.config))) throw new Error("Plan analysis must identify unique files within project policy");
@@ -193,9 +209,9 @@ export function planAnalysisInput(value, contract, project, correction = null) {
   }
   const validation = value.validation;
   if (!validation || Object.keys(validation).sort().join() !== "checks,manualReason,skipped,startup"
-      || !Array.isArray(validation.checks) || validation.checks.length > 20
-      || !Array.isArray(validation.skipped) || validation.skipped.length > 20
-      || !Array.isArray(validation.startup) || validation.startup.length > 5
+      || !Array.isArray(validation.checks)
+      || !Array.isArray(validation.skipped)
+      || !Array.isArray(validation.startup)
       || typeof validation.manualReason !== "string" || validation.manualReason.length > 1000
       || (!validation.checks.length && !validation.manualReason.trim()))
     throw new Error("方案必须明确影响范围内的检查、跳过理由及本地启动方式；无自动检查时须说明人工验证方式。");
@@ -209,12 +225,15 @@ export function planAnalysisInput(value, contract, project, correction = null) {
       throw new Error("每条检查和跳过项必须说明源码依赖与验收依据。");
   }
   for (const item of validation.startup) {
-    if (Object.keys(item).sort().join() !== "command,name,url" || typeof item.name !== "string" || !item.name.trim() || item.name.length > 100)
-      throw new Error("本地启动服务必须提供名称、命令和真实地址。");
-    const url = new URL(item.url);
-    if (!['http:', 'https:'].includes(url.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
-        || url.username || url.password || item.url.length > 2000)
-      throw new Error("本地启动地址必须为不含账号密码的回环 HTTP/HTTPS 地址。");
+    if (Object.keys(item).sort().join() !== "applicationUrl,command,healthUrl,name" || typeof item.name !== "string" || !item.name.trim() || item.name.length > 100)
+      throw new Error("本地启动服务必须提供名称、命令、健康检查地址和应用入口（无页面时为null）。");
+    for (const address of [item.healthUrl, ...(item.applicationUrl === null ? [] : [item.applicationUrl])]) {
+      if (typeof address !== "string" || !address || address.length > 2000) throw new Error("本地启动地址不能为空或缺失。");
+      const url = new URL(address);
+      if (!['http:', 'https:'].includes(url.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
+          || url.username || url.password)
+        throw new Error("本地启动地址必须为不含账号密码的回环 HTTP/HTTPS 地址。");
+    }
   }
   const selected = validation.checks.map(item => JSON.stringify(item.command));
   if (new Set(selected).size !== selected.length || validation.skipped.some(item => selected.includes(JSON.stringify(item.command))))
@@ -237,14 +256,13 @@ export function planAnalysisInput(value, contract, project, correction = null) {
     `## 需求与验收\n${contract.objective}\n${contract.acceptance.map(item => `- ${item.id}：${item.text}`).join("\n")}`,
     ...(value.schemaVersion === 2 ? [designMarkdown(value)] : []),
     `## 拟改位置与做法\n${value.schemaVersion === 2 ? `本次允许修改 ${value.affectedFiles.length} 个文件，具体位置与改法见上文“修改位置与关键逻辑”。` : value.changes.map(item => `- ${item.file}：${item.description}`).join("\n")}`,
-    `## 验证\n${value.verification.map(item => `- ${item.acceptanceId}：${item.scenario}；回归：${item.regression}`).join("\n")}\n\n自动检查（仅影响范围）：\n${validation.checks.map(item => `- ${JSON.stringify(item.command)}：${item.reason}`).join("\n") || `无；人工验证：${validation.manualReason}`}\n\n跳过检查：\n${validation.skipped.map(item => `- ${JSON.stringify(item.command)}：${item.reason}`).join("\n") || "无"}\n\n本地启动：\n${validation.startup.map(item => `- ${item.name}：${JSON.stringify(item.command)}；${item.url}`).join("\n") || "此项目没有常驻本地服务；按验收场景人工验证或发布测试环境。"}`,
+    `## 验证\n${value.verification.map(item => `- ${item.acceptanceId}：${item.scenario}；回归：${item.regression}`).join("\n")}\n\n自动检查（仅影响范围）：\n${validation.checks.map(item => `- ${JSON.stringify(item.command)}：${item.reason}`).join("\n") || `无；人工验证：${validation.manualReason}`}\n\n跳过检查：\n${validation.skipped.map(item => `- ${JSON.stringify(item.command)}：${item.reason}`).join("\n") || "无"}\n\n本地启动：\n${validation.startup.map(item => `- ${item.name}：${JSON.stringify(item.command)}；健康检查 ${item.healthUrl}；应用入口 ${item.applicationUrl ?? "无页面"}`).join("\n") || "此项目没有常驻本地服务；按验收场景人工验证或发布测试环境。"}`,
     `## 风险与回退\n${["existingBehavior", "interfaces", "data"].map((kind, index) => `- ${["历史功能", "接口", "数据"][index]}（${value.impacts[kind].status}）：${value.impacts[kind].evidence}`).join("\n")}\n- 外部影响（${value.boundaries.externalEffects.status}）：${value.boundaries.externalEffects.evidence}\n- 恢复：${value.boundaries.recovery.evidence}`,
     `## 待确认\n${value.openQuestions.length ? value.openQuestions.map(question => `- ${question}`).join("\n") : "无"}`,
   ].join("\n\n");
-  if (Buffer.byteLength(markdown) > (value.schemaVersion === 2 ? 64000 : 16000)
-      || planSections.some(section => markdown.split("\n").filter(line => line === `## ${section}`).length !== 1)
+  if (planSections.some(section => markdown.split("\n").filter(line => line === `## ${section}`).length !== 1)
       || (Object.hasOwn(value, "markdown") && value.markdown !== markdown)) {
-    throw new Error("Plan document must match its structured analysis and stay within its bounded size");
+    throw new Error("Plan document must match its structured analysis and required sections");
   }
   return { ...value, markdown };
 }
@@ -280,7 +298,7 @@ export async function reviewPlanAnalysis(project, id, meta, directory, workspace
     }
     const suffix = correction ? `-correction-${correction}` : "";
     const logFile = path.join(directory, `plan-v${meta.planVersion + 1}-attempt-${meta.planAttempts}-specialist-${role}${suffix}.events.jsonl`);
-    const remaining = project.config.maxCostUsd - current.intakeCostUsd - current.reviewCostUsd - current.planCostUsd;
+    const remaining = (project.config.maxCostUsd ?? Infinity) - current.intakeCostUsd - current.reviewCostUsd - current.planCostUsd;
     if (remaining <= 0) {
       await appendEvent(project, id, "pi_budget_exhausted", current, { phase: "review", role, reason: "Requirement cost budget exhausted" });
       throw new Error("Requirement cost budget exhausted before specialist review");
@@ -313,7 +331,7 @@ export async function reviewPlanAnalysis(project, id, meta, directory, workspace
     try {
       const allowance = modelAllowance((await readTask(project, id)).events, admissionPolicy(project.config));
       const outputContract = "\n输出顶层必须是单个对象，禁止数组。对象格式：{\"findings\":[]}。仅返回 findings；角色、需求和方案的身份由系统绑定，不要输出哈希。\n评审对象是方案是否可以实施，不是尚未编写的实现是否已经完美。方案已明确的验收和验证不要再次列为遗漏；实现顺序、变量命名、同等正确的写法属于实现指导，标 advisory。只有能够引用冻结需求与方案中明确矛盾、不可恢复的风险或缺少必要业务决策时才阻断。假设未来可能写错、要求把已有验收再写一遍，不构成 blocking。";
-      const testInstructions = "\n你是唯一的独立审查 Agent，统一检查受影响的前端、后端、接口、数据恢复与测试，不再拆成多个角色反复调查。逐项核对冻结验收、必要异常边界和历史功能回归，确认真实可执行的验证路径。所有validation命令从仓库根目录运行，直接读取对应package.json/pom.xml和服务配置：子目录脚本须保留目录参数，Maven的-pl不能代替-f，startup地址须匹配真实端口和健康路径，前端代理须对应后端地址。已存在且未计划修改的脚本或配置与启动约定明确矛盾时属于不可验证，应blocking并给出最小命令修正；不要要求增加根目录代理脚本来迁就错误命令。只读审查，核实源码；不得重新设计、扩大业务范围或宣称测试已执行。";
+      const testInstructions = "\n你是唯一的独立审查 Agent，统一检查受影响的前端、后端、接口、数据恢复与测试，不再拆成多个角色反复调查。逐项核对冻结验收、必要异常边界和历史功能回归，确认真实可执行的验证路径。所有validation命令从仓库根目录运行，直接读取对应package.json/pom.xml和服务配置：子目录脚本须保留目录参数，Maven的-pl不能代替-f，startup.healthUrl须匹配真实端口和健康路径，applicationUrl须为实际应用入口（无页面为null），前端代理须对应后端地址。已存在且未计划修改的脚本或配置与启动约定明确矛盾时属于不可验证，应blocking并给出最小命令修正；不要要求增加根目录代理脚本来迁就错误命令。只读审查，核实源码；不得重新设计、扩大业务范围或宣称测试已执行。";
       const convergenceInstructions = "\n只阻断真实无法安全实现或验收的矛盾、缺失业务决定和不可恢复风险。已确定需求内的ID重映射、文件唯一命名、过期提示、按原项目规范处理关联等普通技术细节，先核实源码后直接给最简建议，标advisory并指导Pi实现，不要求研发逐项再次确认。发现与当前方案明确相矛盾的删除范围、未受控数据改动或真实遗漏交付入口时仍应blocking，不能为了少提问隐去问题。不要把同一个问题变换措辞再开一轮。";
       const materialInstructions = `\n这份交接包保留完整冻结需求、验收、接口契约与风险，只发送职责相关的设计正文。deferredSections 中的原文未发送，不能把省略误判为遗漏；检查依赖这些内容时必须通过 read_plan 读取 planHash=${analysisHash} 的对应章节，按偏移读取必要范围。其他 Agent 的判断不作为源码事实或你的评审依据。复用附带的哈希校验源码，未覆盖的调用方、实体或回归按需定位。`;
       run = await runPi(project, workspace, "review", prompt + testInstructions + outputContract + convergenceInstructions + materialInstructions, logFile, remaining, role, [], {
@@ -328,7 +346,7 @@ export async function reviewPlanAnalysis(project, id, meta, directory, workspace
         ...allowance, ...(contextFiles.length ? { contextFiles } : {}), discussionTask: id,
         sourceQuery: JSON.stringify({ impacts: analysis.impacts, components: reviewInput.design?.components
           .filter(row => contextFiles.includes(row.file)) }).slice(0, 4000),
-        authoritativeContext: { ...reviewInput, contract, role, materialTool: "read_plan" } });
+        authoritativeContext: { plan: reviewInput, contract, role, materialTool: "read_plan" } });
       if (manifestHash(await manifest(workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== sourceHash
           || manifestHash(await sourceManifest(project)) !== sourceHash) throw new Error("Files changed during read-only specialist review");
       const output = JSON.parse(run.text);

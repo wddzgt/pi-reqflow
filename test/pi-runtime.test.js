@@ -9,6 +9,55 @@ import { runPi } from "../src/pi-runner.js";
 import { saveModelCredential } from "../src/model-credentials.js";
 import { progressContext } from "../src/action-progress.js";
 
+for (const dependency of ["fd", "rg", "broken-fd", "shared", "shared-tilde", "shared-relative"]) test(`real Pi preflight ${dependency} checks tools before requesting the model`, {
+  skip: !process.env.REQFLOW_TEST_PI,
+}, async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-preflight-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const home = path.join(directory, "shared");
+  await fs.mkdir(path.join(home, "bin"), { recursive: true });
+  const previous = { PATH: process.env.PATH, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, HOME: process.env.HOME };
+  t.after(() => { for (const [name, value] of Object.entries(previous)) {
+    if (value === undefined) delete process.env[name]; else process.env[name] = value;
+  } });
+  process.env.PATH = ""; process.env.HOME = directory;
+  process.env.PI_CODING_AGENT_DIR = dependency === "shared-tilde" ? "~/shared" : dependency === "shared-relative" ? "shared" : home;
+  for (const name of ["fd", "rg"]) if (dependency !== name) await fs.writeFile(path.join(home, "bin", name),
+    `#!${process.execPath}\nif(process.argv.includes('--version')){console.log('${name} fixture');process.exit(${dependency === "broken-fd" && name === "fd" ? 2 : 0});}
+    console.log('source.py');`, { mode: 0o700 });
+  await fs.writeFile(path.join(directory, "source.py"), "value = 1\n");
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    let body = ""; for await (const chunk of request) body += chunk; requests.push(JSON.parse(body));
+    const delta = requests.length % 2 ? { role: "assistant", tool_calls: [{ index: 0, id: "find-source", type: "function",
+      function: { name: "find", arguments: '{"pattern":"*.py","path":"."}' } }] } : { role: "assistant", content: '{"verified":true}' };
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(`data: ${JSON.stringify({ id: "preflight", object: "chat.completion.chunk", choices: [{ index: 0,
+      delta, finish_reason: delta.tool_calls ? "tool_calls" : "stop" }], usage: { prompt_tokens: 100, completion_tokens: 10 } })}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const config = { piExecutable: process.env.REQFLOW_TEST_PI, provider: "preflight", model: "local", mode: "local", thinking: "off",
+    environment: { pi: ["PI_CODING_AGENT_DIR"] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 10000, maxToolCalls: 4, maxEventBytes: 1000000,
+    compatibleProviders: [{ name: "preflight", baseUrl: `http://127.0.0.1:${server.address().port}/v1`, apiKeyEnv: "PI_CODING_AGENT_DIR",
+      models: [{ id: "local", input: ["text"], contextWindow: 32000, maxTokens: 2000 }] }] };
+  const firstLog = path.join(directory, "first.events.jsonl");
+  if (!dependency.startsWith("shared")) {
+    await assert.rejects(runPi({ config }, directory, "plan", "Locate source", firstLog, 1), /REQFLOW_DEPENDENCY_STOP/);
+    assert.equal(requests.length, 0, "missing or broken dependencies must never consume a model request");
+    return;
+  }
+  for (const log of [firstLog, path.join(directory, "second.events.jsonl")]) {
+    assert.equal((await runPi({ config }, directory, "plan", "Locate source", log, 1)).text, '{"verified":true}');
+    const events = (await fs.readFile(log, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.ok(events.some(event => event.entry?.customType === "reqflow_dependencies_checked"));
+    assert.ok(events.some(event => event.type === "tool_execution_end" && event.toolName === "find" && !event.isError));
+    await assert.rejects(fs.stat(path.join(`${log}.pi-home`, "bin")), { code: "ENOENT" }, "private directories never receive tool downloads");
+    assert.ok((await fs.stat(path.join(`${log}.pi-home`, "settings.json"))).isFile());
+  }
+  assert.equal(requests.length, 4);
+});
+
 test("real Pi repeated resumes replace controller prompts and preserve source evidence and archives", {
   skip: !process.env.REQFLOW_TEST_PI,
 }, async t => {
@@ -17,6 +66,7 @@ test("real Pi repeated resumes replace controller prompts and preserve source ev
   await fs.writeFile(path.join(directory, "source.py"), "value = 1\n");
   await fs.writeFile(path.join(directory, "evidence.txt"), "VERIFIED_SOURCE_FACT\n" + "source evidence\n".repeat(300));
   const protectedContract = { objective: "FROZEN_ACCEPTANCE", acceptance: [{ id: "AC1", text: "Preserve user decisions. ".repeat(20) }] };
+  const design = "EXACT_MULTILINE_DESIGN\n" + "Preserve this design.\n".repeat(50);
   const payloads = [];
   const server = createServer(async (request, response) => {
     let body = "";
@@ -43,18 +93,18 @@ test("real Pi repeated resumes replace controller prompts and preserve source ev
     modelUsage: { maxRequests: 3, readOnlyMaxRequests: 3, maxTokens: 60000, maxContextBytes: 64000, maxToolResultBytes: 8000 },
     compatibleProviders: [{ name: "local-resume", baseUrl: `http://127.0.0.1:${server.address().port}/v1`, apiKeyEnv: "RESUME_MODEL_KEY",
       models: [{ id: "local", input: ["text"], contextWindow: 65536, maxTokens: 16384 }] }] };
-  const padding = `${"current specification ".repeat(1500)}\nFrozen requirement: ${JSON.stringify(protectedContract)}`;
+  const padding = `${"current specification ".repeat(1500)}\nFrozen requirement: ${JSON.stringify(protectedContract)}\nDesign: ${JSON.stringify({ design })}`;
   const checkpoints = [];
   let result = await runPi({ config }, directory, "plan", `OLD_STAGE_INSTRUCTIONS\n${padding}`,
     path.join(directory, "plan.events.jsonl"), 1, null, [], { developerSession: true, maxTokens: 60000,
-      authoritativeContext: { contract: protectedContract, currentState: "planning" } });
+      authoritativeContext: { contract: protectedContract, design, currentState: "planning" } });
   for (let attempt = 1; attempt <= 3; attempt++) {
     checkpoints.push({ file: result.telemetry.sessionCheckpoint.file,
       content: await fs.readFile(result.telemetry.sessionCheckpoint.file, "utf8") });
     result = await runPi({ config }, directory, "plan", `LATEST_PLAN_INSTRUCTIONS\n${padding}`,
       path.join(directory, `resume-${attempt}.events.jsonl`), 1, null, [], { developerSession: true,
         maxTokens: 60000, resumeSession: result.telemetry.sessionCheckpoint,
-        authoritativeContext: { contract: protectedContract, currentState: "planning" } });
+        authoritativeContext: { contract: protectedContract, design, currentState: "planning" } });
     assert.equal(result.telemetry.requestEstimates[0].estimationMethod, "measured_retained", "resume reuses hash-bound provider input evidence");
   }
   checkpoints.push({ file: result.telemetry.sessionCheckpoint.file,
@@ -75,6 +125,7 @@ test("real Pi repeated resumes replace controller prompts and preserve source ev
   assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 2\n");
   assert.equal(payloads.length, 8);
   assert.equal(JSON.stringify(payloads[0].messages).match(/FROZEN_ACCEPTANCE/g).length, 1, "first request carries the full contract once");
+  assert.equal(JSON.stringify(payloads[0].messages).match(/EXACT_MULTILINE_DESIGN/g).length, 1, "escaped multiline fields also enter context exactly once");
   assert.equal(JSON.stringify(payloads[2].messages).match(/VERIFIED_SOURCE_FACT/g).length, 1, "duplicate reads keep one exact result");
   assert.match(JSON.stringify(payloads[2].messages), /Exact evidence retained in later tool result read-evidence-2/);
   for (const payload of payloads.slice(3, 7)) {
@@ -96,10 +147,10 @@ test("real Pi repeated resumes replace controller prompts and preserve source ev
   assert.ok(replacement.entry.data.replaced.reduce((bytes, row) => bytes + row.bytes, 0) > 132377);
 });
 
-for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-workspace-continuity", "plan-settings", "plan-compaction", "plan-compaction-failure", "plan-read-budget", "plan-schema", "plan-schema-unsupported", "plan-reasoning", "plan-truncated", "plan-correction", "plan-local-correction", "plan-diagram-correction", "plan-timeout", "plan-adaptive-context", "plan-adaptive-schema", "plan-context-window", "intake-correction", "implement", "adaptive", "short-output", "request-progress", "read-budget-retry", "grep-path-retry", "grep-path-exhausted", "edit-retry", "edit-ambiguous-retry", "edit-limit-retry", "edit-noop-retry", "repair", "repair-adaptive", "repair-failed", "repair-budget", "check-mutation"]) test(`real Pi ${scenario} preserves budget evidence and explicit completion`, {
+for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-workspace-continuity", "plan-settings", "plan-compaction", "plan-compaction-failure", "plan-read-budget", "plan-read-directory", "plan-schema", "plan-schema-unsupported", "plan-reasoning", "plan-truncated", "plan-correction", "plan-local-correction", "plan-diagram-correction", "plan-timeout", "plan-adaptive-context", "plan-adaptive-schema", "plan-context-window", "review-correction", "review-correction-exhausted", "review-strict", "intake-correction", "intake-count-correction", "intake-schema-correction", "implement", "adaptive", "short-output", "request-progress", "read-budget-retry", "grep-path-retry", "grep-path-exhausted", "edit-retry", "edit-ambiguous-retry", "edit-limit-retry", "edit-noop-retry", "repair", "repair-adaptive", "repair-failed", "repair-budget", "check-mutation"]) test(`real Pi ${scenario} preserves budget evidence and explicit completion`, {
   skip: !process.env.REQFLOW_TEST_PI,
 }, async t => {
-  const phase = scenario.startsWith("plan") ? "plan" : scenario === "intake-correction" ? "intake" : "implement";
+  const phase = scenario.startsWith("plan") ? "plan" : scenario.startsWith("review-") ? "review" : scenario.startsWith("intake-") ? "intake" : "implement";
   const compactionScenario = scenario.startsWith("plan-compaction");
   const checkScenario = ["repair", "repair-adaptive", "repair-failed", "repair-budget", "check-mutation"].includes(scenario);
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-real-pi-"));
@@ -114,6 +165,9 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
   const analysis = { schemaVersion: 1, inputHash: "discussion-hash", status: "needs_clarification",
     reply: "请确认允许哪些用户使用新增功能。", summary: "新增功能保留现有使用方式。", suggestions: [],
     questions: [{ id: "Q1", text: "哪些用户可以使用新增功能？" }], requiredRoles: ["backend", "qa"], contract: null };
+  if (scenario === "intake-count-correction") Object.assign(analysis, { status: "ready", questions: [], reply: "使用范围已经核对。",
+    contract: { ...contract, currentBehavior: "当前值保持不变", desiredBehavior: "更新为已确认的值",
+      inScope: ["更新值"], outOfScope: ["其他功能"], answers: {} } });
   const draft = { schemaVersion: 1, contractHash: createHash("sha256").update(JSON.stringify(contract)).digest("hex"),
     affectedFiles: ["source.py"], changes: [{ file: "source.py", description: "Update value" }], domains: ["backend"],
     impacts: Object.fromEntries(["existingBehavior", "interfaces", "data"].map(key => [key, { status: "none", evidence: "Local isolated value" }])),
@@ -145,7 +199,13 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
       response.end(JSON.stringify({ error: { message: "Injected summarization rejection", type: "invalid_request_error" } }));
       return;
     }
-    const delta = scenario === "plan-workspace-continuity" && payloads.length >= 3
+    const delta = scenario === "plan-read-directory" && payloads.length <= 2
+      ? { role: "assistant", tool_calls: [{ index: 0, id: `directory-read-${payloads.length}`, type: "function",
+        function: { name: "read", arguments: JSON.stringify({ path: first ? "." : "evidence.txt", limit: 1 }) } }] }
+      : phase === "review"
+      ? { role: "assistant", content: first || scenario !== "review-correction" ? "The plan's review has a blocking issue."
+        : JSON.stringify({ findings: [{ severity: "blocking", subject: "Unsafe write", evidence: "Verified source", recommendation: "Correct the write boundary" }] }) }
+      : scenario === "plan-workspace-continuity" && payloads.length >= 3
       ? payloads.length === 3 ? { role: "assistant", tool_calls: [{ index: 0, id: "read-current-workspace", type: "function",
         function: { name: "read", arguments: JSON.stringify({ path: "source.py", limit: 1 }) } }] }
       : payloads.length === 4 ? { role: "assistant", content: "REQFLOW_EDITS_COMPLETE", tool_calls: [{ index: 0,
@@ -170,7 +230,10 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
              : `value = ${scenario.startsWith("grep-path") ? 3 : payloads.length === 4 ? 4 : payloads.length + 1}` }] }) } }] }
       : phase === "implement" ? { role: "assistant", content: "External verification pending." }
       : phase === "intake" ? { role: "assistant", content: JSON.stringify({ ...analysis,
-        reply: first ? "Implement `source.py` to add the feature." : analysis.reply }) }
+        ...(scenario === "intake-schema-correction" && first ? { name: "requirement_intake" } : {}),
+        contract: scenario === "intake-count-correction" && first ? { ...analysis.contract,
+          acceptance: Array.from({ length: 9 }, (_, index) => ({ id: `AC${index + 1}`, text: `Complete user outcome ${index + 1}` })) } : analysis.contract,
+        reply: first && scenario === "intake-correction" ? "Implement `source.py` to add the feature." : analysis.reply }) }
       : first || (scenario === "plan-read-budget" && payloads.length === 2) || (scenario === "plan-local-correction" && payloads.length === 3) ? { role: "assistant", tool_calls: [{ index: 0, id: `read-${payloads.length}`, type: "function",
       function: { name: "read", arguments: JSON.stringify({ path: "evidence.txt", ...(scenario === "plan-read-budget" && !first ? { limit: 1 } : {}) }) } }] }
       : { role: "assistant", content: scenario === "plan-local-correction"
@@ -261,23 +324,60 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
   const progress = [];
   const run = progressContext.run(update => progress.push(update), () => runPi({ config, archive: ["plan-settings", "plan-local-correction"].includes(scenario) ? directory : undefined }, directory, phase,
     "Read evidence.txt then return JSON with verified=true.", logFile, 1,
-    null, [], localCorrection ?? (["plan-continuity", "plan-workspace-continuity"].includes(scenario) ? { developerSession: true, maxTokens: 24000,
+    phase === "review" ? "all" : null, [], localCorrection ?? (["plan-continuity", "plan-workspace-continuity"].includes(scenario) ? { developerSession: true, maxTokens: 24000,
       authoritativeContext: { contract, currentState: "contract_confirmed" } } : scenario.startsWith("plan-schema") ? { maxTokens: 24000, outputSchema: { name: "verified_result", strict: true,
       schema: { type: "object", additionalProperties: false, required: ["verified"], properties: { verified: { type: "boolean" } } } } }
       : compactionScenario ? { maxTokens: 64000,
         authoritativeContext: { contract, state: "EXACT_REQ_STATE_01" } }
       : ["plan-correction", "plan-diagram-correction"].includes(scenario) ? { maxTokens: 24000, planContract: contract,
       budget: { mode: "adaptive", complexity: "small", maxRepairAttempts: 2 } }
-      : ["plan-adaptive-context", "plan-adaptive-schema", "plan-context-window"].includes(scenario) ? { maxTokens: 24000,
+      : ["plan-adaptive-context", "plan-adaptive-schema", "plan-context-window", "plan-read-directory"].includes(scenario) ? { maxTokens: 24000,
         budget: { mode: "adaptive", complexity: "planning", maxRepairAttempts: 2 },
         ...(scenario === "plan-adaptive-schema" ? { outputSchema: { name: "verified_result", strict: true,
           schema: { type: "object", additionalProperties: false, required: ["verified"], properties: { verified: { type: "boolean" } } } } } : {}) }
+      : phase === "review" ? { maxTokens: 24000,
+        budget: { mode: scenario === "review-strict" ? "strict" : "adaptive", complexity: "small", maxRepairAttempts: 2 },
+        outputSchema: { name: "review_findings", strict: true, schema: {
+          type: "object", additionalProperties: false, required: ["findings"],
+          properties: { findings: { type: "array", items: { type: "object", additionalProperties: false,
+            required: ["severity", "subject", "evidence", "recommendation"],
+            properties: Object.fromEntries(["severity", "subject", "evidence", "recommendation"].map(key => [key, { type: "string" }])) } } }
+        } } }
       : phase === "intake" ? { maxTokens: 24000,
         intakeValidation: { inputHash: "discussion-hash", sourceFiles: ["source.py"] },
+        outputSchema: { name: "requirement_intake", strict: true, schema: { type: "object", additionalProperties: false,
+          required: Object.keys(analysis), properties: Object.fromEntries(Object.entries(analysis).map(([key, value]) => [key,
+            key === "contract" ? { anyOf: [{ type: "object" }, { type: "null" }] }
+              : { type: Array.isArray(value) ? "array" : typeof value === "number" ? "integer" : "string" }])) } },
         budget: { mode: "adaptive", complexity: "small", maxRepairAttempts: 2 } } : phase === "implement" ? { maxTokens: scenario === "adaptive" ? 100 : 24000,
       ...(["adaptive", "short-output", "request-progress"].includes(scenario) ? { budget: { mode: "adaptive", complexity: "small", maxRepairAttempts: 2 } } : {}),
       ...(scenario === "repair-adaptive" ? { budget: { mode: "adaptive", complexity: "standard", maxRepairAttempts: 3 } } : {}),
       ...(scenario === "read-budget-retry" || scenario.startsWith("grep-path") ? {} : { approvedFiles: ["source.py"] }) } : null)));
+  if (phase === "review") {
+    if (scenario === "review-correction") {
+      const result = await run;
+      assert.equal(JSON.parse(result.text).findings[0].severity, "blocking");
+      assert.equal(payloads.length, 2);
+    } else {
+      await assert.rejects(run, /not valid JSON/);
+      assert.equal(payloads.length, scenario === "review-strict" ? 1 : 3);
+    }
+    assert.ok(payloads.slice(1).every(payload => payload.tools === undefined), "correction cannot perform new research");
+    const events = (await fs.readFile(logFile, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    const validation = events.filter(event => event.entry?.customType === "reqflow_review_validation");
+    assert.equal(validation[0].entry.data.status, "invalid", "malformed output remains explicit audit evidence");
+    assert.equal(validation.at(-1).entry.data.status, scenario === "review-correction" ? "valid" : "invalid");
+    return;
+  }
+  if (scenario === "plan-read-directory") {
+    const result = await run;
+    assert.equal(payloads.length, 3);
+    assert.match(JSON.stringify(payloads[1].messages), /Use ls/);
+    assert.match(JSON.stringify(payloads[2].messages), /Original evidence/);
+    assert.equal(JSON.parse(result.text).verified, true);
+    assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 1\n");
+    return;
+  }
   if (["plan-continuity", "plan-workspace-continuity"].includes(scenario)) {
     const planned = await run;
     assert.equal(planned.telemetry.agent, "development");
@@ -322,14 +422,15 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
     const result = await run;
     assert.equal(payloads.length, 4);
     assert.ok(payloads[2].tools.some(tool => tool.function.name === "read_plan"), "local correction must retain exact archived evidence tools after invalid JSON");
-    assert.equal(payloads[3].tools, undefined);
-    assert.match(payloads[3].messages.at(-1).content, /one modification JSON object/);
+    assert.ok(payloads[3].tools.some(tool => tool.function.name === "read_plan"), "adaptive correction keeps exact evidence available beyond its target");
     assert.deepEqual(Object.values(JSON.parse(result.text)), Array(9).fill(null));
     return;
   }
   if (scenario === "plan-context-window") {
-    await assert.rejects(run, /native compaction and final response exceed remaining request limit/);
-    assert.equal(payloads.length, 1, "oversized input plus output must stop before provider dispatch");
+    const result = await run;
+    assert.equal(JSON.parse(result.text).verified, true);
+    assert.equal(result.telemetry.contextExpansions.length, 1, "wire byte estimates are not a second model capacity gate");
+    assert.equal(result.telemetry.requestLimit, null);
     return;
   }
   if (scenario === "plan-schema-unsupported") {
@@ -337,7 +438,9 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
     assert.deepEqual(JSON.parse(result.text), { verified: true });
     assert.ok(payloads.length > 0);
     assert.ok(payloads.every(payload => payload.response_format.type === "json_object"));
-    assert.match(JSON.stringify(payloads[0].messages), /schema exactly/);
+    assert.ok(payloads.every(payload => payload.messages.some(message => typeof message.content === "string"
+      && message.content.includes(JSON.stringify({ type: "object", additionalProperties: false,
+        required: ["verified"], properties: { verified: { type: "boolean" } } })))));
     return;
   }
   if (scenario === "plan-compaction-failure") {
@@ -411,7 +514,13 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
     assert.ok(payloads.every(payload => payload.max_tokens === 8192));
   }
   if (phase === "intake") {
-    assert.ok(progress.some(row => row.stage === "draft" && row.preview.includes("请确认允许哪些用户")));
+    if (scenario === "intake-count-correction") {
+      assert.equal(JSON.parse(result.text).contract.acceptance.length, 9);
+      assert.equal(payloads.length, 1);
+      assert.deepEqual(result.telemetry.intakeValidation.map(row => row.status), ["valid"]);
+      return;
+    }
+    assert.ok(progress.some(row => row.stage === "draft" && row.preview.includes(analysis.reply)));
     assert.doesNotMatch(JSON.stringify(progress), /PRIVATE_REASONING_DO_NOT_DISPLAY|Implement `source.py`/);
     assert.deepEqual(JSON.parse(result.text), analysis);
     assert.equal(payloads.length, 2);
@@ -420,7 +529,8 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
     assert.deepEqual(result.telemetry.intakeValidation.map(row => row.status), ["invalid", "valid"]);
     assert.equal(result.telemetry.assistantMessages, 2);
     assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 1\n");
-    assert.match(await fs.readFile(logFile, "utf8"), /Implement `source.py`/);
+    assert.match(await fs.readFile(logFile, "utf8"), scenario === "intake-correction" ? /Implement `source.py`/
+      : scenario === "intake-count-correction" ? /acceptance count 9 exceeds configured limit 8/ : /additionalProperties/);
     const audit = await fs.readFile(logFile, "utf8");
     assert.doesNotMatch(audit, /PRIVATE_REASONING_DO_NOT_DISPLAY/);
     assert.match(audit, /thinking_reference/);
@@ -553,9 +663,13 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
   if (scenario === "plan-schema") {
     assert.ok(payloads.every(payload => payload.response_format.json_schema.strict === true));
     assert.deepEqual(payloads[0].response_format.json_schema.schema.required, ["verified"]);
+    assert.ok(payloads.every(payload => payload.messages.some(message => typeof message.content === "string"
+      && message.content.includes('"required":["verified"]') && message.content.includes('"additionalProperties":false'))),
+      "the active field contract must reach model context even when provider response format is strict");
     assert.ok(payloads[0].tools.some(tool => tool.function.name === "read"), "schema must retain Pi investigation");
   }
-  assert.equal(payloads[1].tools, undefined);
+  if (["plan-adaptive-context", "plan-adaptive-schema"].includes(scenario)) assert.ok(payloads[1].tools.some(tool => tool.function.name === "read"));
+  else assert.equal(payloads[1].tools, undefined);
   assert.deepEqual(result.telemetry.tokens, { input: 430, output: 20, cacheRead: 0, cacheWrite: 0 });
   assert.equal(result.telemetry.requestEstimates.length, 2);
   assert.equal(result.telemetry.requestEstimates[0].estimationMethod, "wire_bytes");

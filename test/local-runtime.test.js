@@ -21,20 +21,34 @@ async function fixture(t) {
 test("local runtime starts real services, reuses them and stops the process group", async t => {
   const { directory, port, url } = await fixture(t);
   const command = [process.execPath, "-e", `require('node:http').createServer((req,res)=>res.end('local acceptance')).listen(${port},'127.0.0.1')`];
-  const result = await startLocalRuntime(directory, directory, [{ name: "web", command, url }], directory, []);
+  const result = await startLocalRuntime(directory, directory, [{ name: "web", command, healthUrl: url, applicationUrl: url }], directory, []);
   assert.equal(result.status, "running");
   assert.equal(await (await fetch(url)).text(), "local acceptance");
-  assert.deepEqual((await startLocalRuntime(directory, directory, [{ name: "web", command, url }], directory, [])).services,
+  assert.deepEqual((await startLocalRuntime(directory, directory, [{ name: "web", command, healthUrl: url, applicationUrl: url }], directory, [])).services,
     result.services);
   assert.equal((await stopLocalRuntime(directory)).status, "stopped");
   assert.equal(localRuntimeStatus(directory).status, "stopped");
   await assert.rejects(fetch(url), /fetch failed/);
 });
 
+test("readiness probes the health endpoint independently of the browser application entry", async t => {
+  const { directory, port, url } = await fixture(t);
+  const healthUrl = `${url}health`, applicationUrl = `${url}templates`;
+  const command = [process.execPath, "-e", `require('node:http').createServer((req,res)=>{
+    if(req.url==='/health'){res.end('healthy');return;}
+    res.statusCode=503;res.end('application requires a user session');
+  }).listen(${port},'127.0.0.1')`];
+  const result = await startLocalRuntime(directory, directory, [{ name: "frontend", command, healthUrl, applicationUrl }], directory, []);
+  assert.equal(result.status, "running");
+  assert.equal(result.services[0].healthUrl, healthUrl);
+  assert.equal(result.services[0].applicationUrl, applicationUrl);
+  assert.equal((await fetch(applicationUrl)).status, 503, "application entry does not determine service readiness");
+});
+
 test("startup failure records output, closes all services and permits a clean retry", async t => {
   const { directory, url } = await fixture(t);
   const command = [process.execPath, "-e", "console.error('missing local dependency');process.exit(2)"];
-  const error = await startLocalRuntime(directory, directory, [{ name: "bad", command, url }], directory, [])
+  const error = await startLocalRuntime(directory, directory, [{ name: "bad", command, healthUrl: url, applicationUrl: url }], directory, [])
     .then(() => assert.fail("Startup must fail"), error => error);
   assert.match(error.message, /missing local dependency/);
   assert.equal(localRuntimeStatus(directory).status, "stopped");
@@ -47,7 +61,7 @@ test("startup receives configured values and redacts secrets split across output
   const command = [process.execPath, "-e", `process.stdout.write(process.env.DATABASE_PASSWORD.slice(0,5));
     setTimeout(()=>{process.stdout.write(process.env.DATABASE_PASSWORD.slice(5));process.exit(2);},50)`];
   const secret = "split-password-value";
-  const failure = await startLocalRuntime(directory, directory, [{ name: "bad", command, url }], directory,
+  const failure = await startLocalRuntime(directory, directory, [{ name: "bad", command, healthUrl: url, applicationUrl: url }], directory,
     ["DATABASE_PASSWORD"], 1000, { DATABASE_PASSWORD: secret }).then(() => assert.fail("must fail"), error => error);
   assert.doesNotMatch(failure.message, /split-password-value/);
   assert.match(failure.message, /REDACTED/);
@@ -66,7 +80,7 @@ test("catalogued frontend script starts from the repository root without a root 
   const [entry] = initializationCommands({ checks: [], files: {},
     packages: [{ path: "frontend app/package.json", scripts: ["serve"], packageManager: "npm@10.9.2" }] });
   const result = await startLocalRuntime(directory, directory,
-    [{ name: "frontend", command: entry.argv, url }], directory, [], 10000);
+    [{ name: "frontend", command: entry.argv, healthUrl: url, applicationUrl: url }], directory, [], 10000);
   assert.equal(result.status, "running");
   assert.equal(await (await fetch(url)).text(), await fs.realpath(frontend));
   assert.equal(entry.cwd, ".", "catalogue and controller share the same repository root");
@@ -78,7 +92,7 @@ test("an occupied port cannot be mistaken for successful startup", async t => {
   await new Promise(resolve => occupied.listen(port, "127.0.0.1", resolve));
   t.after(() => new Promise(resolve => occupied.close(resolve)));
   await assert.rejects(startLocalRuntime(directory, directory,
-    [{ name: "web", command: [process.execPath, "-e", "throw Error('must not execute')"], url }], directory, []), /端口已占用/);
+    [{ name: "web", command: [process.execPath, "-e", "throw Error('must not execute')"], healthUrl: url, applicationUrl: url }], directory, []), /端口已占用/);
   assert.equal(await (await fetch(url)).text(), "different app");
   assert.deepEqual(await fs.readdir(directory), []);
 });
@@ -86,7 +100,7 @@ test("an occupied port cannot be mistaken for successful startup", async t => {
 test("unhealthy startup times out and stops every service without discarding its logs", async t => {
   const { directory, port, url } = await fixture(t);
   const command = [process.execPath, "-e", `require('node:http').createServer((req,res)=>{res.statusCode=503;res.end('not ready')}).listen(${port},'127.0.0.1');console.log('unhealthy service')`];
-  const error = await startLocalRuntime(directory, directory, [{ name: "web", command, url }], directory, [], 400)
+  const error = await startLocalRuntime(directory, directory, [{ name: "web", command, healthUrl: url, applicationUrl: url }], directory, [], 400)
     .then(() => assert.fail("Unhealthy service must fail"), error => error);
   assert.match(error.message, /未就绪.*web/s);
   assert.match(await fs.readFile(error.runtime.services[0].logFile, "utf8"), /unhealthy service/);

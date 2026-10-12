@@ -28,7 +28,7 @@ export async function firstRunConfig(provider, model) {
   return validateConfig({ schemaVersion: 2, mode: "local", piExecutable,
     provider: provider.trim(), model: model.trim(), environment: { pi: [], checks: [], localDeployment: [] },
     allowedPaths: ["."], excludedPaths: [".env", ".npmrc", ".pi", ".codex", ".agents", ".claude", ".idea", ".vscode", "secrets", "credentials"],
-    maxSnapshotBytes: 100 * 1024 * 1024, maxPiMs: 300000, maxToolCalls: 60, maxEventBytes: 2000000, maxCostUsd: 2,
+    maxSnapshotBytes: 100 * 1024 * 1024, maxPiMs: 300000, maxToolCalls: 60, maxEventBytes: 2000000, maxCostUsd: null,
     codingStandards: { globalRules: [] }, fastPath: { enabled: false }, checks: [],
     testDeployment: { kind: "unconfigured" }, productionDeployment: { kind: "none" } });
 }

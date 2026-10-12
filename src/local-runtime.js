@@ -17,8 +17,8 @@ export function localRuntimeStatus(key) {
   const runtime = runtimes.get(key);
   if (!runtime) return { status: "stopped", services: [] };
   return { status: runtime.services.every(service => service.ready && !service.exited) ? "running" : "failed",
-    services: runtime.services.map(({ name, url, command, logFile, exited, error, healthError, tail, bytes }) =>
-      ({ name, url, command, logFile, exited, error, healthError, tail, logTruncated: bytes > 1024 * 1024 })) };
+    services: runtime.services.map(({ name, healthUrl, applicationUrl, command, logFile, exited, error, healthError, tail, bytes }) =>
+      ({ name, healthUrl, applicationUrl, command, logFile, exited, error, healthError, tail, logTruncated: bytes > 1024 * 1024 })) };
 }
 
 export async function stopLocalRuntime(key) {
@@ -53,7 +53,7 @@ export async function startLocalRuntime(key, workspace, startup, directory, envi
   await stopLocalRuntime(key);
   if (!startup.length) return { status: "not_applicable", services: [] };
   for (const service of startup) {
-    const url = new URL(service.url);
+    const url = new URL(service.healthUrl);
     await new Promise((resolve, reject) => {
       const socket = connect({ host: url.hostname === "[::1]" ? "::1" : url.hostname,
         port: Number(url.port || (url.protocol === "https:" ? 443 : 80)) });
@@ -104,7 +104,7 @@ export async function startLocalRuntime(key, workspace, startup, directory, envi
         if (service.error || service.exited) throw new Error(`${service.name} 启动失败：${service.error}\n${service.tail}`);
         try {
           const signal = executionSignal();
-          const response = await fetch(service.url, { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(500)]) : AbortSignal.timeout(500), redirect: "manual" });
+          const response = await fetch(service.healthUrl, { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(500)]) : AbortSignal.timeout(500), redirect: "manual" });
           await response.body?.cancel();
           service.ready = response.ok || (response.status >= 300 && response.status < 400);
           service.healthError = service.ready ? null : `HTTP ${response.status}`;
@@ -118,7 +118,7 @@ export async function startLocalRuntime(key, workspace, startup, directory, envi
       if (runtime.services.every(service => service.ready && !service.exited)) return localRuntimeStatus(key);
       await new Promise(resolve => setTimeout(resolve, 150));
     }
-    throw new Error(`本地服务在 ${timeoutMs / 1000} 秒内未就绪：${runtime.services.filter(service => !service.ready).map(service => `${service.name} ${service.url} ${service.healthError}\n${service.tail}`).join("\n")}`);
+    throw new Error(`本地服务在 ${timeoutMs / 1000} 秒内未就绪：${runtime.services.filter(service => !service.ready).map(service => `${service.name} ${service.healthUrl} ${service.healthError}\n${service.tail}`).join("\n")}`);
   } catch (error) {
     error.runtime = localRuntimeStatus(key);
     await stopLocalRuntime(key);

@@ -56,7 +56,7 @@ import {promises as fs} from 'node:fs';
 import {startLocalRuntime,stopAllLocalRuntimes,localRuntimePorts} from '/opt/reqflow/src/local-runtime.js';
 const directory=await fs.mkdtemp('/tmp/local-runtime-');
 const port=localRuntimePorts[0];
-await startLocalRuntime(directory,directory,[{name:'fixture',url:'http://127.0.0.1:'+port+'/',
+await startLocalRuntime(directory,directory,[{name:'fixture',healthUrl:'http://127.0.0.1:'+port+'/',applicationUrl:null,
 command:[process.execPath,'-e',"require('node:http').createServer((req,res)=>res.end('container local validation')).listen("+port+",'0.0.0.0')"]}],directory,[]);
 process.on('SIGTERM',async()=>{await stopAllLocalRuntimes();process.exit(0)});`);
   let localReady = false;

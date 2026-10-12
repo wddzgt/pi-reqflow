@@ -51,12 +51,16 @@ export async function runCommand(argv, cwd, timeoutMs, logFile, maxBytes, envNam
   const log = await fs.open(logFile, "wx", 0o600);
   const child = spawn(executable, args, { cwd, env: childEnv, stdio: ["ignore", "pipe", "pipe"],
     detached: process.platform !== "win32" });
+  let groupTerminated = false;
   const signalGroup = (signal) => {
+    if (groupTerminated) return;
     try {
       if (process.platform === "win32") child.kill(signal);
       else if (child.pid) process.kill(-child.pid, signal);
+      if (signal === "SIGKILL") groupTerminated = true;
     } catch (error) {
       if (error.code !== "ESRCH") throw error;
+      groupTerminated = true;
     }
   };
   let bytes = 0;
@@ -66,7 +70,7 @@ export async function runCommand(argv, cwd, timeoutMs, logFile, maxBytes, envNam
   let escalation;
   let terminationError;
   const terminate = () => {
-    if (escalation) return;
+    if (groupTerminated || escalation) return;
     try { signalGroup("SIGTERM"); }
     catch (error) { terminationError = error; child.kill("SIGKILL"); }
     escalation = setTimeout(() => {
@@ -91,7 +95,7 @@ export async function runCommand(argv, cwd, timeoutMs, logFile, maxBytes, envNam
   const capture = (stream, label) => stream.on("data", (part) => {
     bytes += part.length;
     tail = (tail + part.toString()).slice(-4000);
-    if (bytes > maxBytes) { exceeded = true; terminate(); return; }
+    if (maxBytes !== null && bytes > maxBytes) { exceeded = true; terminate(); return; }
     writes = writes.then(() => log.write(`${label}: ${part.toString()}`));
   });
   capture(child.stdout, "stdout");

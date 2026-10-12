@@ -25,19 +25,28 @@ export async function develop(projectPath, id, actor, authorizeImplementation, e
         scope: "plan requires human confirmation; then isolated implementation and verification; developer chooses local validation or test deployment" });
     });
     let automaticRetries = 0;
+    let previousAutomaticFailure;
+    let repeatedAutomaticFailure = 0;
     let pendingFailure = null;
-    for (let step = 0; step < 9; step++) {
+    for (let step = 0; step < 9 + automaticRetries * 3; step++) {
       assertExecutionActive();
       const { meta, directory, events } = await readTask(project, id);
       if (["implementation_failed", "verification_failed"].includes(meta.state)) {
         const failure = events.findLast(event => event.type === meta.state);
         const kind = meta.developmentFailure?.kind;
         const automatic = pendingFailure !== null;
+        const failureSignature = JSON.stringify([kind, failure.detail.error.split(";")[0],
+          failure.detail.checks?.filter(check => check.code !== 0).map(check => ({ command: check.command, code: check.code,
+            failures: check.tail?.match(/^(?:not ok .*|\s+error:.*|\s+code:.*)$/gm) }))]);
+        if (automatic) {
+          repeatedAutomaticFailure = previousAutomaticFailure === failureSignature ? repeatedAutomaticFailure + 1 : 1;
+          previousAutomaticFailure = failureSignature;
+        }
         const resumable = meta.state === "verification_failed" ? kind === "check_failed"
           : ["tool_limit", "timeout"].includes(kind)
             && (meta.changeCount > 0 || Boolean(failure.detail.telemetry?.sessionCheckpoint));
         let reason = failure.detail.error;
-        if (!automatic || (automaticRetries < 1 && resumable)) {
+        if (!automatic || (repeatedAutomaticFailure < 3 && resumable)) {
           const changes = events.findLast(event => ["implementation_failed", "implemented"].includes(event.type)).detail.changes;
           const files = [...new Set([...meta.developmentFiles, ...changes.map(change => change.file)])];
           const evidence = `Previous ${meta.state}: ${failure.detail.error}. Continue the approved requirement from retained files. Diagnose failures using current source and real checks; no new business scope.`.slice(0, 4000);
@@ -45,7 +54,7 @@ export async function develop(projectPath, id, actor, authorizeImplementation, e
             await resumeImplementation(projectPath, id, actor, evidence, files, undefined, undefined,
               { expectedPlanHash: meta.planHash, expectedAfterHash: meta.afterHash, automatic });
             if (automatic) automaticRetries++;
-            reportProgress(automatic ? "已保留本轮现场，正在自动继续或修复；本次最多自动恢复一次。" : "正在从已保存的代码和上下文继续执行。", "", "resuming");
+            reportProgress(automatic ? `已保留本轮现场，正在进行第 ${automaticRetries} 次恢复；相同现场连续失败三次时暂停。` : "正在从已保存的代码和上下文继续执行。", "", "resuming");
             pendingFailure = null;
             continue;
           } catch (error) { assertExecutionActive(); reason = error.message; }

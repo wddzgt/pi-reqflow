@@ -42,7 +42,7 @@ export async function runDeploymentAdapter(config, task, previous, logFile, limi
   const action = previous === null ? "submit" : "poll";
   if (!Number.isSafeInteger(config.timeoutMs) || config.timeoutMs < 1
       || !Number.isSafeInteger(limits.timeoutMs) || limits.timeoutMs < 1
-      || !Number.isSafeInteger(limits.maxBytes) || limits.maxBytes < 1) throw new Error("Deployment adapter requires positive timeout and log byte limits");
+      || limits.maxBytes !== null && (!Number.isSafeInteger(limits.maxBytes) || limits.maxBytes < 1)) throw new Error("Deployment adapter requires a positive timeout and explicit nullable log storage cap");
   if (action === "poll" && !adapter.poll) throw new Error(`Deployment adapter cannot poll: ${config.kind}`);
   if (!["test", "production"].includes(limits.environment) || !/^[a-f0-9]{64}$/.test(limits.sourceHash ?? "")
       || !/^[a-f0-9]{64}$/.test(task.planHash ?? "") || !/^[a-f0-9]{64}$/.test(task.contractHash ?? "")
@@ -88,7 +88,7 @@ export async function runDeploymentAdapter(config, task, previous, logFile, limi
   const result = { ...receipt, kind: config.kind, adapterVersion: adapter.version, operationKey: request.operationKey };
   const line = `${JSON.stringify({ action, request, deployment: result })}\n`;
   const existingBytes = action === "submit" ? 0 : (await fs.stat(logFile)).size;
-  if (existingBytes + Buffer.byteLength(line) > limits.maxBytes) throw new Error("Deployment evidence exceeds the configured log byte limit");
+    if (limits.maxBytes !== null && existingBytes + Buffer.byteLength(line) > limits.maxBytes) throw new Error("Deployment evidence exceeds the configured log byte limit");
   await fs.writeFile(logFile, line, { flag: action === "submit" ? "wx" : "a", mode: 0o600 });
   return result;
 }

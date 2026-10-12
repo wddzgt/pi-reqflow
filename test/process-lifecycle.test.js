@@ -24,6 +24,17 @@ test("Pi cumulative token limit stops execution and preserves measured billing",
 });
 
 test("timed-out check terminates signal-ignoring descendants", { skip: process.platform === "win32" }, async (t) => {
+  const kill = process.kill;
+  const terminatedGroups = new Set();
+  process.kill = function (pid, signal) {
+    if (pid < 0 && terminatedGroups.has(pid)) {
+      throw Object.assign(new Error("Already terminated process group"), { code: "EPERM" });
+    }
+    const result = kill.call(process, pid, signal);
+    if (pid < 0 && signal === "SIGKILL") terminatedGroups.add(pid);
+    return result;
+  };
+  t.after(() => { process.kill = kill; });
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-process-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const marker = path.join(directory, "late-check-write");
@@ -36,11 +47,23 @@ process.on('SIGTERM',()=>{});setTimeout(()=>process.exit(0),4500);\n`);
   await assert.rejects(runCommand([process.execPath, parent, marker], directory, 250,
     path.join(directory, "check.log"), 10000, []), /Command timed out/);
   assert.ok(Date.now() - started < 3000, "timeout must not wait for the signal-ignoring child");
+  assert.equal(terminatedGroups.size, 1, "the process group is terminated exactly once");
   await new Promise((resolve) => setTimeout(resolve, 2200));
   await assert.rejects(fs.stat(marker), { code: "ENOENT" });
 });
 
 test("timed-out Pi run terminates signal-ignoring descendants", { skip: process.platform === "win32" }, async (t) => {
+  const kill = process.kill;
+  const terminatedGroups = new Set();
+  process.kill = function (pid, signal) {
+    if (pid < 0 && terminatedGroups.has(pid)) {
+      throw Object.assign(new Error("Already terminated process group"), { code: "EPERM" });
+    }
+    const result = kill.call(process, pid, signal);
+    if (pid < 0 && signal === "SIGKILL") terminatedGroups.add(pid);
+    return result;
+  };
+  t.after(() => { process.kill = kill; });
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-pi-process-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));
   const marker = path.join(directory, "late-pi-write");
@@ -56,6 +79,7 @@ process.on('SIGTERM',()=>{});setTimeout(()=>process.exit(0),4500);\n`);
   await assert.rejects(runPi(project, directory, "plan", "read only",
     path.join(directory, "pi.log"), 1, null, [], { maxTokens: 2000 }), /AI 研发方案单次模型请求超过 .*执行时限/);
   assert.ok(Date.now() - started < 3000, "timeout must not wait for the signal-ignoring Pi child");
+  assert.equal(terminatedGroups.size, 1, "the process group is terminated exactly once");
   await new Promise((resolve) => setTimeout(resolve, 2200));
   await assert.rejects(fs.stat(marker), { code: "ENOENT" });
 });

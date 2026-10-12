@@ -37,7 +37,7 @@ export async function readExecutionSetup(projectPath) {
   return { configHash: sha256(JSON.stringify(project.config)), kind: deployment.kind, mode: project.config.mode,
     gitDelivery: project.config.gitDelivery ?? (project.config.mode === "git" ? { testMode: "branch" } : null),
     fields, credentialConfigured: remote && (stored !== null || names.every(name => Boolean(process.env[name]))),
-    timeoutMs: remote ? deployment.timeoutMs : project.config.maxPiMs,
+    timeoutMs: remote ? deployment.timeoutMs : project.config.executionTimeouts.deploymentMs,
     checksText: project.config.checks.map(command => quote(command)).join("\n"),
     deployCommand: project.config.testDeployment.kind === "local" ? quote(project.config.testDeployment.command) : "",
     url: project.config.testDeployment.url ?? "", checksEnvironment: project.config.environment.checks,

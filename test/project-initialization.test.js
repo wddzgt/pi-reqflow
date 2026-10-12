@@ -173,7 +173,7 @@ test("shared encrypted model credentials are available during initialization bef
   const config = JSON.parse(await fs.readFile(configFile, "utf8"));
   config.compatibleProviders = [{ name: "fake", baseUrl: "https://models.example/v1", apiKeyEnv: "SHARED_INIT_KEY",
     credentialId, thinkingToggle: false, models: [{ id: "fake", input: ["text"], contextWindow: 65536,
-      maxTokens: 8192, reasoning: false, supportsJsonSchema: true }] }];
+      maxTokens: 8192, reasoning: false, supportsJsonSchema: true, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] }];
   config.environment.pi.push("SHARED_INIT_KEY");
   await fs.writeFile(configFile, JSON.stringify(config));
   await fs.appendFile(config.piExecutable, "\nassert.equal(process.env.SHARED_INIT_KEY, 'shared-init-secret');\n");

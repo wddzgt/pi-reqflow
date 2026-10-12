@@ -37,7 +37,7 @@ test("pause aborts local readiness waiting and stops the service", async t => {
   const port = reservation.address().port; await new Promise(resolve => reservation.close(resolve));
   const running = controlledExecution(root, "local-validation", "dev", () => startLocalRuntime(root, root, [{ name: "slow",
     command: [process.execPath, "-e", `require('node:http').createServer((q,s)=>s.writeHead(503).end()).listen(${port},'127.0.0.1')`],
-    url: `http://127.0.0.1:${port}` }], root, [], 30000));
+    healthUrl: `http://127.0.0.1:${port}`, applicationUrl: null }], root, [], 30000));
   const rejected = assert.rejects(running, { code: "EXECUTION_PAUSED" });
   while (!localRuntimeStatus(root).services.length) await delay(20);
   pauseExecution(root, "dev"); await rejected;

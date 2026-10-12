@@ -41,6 +41,16 @@ test("plan validation identifies an oversized description instead of blaming fil
   assert.throws(() => planAnalysisInput(value, contract, project), /changes\[1\]\.description for tests\/test_cli\.py has 525 characters; maximum is 500/);
   value.changes[1].description = "x".repeat(500);
   assert.ok(planAnalysisInput(value, contract, project).markdown.includes("拟改位置与做法"));
+  value.validation.startup = [{ name: "frontend", command: ["npm", "run", "dev"],
+    healthUrl: "http://127.0.0.1:4180/health", applicationUrl: "http://127.0.0.1:4180/templates" }];
+  assert.match(planAnalysisInput(value, contract, project).markdown, /健康检查 .*\/health；应用入口 .*\/templates/);
+  value.validation.startup[0].applicationUrl = null;
+  assert.match(planAnalysisInput(value, contract, project).markdown, /应用入口 无页面/);
+  delete value.validation.startup[0].applicationUrl;
+  assert.throws(() => planAnalysisInput(value, contract, project), /应用入口/);
+  value.validation.startup = [{ name: "old", command: ["npm", "run", "dev"], url: "http://127.0.0.1:4180/" }];
+  assert.throws(() => planAnalysisInput(value, contract, project), /应用入口/);
+  value.validation.startup = [];
   value.domains.push("backend");
   assert.throws(() => planAnalysisInput(value, contract, project), /domains must be unique; repeated: backend/);
   value.domains.pop();

@@ -883,7 +883,8 @@ test("local validation opens automatically started services without an editable 
     globalThis.form=document.createElement('form');
     api=async(url,options)=>{if(url.startsWith('/api/local-environment-scan'))return {setup:{settings:null}};
       globalThis.started=JSON.parse(options.body);return {workspace:'/isolated/work',patch:null,status:'running',
-      services:[{name:'前端',url:'http://127.0.0.1:9000/',tail:'Ready'}]};};
+      services:[{name:'后端',healthUrl:'http://127.0.0.1:9001/health',applicationUrl:null,tail:'API ready'},
+        {name:'前端',healthUrl:'http://127.0.0.1:9000/health',applicationUrl:'http://127.0.0.1:9000/templates',tail:'Ready'}]};};
     structuredModal=(title,description,build,submit)=>{globalThis.fields=build(form);globalThis.submit=submit;};
     globalThis.sent=[];sendAction=async(action,input,returnResult)=>{
       if(returnResult)return api('/actions',{body:JSON.stringify({action,...input})});
@@ -891,7 +892,9 @@ test("local validation opens automatically started services without an editable 
   await run("openGitDelivery('local-validation')");
   assert.equal(context.sent.length, 0);
   assert.equal(context.started.expectedAfterHash, "shown-code");
-  assert.equal(run("form.children.find(node=>node.tagName==='A').href"), "http://127.0.0.1:9000/");
+  assert.equal(run("form.children.find(node=>node.tagName==='A').href"), "http://127.0.0.1:9000/templates");
+  assert.equal(run("form.children.filter(node=>node.tagName==='A').length"), 1);
+  assert.ok(run("form.children.some(node=>node.textContent.includes('9001/health'))"));
   assert.equal(run("fields.instructions"), undefined);
   assert.equal(run("fields.url"), undefined);
   await run("form.children.find(node=>node.textContent==='停止本地环境').listeners.click()");

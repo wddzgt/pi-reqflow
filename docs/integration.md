@@ -19,6 +19,8 @@
 
 产品交互仅讨论业务目标、当前和期望行为、业务规则、功能范围及验收结果。AI 内部读取项目，向产品翻译为业务影响，不要求产品决定文件、接口或数据结构。最终契约的 `inScope` 是业务功能，关键决定合并进最终字段，`answers` 为空；讨论与原文留在 `discussion` 供回看，不自动传给研发 Agent。技术定位由方案分析返回 `affectedFiles`，任何实施均受此获批清单限制。`getRequirementEvidence().planAnalysis` 提供影响、待执行场景、专项发现与阻断项，页面无需单独创建角色评审步骤。
 
+需求分析在声明待定版前，使用最终输出的完整 JSON Schema 和当前准入策略校验；`admissionDefaults.maxAcceptance`（默认 8）仅为规划参考，不限制验收项数量。完整场景、边界和断言必须保留，不能为满足参考值合并或截断验收项。结构错误在模型结束前反馈修正，修正失败明确报错并保留原分析和候选。校验策略更新后须重新分析候选，再确认新的分析哈希；结构校验不代替产品对业务完整性的确认。
+
 方案沟通通过授权动作 `discuss-plan` 接入，消息为 `{ text, expectedPlanHash }`，返回只读建议并在 `getRequirementEvidence().planDiscussion` 中留痕。直接编辑通过 `edit-plan`，传 `{ candidate, feedback, expectedPlanHash }`；candidate 为完整的结构化方案草稿，必须覆盖冻结验收，不能作为审批传入。新版本由 AI 核对并附 `candidateReview` 理由，仍等待研发确认。`approve-plan` 携带显示时的 `expectedPlanHash`，确认后自动实施、验证，停在人工确认交付的步骤；本地验证和测试发布可选，过期审批拒绝执行。分工指派和审核接口见 [研发设计与分工审核](development-design.md)。
 
 管理员及已接受当前项目分工的研发通过 `GET/POST /api/project-execution` 配置测试发布；POST 要求当前会话、同源及 CSRF token，写入参数数组并留审计。输入包含 kind，选择 unconfigured / local / jenkins / gitlab / github；unconfigured 的 url 必须为空，可独立保存 checksText，固定测试环境不影响方案设计。远程平台使用 fields 与 timeoutMs，令牌由服务端私有文件保存，GET 不返回值。同权限的 `POST /api/deployment-connection` 只验证平台连接，不触发发布。字段与接入协议见 [内置发布工具](ci-platforms.md)。研发方案选择相关检查并说明跳过依据；无合适自动检查时明确等待人工验证。开发检查完成后返回 next=choose-validation，目录项目与 Git 项目均可人工确认归档，也可按需选择本地验证或显式发布；环境未配置不阻挡归档。
@@ -28,6 +30,10 @@ Git 信息通过 `GET /api/project-git` 读取。`approve-plan` 可传 developme
 `local-validation` 要求 expectedPlanHash、expectedAfterHash，负责研发按已批准方案及选定启动目标启动服务，返回工作目录、Git 补丁、检查、validation、environment 和运行状态。operation 可为 start 或 stop；不接受手填 environment。启动前扫描并检查私有环境配置，缺条件返回 blocked 并保留代码；发现数据库初始化或启动回调时，须传 confirmStartupEffects=true 和当前 expectedEnvironmentRevision。服务可访问不代表业务验收通过。
 
 本地配置通过 `GET /api/local-environment-scan` 扫描，`GET/POST /api/local-environment` 读取及保存，`POST /api/local-environment-check` 检查；管理员与已接受当前项目分工的研发可操作。普通查看者通过 `GET /api/environment-status` 查看状态和允许范围内的配置历史。扫描不执行项目，检查仅验证必需变量及受支持依赖的 TCP 端口，密码不返回页面；POST 沿用同源和 CSRF 校验。配置保存绑定扫描哈希及已有配置版本。
+
+方案 `validation.startup` 的服务为 `{name, command, healthUrl, applicationUrl}`，两个地址均需回环 HTTP/HTTPS；无页面时 `applicationUrl=null`，不可省略。`local-validation` 的 `services` 保留这两个字段，`environment.applications` 返回选中服务的 `{name,url}` 页面入口列表，不能用健康地址或首个服务推导页面。旧单地址方案需重新生成审核，系统不改写旧审计证据。
+
+`read_plan` 每次可请求 1–3000 字符，实际页面同时受模型工具结果字节预算限制；调用方按返回的 `text.length` 前进，直到 `totalChars`，不得假设每页等长。版本哈希和来源校验继续适用。
 
 `accept-test` 必须传 evidence 和 acceptanceMode=manual/local/deployed。manual 在 verified 状态人工确认研发交付，不要求环境；local 要求当前代码及环境版本的实际本地验证；deployed 要求 test_deployed 状态和有效测试环境版本。manual/local 还须传当前 expectedPlanHash、expectedAfterHash；未经审核的实际变更先由负责研发具名确认。动作完成验收后直接归档，记录实际方式、人员与版本，不把未执行的环境验证算作通过。
 

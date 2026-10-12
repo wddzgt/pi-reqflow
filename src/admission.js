@@ -21,8 +21,7 @@ export function validateAdmissionPolicy(policy) {
   for (const key of Object.keys(admissionDefaults).filter((key) => !["restrictedPaths", "budgetMode"].includes(key))) {
     if (!Number.isSafeInteger(policy[key]) || policy[key] < 1) throw new Error(`admission.${key} must be an explicit positive integer`);
   }
-  if (policy.maxFiles > 30) throw new Error("admission.maxFiles cannot exceed the 30-file analysis bound");
-  if (!Array.isArray(policy.restrictedPaths) || policy.restrictedPaths.length > 30
+  if (!Array.isArray(policy.restrictedPaths)
       || new Set(policy.restrictedPaths).size !== policy.restrictedPaths.length
       || policy.restrictedPaths.some((file) => typeof file !== "string" || !file || path.posix.isAbsolute(file)
         || file.includes("\\") || path.posix.normalize(file) !== file || file.split("/").includes(".."))) throw new Error("admission.restrictedPaths must be unique project-relative prefixes");
@@ -30,7 +29,7 @@ export function validateAdmissionPolicy(policy) {
 }
 
 export function admissionInput(value, files) {
-  if (!value || !Array.isArray(value.modules) || !value.modules.length || value.modules.length > 30
+  if (!value || !Array.isArray(value.modules) || !value.modules.length || value.modules.length > files.length
       || value.modules.some((item) => !item || typeof item.name !== "string" || !item.name.trim() || item.name.length > 100 || !Array.isArray(item.files)
         || !item.files.length || item.files.some((file) => !files.includes(file))
         || typeof item.evidence !== "string" || !item.evidence.trim() || item.evidence.length > 1000)) throw new Error("Admission needs named business modules, file scope and evidence");
@@ -39,7 +38,7 @@ export function admissionInput(value, files) {
       || scoped.length !== files.length || new Set(scoped).size !== files.length) {
     throw new Error(`Admission modules must cover every affected file exactly once; missing files: ${JSON.stringify(files.filter(file => !scoped.includes(file)))}; repeated files: ${JSON.stringify([...new Set(scoped.filter((file, index) => scoped.indexOf(file) !== index))])}; module names must be unique`);
   }
-  if (!Array.isArray(value.deliveryUnits) || !value.deliveryUnits.length || value.deliveryUnits.length > 10
+  if (!Array.isArray(value.deliveryUnits) || !value.deliveryUnits.length
       || new Set(value.deliveryUnits.map((item) => item?.name)).size !== value.deliveryUnits.length
       || value.deliveryUnits.some((item) => !item || typeof item.name !== "string" || !item.name.trim() || item.name.length > 100
         || typeof item.evidence !== "string" || !item.evidence.trim() || item.evidence.length > 1000)) throw new Error("Admission needs independently deployable units and evidence");

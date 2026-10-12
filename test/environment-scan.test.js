@@ -54,8 +54,8 @@ test("frontend target excludes backend dependencies and injects only selected se
   assert.equal(inspected.report.status, "ready");
   assert.deepEqual(inspected.names, ["API_TOKEN"]);
   assert.deepEqual(Object.keys(inspected.environments), ["app:frontend"]);
-  const startup = [{ name: "frontend", command: ["npm", "--prefix", "frontend", "run", "dev"], url: "http://localhost:3000/" },
-    { name: "backend", command: ["mvn", "-f", "backend/pom.xml", "spring-boot:run"], url: "http://localhost:8080/" }];
+  const startup = [{ name: "frontend", command: ["npm", "--prefix", "frontend", "run", "dev"], healthUrl: "http://localhost:3000/", applicationUrl: "http://localhost:3000/" },
+    { name: "backend", command: ["mvn", "-f", "backend/pom.xml", "spring-boot:run"], healthUrl: "http://localhost:8080/", applicationUrl: null }];
   const selected = environmentStartup(inspected, startup);
   assert.deepEqual(selected.startup, [startup[0]]);
   assert.deepEqual(selected.environments, { frontend: { API_TOKEN: "frontend-private" } });

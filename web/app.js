@@ -502,10 +502,12 @@ function renderDetail() {
     panel.append(link);
   } else if (meta.state === "test_deployed") {
     panel.append(element("p", "plain-copy", "部署命令已完成，尚未配置可访问地址。请管理员在项目运行配置中补充测试环境地址，再核实部署结果。"));
-  } else if (meta.state === "verified" && meta.localValidation?.environment?.url) {
-    const link = element("a", "button", "打开本地测试地址");
-    link.href = meta.localValidation.environment.url; link.target = "_blank"; link.rel = "noopener";
-    panel.append(link);
+  } else if (meta.state === "verified" && meta.localValidation?.status === "running") {
+    for (const application of meta.localValidation.environment.applications) {
+      const link = element("a", "button", `打开 ${application.name}`);
+      link.href = application.url; link.target = "_blank"; link.rel = "noopener";
+      panel.append(link);
+    }
   }
   if (isArchived) {
     const strip = element("div", "archive-summary");
@@ -1741,6 +1743,13 @@ function modelProfileFields(container, saved) {
     fields[name] = input;
   }
   fields.capabilities = {};
+  fields.cost = {};
+  advanced.append(element("p", "intake-caption", "USD 单价按每百万 Token 填写。全部留空表示价格未知，不代表免费；设置费用上限时必须提供四项单价。"));
+  for (const [name, title] of [["input", "输入"], ["output", "输出"], ["cacheRead", "缓存读取"], ["cacheWrite", "缓存写入"]]) {
+    const input = formField(advanced, `${title}单价（USD / 百万 Token）`);
+    input.type = "number"; input.min = 0; input.step = "any"; input.value = String(saved.cost?.[name] ?? "");
+    fields.cost[name] = input;
+  }
   advanced.append(element("p", "intake-caption", "按供应商实际能力配置。思考开关与 reasoning_effort 参数并非所有模型都支持。"));
   for (const [name, title] of [["reasoning", "支持思考"], ["thinkingToggle", "接受 enable_thinking 参数"],
     ["supportsReasoningEffort", "接受 reasoning_effort 参数"], ["supportsJsonSchema", "支持严格 JSON Schema"], ["imageInput", "支持图片输入"]]) {
@@ -1767,6 +1776,9 @@ function modelProfileInput(fields) {
   values.maxToolCalls = fields.saved.maxToolCalls;
   Object.assign(values, Object.fromEntries(Object.entries(fields.capabilities).map(([name, input]) => [name, input.checked])));
   values.modelUsage = { ...fields.saved.modelUsage };
+  const prices = Object.values(fields.cost).map(input => input.value.trim());
+  if (prices.some(Boolean) && prices.some(value => value === "")) throw new Error("请填写全部四项单价，或全部留空。" );
+  values.cost = prices.every(value => value === "") ? null : Object.fromEntries(Object.entries(fields.cost).map(([name, input]) => [name, Number(input.value)]));
   return values;
 }
 
@@ -1779,7 +1791,8 @@ async function openModelSettings() {
     form.append(element("h3", "content-heading", "默认配置")); fields.default = modelProfileFields(form, setup.default);
     appendModelTest(form, "default", () => modelProfileInput(fields.default), projectId);
     fields.maxCostUsd = formField(fields.default.advanced, "单个需求费用上限（USD）");
-    fields.maxCostUsd.type = "number"; fields.maxCostUsd.min = 0.001; fields.maxCostUsd.step = "any"; fields.maxCostUsd.value = setup.maxCostUsd;
+    fields.maxCostUsd.type = "number"; fields.maxCostUsd.min = 0.001; fields.maxCostUsd.step = "any"; fields.maxCostUsd.value = String(setup.maxCostUsd ?? "");
+    fields.maxCostUsd.placeholder = "留空表示不设置费用上限";
     form.append(element("h3", "content-heading", "Agent 模型"), element("p", "intake-caption", "默认继承项目模型；展开对应 Agent，取消继承即可单独设置。"));
     for (const [agent, title] of Object.entries(modelAgentLabels)) {
       const section = element("details", "model-agent"); const summary = element("summary", "", title); section.append(summary); form.append(section);
@@ -1809,7 +1822,7 @@ async function openModelSettings() {
     await api("/api/model-settings", { method: "POST", headers: { "Content-Type": "application/json", "X-Reqflow-Token": state.token },
       body: JSON.stringify({ expectedConfigHash: setup.expectedConfigHash, default: modelProfileInput(fields.default),
         agents: Object.fromEntries(Object.entries(fields.agents).map(([agent, row]) => [agent, row.inherit.checked ? null : modelProfileInput(row.inputs)])),
-        maxCostUsd: Number(fields.maxCostUsd.value) }) });
+        maxCostUsd: fields.maxCostUsd.value.trim() === "" ? null : Number(fields.maxCostUsd.value) }) });
     fields.default.apiKey.value = ""; for (const row of Object.values(fields.agents)) if (row.inputs) row.inputs.apiKey.value = "";
     await refresh(); toast("模型设置已保存。后续调用使用新配置，已有需求、方案和审核记录保留。");
   }, "保存模型配置");
@@ -2032,7 +2045,7 @@ async function openPlanApproval() {
     for (const item of validation.checks) form.append(element("p", "plain-copy", `自动检查：${item.command.join(" ")} · ${item.reason}`));
     for (const item of validation.skipped) form.append(element("p", "plain-copy", `跳过：${item.command.join(" ")} · ${item.reason}`));
     if (!validation.checks.length) form.append(element("p", "plain-copy", `待人工验证：${validation.manualReason}`));
-    for (const service of validation.startup) form.append(element("p", "plain-copy", `本地启动：${service.name} · ${service.url}`));
+    for (const service of validation.startup) form.append(element("p", "plain-copy", `本地启动：${service.name} · 健康检查 ${service.healthUrl} · 应用入口 ${service.applicationUrl ?? "无页面"}`));
     if (!setup) return {};
     form.append(element("p", "plain-copy", `方案 v${meta.planVersion} · 基础版本 ${meta.baseRevision?.slice(0, 12)} · 合并目标 ${setup.releaseBranch}`));
     const kind = formField(form, "开发分支", "select");
@@ -2089,7 +2102,10 @@ async function openGitDelivery(action, startupConfirmation = null) {
     structuredModal("本地环境验证", result.status === "running" ? "项目已启动。按方案中的验收场景验证，也可关闭窗口后发布测试环境。" : "此项目没有常驻本地服务。按方案验证 CLI/库，也可直接发布测试环境。", form => {
       form.append(element("p", "plain-copy", `工作目录：${result.workspace}`));
       for (const service of result.services) {
-        const link = element("a", "button", `打开 ${service.name}`); link.href = service.url; link.target = "_blank"; link.rel = "noopener"; form.append(link);
+        form.append(element("p", "plain-copy", `${service.name} · 健康检查 ${service.healthUrl}`));
+        if (service.applicationUrl !== null) {
+          const link = element("a", "button", `打开 ${service.name}`); link.href = service.applicationUrl; link.target = "_blank"; link.rel = "noopener"; form.append(link);
+        }
         const log = element("pre", "archive-result"); log.textContent = service.tail; form.append(log);
       }
       if (result.status === "running") {

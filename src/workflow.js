@@ -3,7 +3,7 @@ import path from "node:path";
 import { allowedFile, describePolicy, loadProject, validateConfig } from "./config.js";
 import { localRuntimePorts, stopLocalRuntime } from "./local-runtime.js";
 import { baselineAgentContext, readProjectBaseline } from "./baseline.js";
-import { assertInside, copyFiles, manifest, manifestHash, sha256, writeJson } from "./files.js";
+import { assertInside, compareManifests, copyFiles, manifest, manifestHash, sha256, writeJson } from "./files.js";
 import { runPi } from "./pi-runner.js";
 import { appendEvent, readTask, taskPath, withLock } from "./store.js";
 import { assertReleaseRevision, inspectChanges, preparePlanWorkspace, prepareReleaseCandidate, prepareWorkspace, rollbackWorkspace, sourceManifest, sourceRevision } from "./workspace.js";
@@ -68,7 +68,7 @@ function resultReport(meta, events) {
     `Pi 成本：${usage.costUsd === null ? "未知（缺少完整计价证据；零价格记录不代表免费）" : `$${usage.costUsd.toFixed(4)}`}\n\n` +
     `人工验收人：${meta.acceptedBy ?? "未验收"}\n\n` +
     (meta.acceptanceMode === "manual" ? `验收方式：人工确认研发交付；未以本地运行或测试环境发布作为验收依据。\n\n研发检查：${meta.verificationMode === "manual_pending" ? "无合适自动检查，已记录人工确认结论；不代表自动测试通过" : "方案选定的相关检查已通过"}\n\n` : "") +
-    (meta.acceptanceMode === "local" ? `验证方式：研发本地验证；地址：${meta.localValidation.environment.url || "通过本地启动步骤访问"}\n\n本地启动说明：${meta.localValidation.environment.instructions}\n\n` : "") +
+    (meta.acceptanceMode === "local" ? `验证方式：研发本地验证；地址：${meta.localValidation.environment.applications.map(app => `${app.name} ${app.url}`).join("；") || "无应用页面，按方案验证服务或CLI"}\n\n本地启动说明：${meta.localValidation.environment.instructions}\n\n` : "") +
     `需求分支：${meta.branch ?? "目录工作区"}；已推送版本：${meta.publishedRevision ?? "未推送"}\n\n` +
     `研发交付版本：${meta.afterHash ?? "未形成"}\n\n` +
     `测试环境版本：${meta.testDeployment ? meta.testCandidate?.publishedRevision ?? meta.publishedRevision ?? meta.afterHash : "未发布"}\n\n` +
@@ -96,7 +96,7 @@ export async function plan(projectPath, id) {
     const contract = JSON.parse(await fs.readFile(path.join(directory, `contract-v${meta.contractVersion}.json`), "utf8"));
     if (sha256(JSON.stringify(contract)) !== meta.contractHash) throw new Error("Confirmed contract changed before planning");
     const standards = resolveStandards(project.config, meta.aiAligned ? Object.keys((await readProjectBaseline(project)).files) : contract.inScope);
-    const remainingCost = project.config.maxCostUsd - meta.intakeCostUsd - meta.reviewCostUsd - (meta.planCostUsd ?? 0);
+    const remainingCost = (project.config.maxCostUsd ?? Infinity) - meta.intakeCostUsd - meta.reviewCostUsd - (meta.planCostUsd ?? 0);
     if (remainingCost <= 0) {
       await appendEvent(project, id, "pi_budget_exhausted", meta, { phase: "plan", reason: "Requirement cost budget exhausted" });
       throw new Error("Requirement cost budget exhausted before planning");
@@ -122,7 +122,7 @@ export async function plan(projectPath, id) {
       partial: (event.detail.text ?? event.detail.reply.reply).length > 500 }));
     const reviewPolicy = project.config.planReview ?? "risk-based";
     const contextHash = sha256(JSON.stringify([meta.contractHash, baseHash, projectBaseline.snapshotHash,
-      configHash, revision, standards.hash, sha256(feedback), discussion.map(event => event.hash), "design-v8-root-commands", reviewPolicy,
+      configHash, revision, standards.hash, sha256(feedback), discussion.map(event => event.hash), "design-v10-explicit-application-entry", reviewPolicy,
       process.env.REQFLOW_LOCAL_RUNTIME_CONTAINER === "1", localRuntimePorts]));
     const checkpoint = events.findLast(event => event.type === "plan_draft_completed"
       && event.detail.contextHash === contextHash && event.detail.version === meta.planVersion + 1);
@@ -166,7 +166,7 @@ export async function plan(projectPath, id) {
       }
       if (!checkpoint) result = await runPi(project, planningWorkspace, "plan", prompt + boundaryPrompt + designPrompt
         + (process.env.REQFLOW_LOCAL_RUNTIME_CONTAINER === "1"
-          ? `\n本地启动运行在Docker容器中，${localRuntimePorts.join("、")}已经映射到宿主机回环地址。每个startup服务选择这5个端口之一，监听0.0.0.0，健康和访问地址使用http://127.0.0.1:对应端口；前端代理后端也使用对应容器端口。需要更改启动参数或代理配置时列入方案，不让用户另填命令。`
+          ? `\n本地启动运行在Docker容器中，${localRuntimePorts.join("、")}已经映射到宿主机回环地址。每个startup服务选择这5个端口之一，监听0.0.0.0，healthUrl和applicationUrl分别明确配置，均使用http://127.0.0.1:对应端口；前端代理后端也使用对应容器端口。需要更改启动参数或代理配置时列入方案，不让用户另填命令。`
           : "\n本地服务运行在工作台主机，监听回环地址；核实现有端口和依赖后选择启动参数。")
         + "\n保留关键逻辑伪代码，也可用少量关键代码说明：优先展示核心判断、身份映射、事务或写入边界，通常5–10行；多个文件复用同一逻辑时只在核心文件展示，其他文件用修改说明交代。纯展示、配置或样式文件没有关键逻辑时pseudocode为空。每个文件最多1600字符，禁止输出完整Java类、Vue组件、全部实现或大段样板代码；实际实现由后续Pi完成。返回前核对字段长度。"
         + '\n仅在选择出图时：Mermaid source 必须包含图类型声明，kind=flow 的首行为 flowchart TD（或合法方向），kind=sequence 的首行为 sequenceDiagram；之后才写节点或 participant，不能省略首行，也不要加 Markdown 围栏。流程图节点标签统一用双引号包围，如 A["用户选择模板"]、B{"是否冲突"}。'
@@ -174,7 +174,7 @@ export async function plan(projectPath, id) {
         + "\n返回前逐项核对设计的一致性：接口请求与前端调用、数据主记录与关联记录的身份映射、事务边界、跳过/覆盖的写入范围必须在文字、图、伪代码中一致。涉及删除或恢复字段必须直接读实体、schema和服务，既有字段与需要新增的字段明确区分，新增字段所需迁移也要列入拟改文件；不得凭项目文档假设已有支持。普通技术纠错直接写入方案，不转化为人工问答；新增关系表等扩大范围的建议先检查是否确有必要。"
         + (meta.planHash ? `\n正在收敛已有方案 ${meta.planHash}。通过read_plan读取当前相关设计、specialists和discussion原文；已明确的研发决定只核实是否偏离需求，不重复追问。过去AI意见不是人类审批，不能盲从；同一根因合并修正。近期沟通导航：${JSON.stringify(recentDiscussion)}。不论修改几轮，都以当前冻结需求为准。` : "")
         + (priorPlan?.draft.design ? `\n已有方案的接口索引：${JSON.stringify(priorPlan.draft.design.interfaces.map(({ name, method, path }) => ({ name, method, path })))}。本轮是在这份方案上局部修订，不是重新设计：未被意见、源码事实或冻结需求否定的接口路径、请求响应和文件职责必须保留；确有必要改动时在approach说明原因，并同步更新前后端、接口和关键伪代码。更改数据恢复方式不能顺带重新命名接口或重建Controller。请求响应、拟改文件和其余原文通过read_plan按需读取。` : "")
-        + "\n另返回 validation={checks:[{command:argv数组,reason:源码依赖和验收依据}],skipped:[{command:argv数组,reason:与影响范围无关的具体依据}],manualReason:字符串,startup:[{name,command:argv数组,url:回环HTTP地址}]}。检查和启动命令都从项目根目录运行。先读现有脚本、测试和调用依赖，只选择影响范围内的用例或构建；项目检查配置只是候选，禁止默认全量回归，无关失败不阻塞也不修复。后端改动也选择对应类/方法/依赖调用方测试。没有合适自动检查时checks=[]，manualReason说明人工验收步骤，绝不伪称通过。startup描述可选本地验证需要的前后端服务及其真实健康地址，明确回环绑定和端口；检查依赖/环境，不猜测凭据。缺启动脚本时将最小启动方式的文件纳入affectedFiles和changes，交由编码补齐。CLI或库没有常驻服务可startup=[]。用户不填写命令；相关检查通过后人工确认即可归档，不配置环境也可以；本地启动验证和测试环境发布均为可选步骤，不强制最终环境自动化测试。"
+        + "\n另返回 validation={checks:[{command:argv数组,reason:源码依赖和验收依据}],skipped:[{command:argv数组,reason:与影响范围无关的具体依据}],manualReason:字符串,startup:[{name,command:argv数组,healthUrl:回环健康HTTP地址,applicationUrl:应用入口或null}]}。检查和启动命令都从项目根目录运行。先读现有脚本、测试和调用依赖，只选择影响范围内的用例或构建；项目检查配置只是候选，禁止默认全量回归，无关失败不阻塞也不修复。后端改动也选择对应类/方法/依赖调用方测试。没有合适自动检查时checks=[]，manualReason说明人工验收步骤，绝不伪称通过。startup描述可选本地验证需要的前后端服务；healthUrl仅用于就绪探测，applicationUrl用于打开应用页面，无页面的后端明确为null，禁止用健康地址充当页面入口，明确回环绑定和端口；检查依赖/环境，不猜测凭据。缺启动脚本时将最小启动方式的文件纳入affectedFiles和changes，交由编码补齐。CLI或库没有常驻服务可startup=[]。用户不填写命令；相关检查通过后人工确认即可归档，不配置环境也可以；本地启动验证和测试环境发布均为可选步骤，不强制最终环境自动化测试。"
         + `\n项目根目录命令目录：${JSON.stringify(initializationCommands(projectBaseline))}。复用其中已包含子目录参数的argv，不得丢掉--prefix/--dir/--cwd。子目录有脚本不等于根目录有脚本；例如frontend/package.json的serve必须用["npm","--prefix","frontend","run","serve"]。Maven没有根pom.xml时用-f指定真实pom.xml路径，-pl只选择已有聚合项目的模块，不能代替-f。逐项直接读取启动配置核对端口、监听地址、前端代理和可返回成功状态的健康路径，url必须与命令一致，不得猜8080/8081。核对数据库启动初始化和外部依赖，避免本地验证对现有业务数据库执行建表或初始化写入；需要变更启动参数时显式写入command。`
         + "\nAssess the real runtime feature, not only its isolated tests: persistent writes require impacts.data=changed and documented data recovery. Persistence alone is not irreversible. Use reversible only with concrete backup/restore steps and verification; irreversible means no documented recovery can restore the affected state. Test isolation does not establish code_only recovery for a data feature. Missing operational recovery facts stay unresolved; never invent them. Existing loaders and builtin registration must be read from real source, not guessed."
         + "\n有INSERT、UPDATE或逻辑删除时，即使没有DDL也不能把数据恢复写成code_only。给出受影响记录/旧值的备份或记录方式、失败事务回滚及必要时恢复的具体步骤和验证，核实后才能标documented。运维恢复步骤不等于增加用户可见的撤销功能，也不强制独立回退脚本；能用已有可靠方式就复用，缺少必要事实再提问。沟通中的AI建议须核实，不得直接沿用'代码回滚可恢复数据库'等错误结论。"
@@ -225,16 +225,24 @@ export async function plan(projectPath, id) {
       draftRecorded = true;
       let checked = await reviewPlanAnalysis(project, id, drafted, directory, planningWorkspace, baseHash, draft, contract, specialistRoles, contextHash);
       let internalCorrection = null;
-      const technicalFindings = checked.results.flatMap(row => row.findings.findings
+      let correctionAttempts = 0;
+      let previousTechnicalFailure;
+      let repeatedTechnicalFailures = 0;
+      let technicalFindings = checked.results.flatMap(row => row.findings.findings
         .filter(item => item.severity === "blocking").map(item => ({ role: row.role, ...item })));
-      if (admission.status !== "out_of_scope" && !draft.openQuestions.length
+      while (admission.status !== "out_of_scope" && !draft.openQuestions.length
           && !["product_confirmation", "human_led"].includes(draft.candidateReview?.status)
           && (admission.reasons.length || technicalFindings.length)) {
+        const failureSignature = sha256(JSON.stringify([admission.reasons, technicalFindings]));
+        repeatedTechnicalFailures = previousTechnicalFailure === failureSignature ? repeatedTechnicalFailures + 1 : 1;
+        previousTechnicalFailure = failureSignature;
+        if (repeatedTechnicalFailures >= 3) break;
+        correctionAttempts++;
         const priorAnalysisHash = sha256(JSON.stringify(draft));
         const correctionCheckpoint = (await readTask(project, id)).events.findLast(event => event.type === "plan_correction_completed"
           && event.detail.contextHash === contextHash && event.detail.version === version
           && event.detail.priorAnalysisHash === priorAnalysisHash);
-        const correctionLog = path.join(directory, `plan-v${version}-attempt-${attempt}-correction.events.jsonl`);
+        const correctionLog = path.join(directory, `plan-v${version}-attempt-${attempt}-correction-${correctionAttempts}.events.jsonl`);
         let correctionRun;
         try {
           if (correctionCheckpoint) {
@@ -270,17 +278,17 @@ export async function plan(projectPath, id) {
               recovery: currentDesign.boundaries.recovery.status, openQuestions: currentDesign.openQuestions,
               ...(revisionProposal ? { candidateReview: currentDesign.candidateReview } : {}) };
             await appendEvent(project, id, "plan_correction_started", checked.meta, { contextHash, version, priorAnalysisHash,
-              reasons: admission.reasons, findings: technicalFindings, maxCorrections: 1 });
-            const correctionPrompt = `局部研发方案纠错。内部检查发现具体问题，请核实源码并修正，不让研发充当技术问题传话人。仅返回指定JSON修改对象：所有字段必须出现，未修改的字段显式为null；design仅返回需要修改的小节，其余小节为null。控制器保留原值，不要重新输出整份方案。\n冻结需求哈希：${meta.contractHash}\n冻结需求 JSON：${JSON.stringify(contract)}\n适用代码规范：${standardsPrompt(standards)}\n当前方案导航：${JSON.stringify(navigation)}\n承接检查：${JSON.stringify(admission.reasons)}\n专项检查：${JSON.stringify(technicalFindings)}\n完整草稿已落盘。用read_plan的planHash=${priorAnalysisHash}按需读取问题涉及的小节；数组小节整体替换前读取完整旧内容，保留无关条目。不要加载全部原文或旧聊天。\n这是本轮唯一一次内部修正。合并同一根因，检查意见也必须客观核实；只改必要内容，保留合理接口路径、请求响应和文件职责。补齐前端调用对应的接口及后端处理，同步相关伪代码和验证。恢复步骤不得扩大为需求外的撤销功能。涉及业务取舍、数据授权或调查后仍未知的风险，明确写入openQuestions并给建议，不替人决定；复杂工作写入真实承接边界。不得删验收、弱化检查或隐藏未知以通过。发现只是实现细节时保留最简做法，由Pi和真实测试验证。`;
-            const remaining = project.config.maxCostUsd - checked.meta.intakeCostUsd - checked.meta.reviewCostUsd - checked.meta.planCostUsd;
+              reasons: admission.reasons, findings: technicalFindings, attempt: correctionAttempts, repeatedTechnicalFailures });
+            const correctionPrompt = `局部研发方案纠错。内部检查发现具体问题，请核实源码并修正，不让研发充当技术问题传话人。仅返回指定JSON修改对象：所有字段必须出现，未修改的字段显式为null；design仅返回需要修改的小节，其余小节为null。控制器保留原值，不要重新输出整份方案。\n冻结需求哈希：${meta.contractHash}\n冻结需求 JSON：${JSON.stringify(contract)}\n适用代码规范：${standardsPrompt(standards)}\n当前方案导航：${JSON.stringify(navigation)}\n承接检查：${JSON.stringify(admission.reasons)}\n专项检查：${JSON.stringify(technicalFindings)}\n完整草稿已落盘。用read_plan的planHash=${priorAnalysisHash}按需读取问题涉及的小节；数组小节整体替换前读取完整旧内容，保留无关条目。不要加载全部原文或旧聊天。\n本轮按具体阻断纠错；有新证据或问题收敛时继续，相同问题连续重复时暂停。合并同一根因，检查意见也必须客观核实；只改必要内容，保留合理接口路径、请求响应和文件职责。补齐前端调用对应的接口及后端处理，同步相关伪代码和验证。恢复步骤不得扩大为需求外的撤销功能。涉及业务取舍、数据授权或调查后仍未知的风险，明确写入openQuestions并给建议，不替人决定；复杂工作写入真实承接边界。不得删验收、弱化检查或隐藏未知以通过。发现只是实现细节时保留最简做法，由Pi和真实测试验证。`;
+            const remaining = (project.config.maxCostUsd ?? Infinity) - checked.meta.intakeCostUsd - checked.meta.reviewCostUsd - checked.meta.planCostUsd;
             if (remaining <= 0) throw new Error("Requirement cost budget exhausted before internal plan correction");
             correctionRun = await runPi(project, planningWorkspace, "plan", correctionPrompt
               + `\nverification修改协议：为null表示全部测试项保持不变；否则必须为按验收编号组织的对象，包含${JSON.stringify(contract.acceptance.map(item => item.id))}所有键。仅修改涉及的验收项为{scenario,regression}，其他键为null。不得返回数组、删除验收或重新编号。`
               + "\nchanges和design.components只返回需要更新的文件条目，按file合并，未返回文件保留旧说明/伪代码。design.interfaces只返回需要更新或新增的接口，按method/path合并，未返回接口保留旧契约。这些修改数组不能删除条目；完整内容通过read_plan按需读取，禁止捏造路径。affectedFiles等其他数组仍为完整替换，通常保持null。变更后端接口时同步前端调用、组件伪代码和测试。普通技术建议（例如缺失数据源的提示）采用最简方案，不把已冻结业务行为重新提问。",
               correctionLog, remaining, null, [], {
-               ...modelAllowance((await readTask(project, id)).events, policy), developerSession: true, resumeSession: developerSession, contextFiles: draft.affectedFiles,
+               ...modelAllowance((await readTask(project, id)).events, policy), developerSession: true, contextFiles: draft.affectedFiles,
               planContract: contract, planCorrection: { draftFile: (await readTask(project, id)).events.findLast(event =>
-                ["plan_draft_completed", "plan_draft_reused"].includes(event.type) && event.detail.analysisHash === priorAnalysisHash).detail.draftFile,
+                ["plan_draft_completed", "plan_draft_reused", "plan_correction_completed"].includes(event.type) && event.detail.analysisHash === priorAnalysisHash).detail.draftFile,
                 draftHash: priorAnalysisHash },
               outputSchema: correctionSchema, discussionTask: id, authoritativeContext: { contractHash: meta.contractHash, contract } });
             draft = planAnalysisInput(JSON.parse(correctionRun.text), contract, project, { draft, sourceFiles: Object.keys(baseline) });
@@ -295,7 +303,7 @@ export async function plan(projectPath, id) {
           if (mismatch) throw new Error(`Plan file path case does not match the verified source index: ${mismatch}`);
           if (revisionProposal && draft.candidateReview?.proposalHash !== sha256(JSON.stringify(revisionProposal))) throw new Error("Plan correction changed the developer proposal binding");
           if (!correctionCheckpoint) {
-            const draftFile = path.join(directory, `plan-correction-v${version}-attempt-${attempt}.json`);
+            const draftFile = path.join(directory, `plan-correction-v${version}-attempt-${attempt}-${correctionAttempts}.json`);
             await fs.writeFile(draftFile, JSON.stringify(draft, null, 2), { flag: "wx", mode: 0o600 });
             const correctedMeta = { ...checked.meta, planCostUsd: checked.meta.planCostUsd + correctionRun.costUsd };
             await appendEvent(project, id, "plan_correction_completed", correctedMeta, { contextHash, version, priorAnalysisHash,
@@ -312,8 +320,10 @@ export async function plan(projectPath, id) {
          developerSession = correctionCheckpoint ? correctionCheckpoint.detail.telemetry.sessionCheckpoint : correctionRun.telemetry.sessionCheckpoint;
          admission = assessAdmission(draft, contract, policy);
         specialistRoles = admission.eligible ? planSpecialists(draft, reviewPolicy) : [];
-        checked = await reviewPlanAnalysis(project, id, checked.meta, directory, planningWorkspace, baseHash, draft, contract, specialistRoles, contextHash, 1);
-        internalCorrection = { attempts: 1, maxAttempts: 1 };
+        checked = await reviewPlanAnalysis(project, id, checked.meta, directory, planningWorkspace, baseHash, draft, contract, specialistRoles, contextHash, correctionAttempts);
+        technicalFindings = checked.results.flatMap(row => row.findings.findings
+          .filter(item => item.severity === "blocking").map(item => ({ role: row.role, ...item })));
+        internalCorrection = { attempts: correctionAttempts, repeatedTechnicalFailures };
       }
       const blockers = [...admission.reasons,
         ...(["product_confirmation", "human_led"].includes(draft.candidateReview?.status) ? draft.candidateReview.reasons : []),
@@ -323,8 +333,8 @@ export async function plan(projectPath, id) {
         label: "待补充", eligible: false, reasons: blockers } : admission;
       for (const [index, command] of draft.validation.checks.map(item => item.command).entries()) {
         const checkLog = path.join(directory, `baseline-v${version}-attempt-${attempt}-check-${index + 1}.log`);
-        const result = await runCommand(command, planningWorkspace, project.config.maxPiMs, checkLog,
-          project.config.maxEventBytes, project.config.environment.checks, project.config.checkSandbox);
+        const result = await runCommand(command, planningWorkspace, project.config.executionTimeouts.checksMs, checkLog,
+          project.config.maxAuditBytes ?? null, project.config.environment.checks, project.config.checkSandbox);
         baselineChecks.push({ command, logFile: checkLog, ...result });
         if (!Number.isInteger(result.code) || result.signal !== null) throw new Error(`Baseline check did not finish normally: ${command.join(" ")}`);
       }
@@ -395,7 +405,7 @@ export async function revisePlan(projectPath, id, actor, feedback, authorization
         throw new Error("Delegated plan revision requires current development authorization");
       }
     }
-    if ((admissionPolicy(project.config).budgetMode === "strict" || authorizationHash !== undefined)
+    if (admissionPolicy(project.config).budgetMode === "strict"
         && (meta.planAttempts ?? 0) >= admissionPolicy(project.config).maxPlanAttempts) {
       const error = "Plan revision limit reached; hand off to the responsible developer";
       await appendEvent(project, id, "execution_boundary_stopped", { ...meta, executionBoundary: [error] }, { error, phase: "plan" });
@@ -691,7 +701,7 @@ export async function implement(projectPath, id) {
     const planText = await fs.readFile(path.join(directory, `plan-v${meta.planVersion}.md`), "utf8");
     if (sha256(planText) !== meta.planHash) throw new Error("Approved plan changed before implementation");
     const previousImplementationCost = meta.implementationCostUsd ?? 0;
-    const remainingCost = project.config.maxCostUsd - meta.intakeCostUsd - meta.reviewCostUsd - meta.planCostUsd - previousImplementationCost;
+    const remainingCost = (project.config.maxCostUsd ?? Infinity) - meta.intakeCostUsd - meta.reviewCostUsd - meta.planCostUsd - previousImplementationCost;
     if (remainingCost <= 0) {
       await appendEvent(project, id, "pi_budget_exhausted", meta, { phase: "implement", reason: "Requirement cost budget exhausted" });
       throw new Error("Requirement cost budget exhausted before implementation");
@@ -700,6 +710,7 @@ export async function implement(projectPath, id) {
     const prepared = resumed ? { workspace: meta.workspace, branch: meta.branch, baselineHash: meta.baselineHash }
       : await prepareWorkspace(project, id, meta.baseHash, meta.baseRevision, meta.developmentBranch, meta.restartCount ?? 0);
     const baseline = JSON.parse(await fs.readFile(path.join(directory, "baseline.json"), "utf8"));
+    if (manifestHash(baseline) !== prepared.baselineHash) throw new Error("Implementation baseline manifest changed");
     prepared.runtimeDependencies = [];
     for (const file of Object.keys(baseline).filter(file => path.posix.basename(file) === "package.json")) {
       const sourceDirectory = path.posix.dirname(file);
@@ -742,7 +753,7 @@ export async function implement(projectPath, id) {
       const implementationGuidance = specialistGuidance.length
         ? `\n方案审核中的实施建议：${JSON.stringify(specialistGuidance)}。核实源码后在已冻结需求及批准权限内落实，不扩大范围，不把建议当成新的业务决定。` : "";
       const currentFiles = await manifest(prepared.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes);
-      const currentChanges = await inspectChanges(project, id, prepared.workspace);
+      const currentChanges = compareManifests(baseline, currentFiles);
       const pathGuidance = `\nController-verified approved path status: ${JSON.stringify((resumed ? meta.resumeImplementationFiles : meta.developmentFiles).map(file => ({ file, existsInWorkspace: Object.hasOwn(currentFiles, file) })))}. Paths marked false are planned NEW files, not missing source evidence. Create them in the approved location; parent directories may also be new. Do not read or list a nonexistent planned file or parent directory. Investigate existing source through the verified source index instead.`;
       result = await runPi({ ...project, config: { ...project.config, checks: commands } }, prepared.workspace, "implement", prompt + resolvedGuidance + verificationGuidance + implementationGuidance + pathGuidance,
         path.join(directory, attempt === 1 ? "implement.events.jsonl" : `implement-attempt-${attempt}.events.jsonl`), remainingCost,
@@ -760,7 +771,7 @@ export async function implement(projectPath, id) {
               items: analysis.resolution.items.map(item => ({ ...item,
                 sources: item.sources.map(({ text, ...reference }) => reference) })) } : null },
             projectReference: reference, specialistGuidance, currentState: "approved", implementationScope,
-             workspaceState: { sourceHash: manifestHash(currentFiles), changes: currentChanges.changes },
+              workspaceState: { sourceHash: manifestHash(currentFiles), changes: currentChanges },
              ...(resumed ? { diagnosis } : {}) },
           sourceQuery: JSON.stringify({ changes: analysis.draft.changes, impacts: analysis.draft.impacts }) });
       inspected = await inspectChanges(project, id, prepared.workspace);
@@ -815,8 +826,8 @@ export async function verify(projectPath, id) {
     try {
       for (const [index, command] of commands.entries()) {
         const logFile = path.join(directory, `${checkPrefix}check-${index + 1}.log`);
-        const result = await runCommand(command, meta.workspace, project.config.maxPiMs, logFile,
-          project.config.maxEventBytes, project.config.environment.checks, project.config.checkSandbox);
+        const result = await runCommand(command, meta.workspace, project.config.executionTimeouts.checksMs, logFile,
+          project.config.maxAuditBytes ?? null, project.config.environment.checks, project.config.checkSandbox);
         results.push({ command, logFile, ...result });
         if (result.code !== 0) throw Object.assign(new Error(`Check failed: ${command.join(" ")}; ${result.tail}`), { code: "CHECK_FAILED" });
       }
@@ -985,12 +996,12 @@ export async function deployTest(projectPath, id) {
       taskId: id, url: project.config.testDeployment.url, revision: deploymentMeta.publishedRevision ?? deploymentHash, status: "submitting" });
     try {
       const deployment = await deployConfigured(project.config.testDeployment, deploymentMeta, logFile, {
-        timeoutMs: project.config.testDeployment.kind === "local" ? project.config.maxPiMs : project.config.testDeployment.timeoutMs, maxBytes: project.config.maxEventBytes,
+        timeoutMs: project.config.testDeployment.kind === "local" ? project.config.executionTimeouts.deploymentMs : project.config.testDeployment.timeoutMs, maxBytes: project.config.maxAuditBytes ?? null,
         envNames: project.config.environment.localDeployment,
         environment: "test", sourceHash: deploymentHash, credentialArchive: project.archive,
       });
       if (deployment.url === undefined && project.config.testDeployment.url !== undefined) deployment.url = project.config.testDeployment.url;
-      if (deployment.status === "succeeded") deployment.environment = await verifyTestEnvironment({ url: deployment.url }, logFile, project.config.maxPiMs);
+      if (deployment.status === "succeeded") deployment.environment = await verifyTestEnvironment({ url: deployment.url }, logFile, project.config.executionTimeouts.startupMs);
       if (manifestHash(await manifest(meta.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== current) {
         throw new Error("Test deployment modified verified workspace files");
       }
@@ -1024,13 +1035,13 @@ export async function pollTestDeployment(projectPath, id) {
     try {
       if (candidate && manifestHash(await manifest(candidate.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== sourceHash) throw new Error("Integrated workspace changed after verification");
       result = await pollConfiguredDeployment(project.config.testDeployment, deploymentMeta, meta.testDeployment, logFile, {
-        timeoutMs: project.config.testDeployment.timeoutMs, maxBytes: project.config.maxEventBytes,
+        timeoutMs: project.config.testDeployment.timeoutMs, maxBytes: project.config.maxAuditBytes ?? null,
         environment: "test", sourceHash, credentialArchive: project.archive,
       });
       if (manifestHash(await manifest(meta.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== meta.afterHash) throw new Error("Deployment polling modified verified workspace files");
       if (candidate && manifestHash(await manifest(candidate.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== sourceHash) throw new Error("Deployment polling modified integrated workspace files");
       if (result.url === undefined && project.config.testDeployment.url !== undefined) result.url = project.config.testDeployment.url;
-      if (result.status === "succeeded") result.environment = await verifyTestEnvironment({ url: result.url }, logFile, project.config.maxPiMs);
+      if (result.status === "succeeded") result.environment = await verifyTestEnvironment({ url: result.url }, logFile, project.config.executionTimeouts.startupMs);
     } catch (error) {
       await appendEvent(project, id, "test_deploy_poll_failed", meta, { error: error.message, logFile,
         deployment: meta.testDeployment });
@@ -1216,8 +1227,8 @@ export async function verifyCandidate(projectPath, id) {
     try {
       for (const [index, command] of (meta.developmentChecks).entries()) {
         const logFile = path.join(directory, `merge-check-${index + 1}.log`);
-        const result = await runCommand(command, candidate.candidateWorkspace, project.config.maxPiMs, logFile,
-          project.config.maxEventBytes, project.config.environment.checks, project.config.checkSandbox);
+        const result = await runCommand(command, candidate.candidateWorkspace, project.config.executionTimeouts.checksMs, logFile,
+          project.config.maxAuditBytes ?? null, project.config.environment.checks, project.config.checkSandbox);
         results.push({ command, logFile, ...result });
         if (result.code !== 0) throw new Error(`Merged result failed check: ${command.join(" ")}; ${result.tail}`);
       }
@@ -1275,7 +1286,7 @@ export async function release(projectPath, id) {
     await appendEvent(project, id, "release_submitting", active, { logFile, candidateHash: before });
     try {
       const deployment = await deployConfigured(project.config.productionDeployment, target, logFile, {
-        timeoutMs: project.config.productionDeployment.kind === "local" ? project.config.maxPiMs : project.config.productionDeployment.timeoutMs, maxBytes: project.config.maxEventBytes,
+        timeoutMs: project.config.productionDeployment.kind === "local" ? project.config.executionTimeouts.deploymentMs : project.config.productionDeployment.timeoutMs, maxBytes: project.config.maxAuditBytes ?? null,
         envNames: project.config.environment.localDeployment,
         environment: "production", sourceHash: before, credentialArchive: project.archive,
       });
@@ -1306,7 +1317,7 @@ export async function pollRelease(projectPath, id) {
       const target = { ...meta, workspace: meta.candidateWorkspace,
         branch: project.config.mode === "git" ? project.config.releaseBranch : null, publishedRevision: meta.mergedRevision };
       result = await pollConfiguredDeployment(project.config.productionDeployment, target, meta.productionDeployment, logFile, {
-        timeoutMs: project.config.productionDeployment.timeoutMs, maxBytes: project.config.maxEventBytes,
+        timeoutMs: project.config.productionDeployment.timeoutMs, maxBytes: project.config.maxAuditBytes ?? null,
         environment: "production", sourceHash: meta.candidateHash, credentialArchive: project.archive,
       });
       if (manifestHash(await manifest(meta.candidateWorkspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== meta.candidateHash) throw new Error("Deployment polling modified candidate files");

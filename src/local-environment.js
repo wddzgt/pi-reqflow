@@ -243,7 +243,7 @@ export function environmentStartup(inspected, startup) {
     if (argv.some(value => /spring(?:-boot\.run|\.profiles|\.config)\.(?:profiles|active|include|location|additional-location|import)=/.test(value)))
       throw new Error(`${service.name} 启动命令指定了额外 Spring 配置，当前扫描未覆盖，请核对验证配置。`);
     const environment = inspected.environments[app.id] ?? {};
-    for (const name of ["PORT", "SERVER_PORT"]) if (environment[name] && Number(environment[name]) !== Number(new URL(service.url).port))
+    for (const name of ["PORT", "SERVER_PORT"]) if (environment[name] && Number(environment[name]) !== Number(new URL(service.healthUrl).port))
       throw new Error(`${service.name} 配置的端口与已确认方案的检查地址不同，请核对方案。`);
     selected.push(service); environments[service.name] = environment; appIds.add(app.id);
   }

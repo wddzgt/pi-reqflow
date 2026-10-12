@@ -6,7 +6,7 @@ export const designSchema = { type: "object", additionalProperties: false,
     frontend: { type: "string", maxLength: 4000, description: "Relevant UI changes, states, calls and error handling; aim for 100–250 Chinese characters. Explain interactions in text even without a diagram." },
     backend: { type: "string", maxLength: 4000, description: "Relevant business logic, validation and compatibility; aim for 100–250 Chinese characters. Keep behavior consistent with the interface contract." },
     data: { type: "string", minLength: 1, maxLength: 2000, description: "Concrete data handling and recovery; aim for 100–200 Chinese characters." },
-    interfaces: { type: "array", maxItems: 12, items: { type: "object", additionalProperties: false,
+    interfaces: { type: "array", items: { type: "object", additionalProperties: false,
       required: ["name", "method", "path", "status", "sourceFile", "request", "response", "errors"], properties: {
         name: { type: "string", minLength: 1, maxLength: 120 }, method: { type: "string", minLength: 1, maxLength: 30 },
         path: { type: "string", minLength: 1, maxLength: 200 }, status: { type: "string", enum: ["existing", "modified", "new"] },
@@ -19,7 +19,7 @@ export const designSchema = { type: "object", additionalProperties: false,
         title: { type: "string", minLength: 1, maxLength: 120 }, kind: { type: "string", enum: ["flow", "sequence"] },
         domain: { type: "string", enum: ["frontend", "backend", "shared"] }, source: { type: "string", minLength: 1, maxLength: 4000,
           description: "Complete raw Mermaid source, without Markdown fences. For kind=flow the first line must be flowchart TD (or another valid direction); for kind=sequence the first line must be sequenceDiagram. Include this declaration before nodes or participants." } } } },
-    components: { type: "array", minItems: 1, maxItems: 30, items: { type: "object", additionalProperties: false,
+    components: { type: "array", minItems: 1, items: { type: "object", additionalProperties: false,
       required: ["file", "domain", "location", "pseudocode"], properties: {
         file: { type: "string", minLength: 1 }, domain: { type: "string", enum: ["frontend", "backend", "shared"] },
         location: { type: "string", minLength: 1, maxLength: 500 }, pseudocode: { type: "string", maxLength: 1600,
@@ -35,8 +35,8 @@ export function validateDesign(draft) {
         || (["approach", "data"].includes(key) && !design[key].trim())
         || (draft.domains.includes(key) && !design[key].trim())) throw new Error(`研发设计 ${key} 说明缺失或超过长度限制。`);
   }
-  for (const [key, max] of [["interfaces", 12], ["diagrams", 3], ["components", 30]]) {
-    if (!Array.isArray(design[key]) || design[key].length > max) throw new Error(`研发设计 ${key} 必须是有界数组。`);
+  for (const key of ["interfaces", "diagrams", "components"]) {
+    if (!Array.isArray(design[key]) || (key === "diagrams" && design[key].length > 3)) throw new Error(`研发设计 ${key} 数组无效。`);
     const schema = designSchema.properties[key].items;
     for (const [index, row] of design[key].entries()) {
       if (!row || typeof row !== "object" || Array.isArray(row)

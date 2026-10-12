@@ -13,7 +13,7 @@ export const defaultModelUsage = Object.freeze({ maxTokens: 60000, maxContextByt
   initializationMaxRequests: 1, initializationMaxToolCalls: 8 });
 const configFields = new Set(["schemaVersion", "mode", "piExecutable", "provider", "model", "environment",
   "allowedPaths", "excludedPaths", "maxSnapshotBytes", "maxPiMs", "maxToolCalls", "maxEventBytes",
-  "maxCostUsd", "fastPath", "planReview", "checks", "checkSandbox", "testDeployment", "productionDeployment",
+  "maxCostUsd", "executionTimeouts", "maxAuditBytes", "fastPath", "planReview", "checks", "checkSandbox", "testDeployment", "productionDeployment",
   "baseBranch", "releaseBranch", "branchPrefix", "remote", "gitDelivery", "codingStandards", "agentModels", "admission", "modelUsage", "modelParameters", "thinking", "structuredOutput", "modelFallbacks", "compatibleProviders", "implementationScope"]);
 
 function rejectUnknown(value, fields, label) {
@@ -112,7 +112,13 @@ export function validateConfig(config) {
       if (!Array.isArray(provider.models) || !provider.models.length || provider.models.length > 16) throw new Error("Provider requires 1..16 models");
       for (const model of provider.models) {
         if (!model || typeof model !== "object" || Array.isArray(model)) throw new Error("Invalid compatible provider model");
-        rejectUnknown(model, ["id", "input", "contextWindow", "maxTokens", "reasoning", "supportsReasoningEffort", "supportsJsonSchema"], "compatible provider model");
+        rejectUnknown(model, ["id", "input", "contextWindow", "maxTokens", "reasoning", "supportsReasoningEffort", "supportsJsonSchema", "cost"], "compatible provider model");
+        if (model.cost !== undefined) {
+          rejectUnknown(model.cost, ["input", "output", "cacheRead", "cacheWrite"], "model.cost");
+          for (const key of ["input", "output", "cacheRead", "cacheWrite"]) {
+            if (!Number.isFinite(model.cost[key]) || model.cost[key] < 0) throw new Error(`model.cost.${key} requires an explicit USD price per million tokens`);
+          }
+        }
         nonempty(model.id, "compatible provider model.id");
         if (model.supportsJsonSchema !== undefined && typeof model.supportsJsonSchema !== "boolean") throw new Error("Invalid model supportsJsonSchema capability");
         if (!Array.isArray(model.input) || !model.input.includes("text") || model.input.some(type => !["text", "image"].includes(type)) || new Set(model.input).size !== model.input.length) throw new Error("Invalid model input capabilities");
@@ -182,8 +188,15 @@ export function validateConfig(config) {
   if (!Number.isSafeInteger(config.maxPiMs) || config.maxPiMs < 1) throw new Error("config.maxPiMs must be positive");
   if (!Number.isSafeInteger(config.maxToolCalls) || config.maxToolCalls < 1) throw new Error("config.maxToolCalls must be positive");
   if (!Number.isSafeInteger(config.maxEventBytes) || config.maxEventBytes < 1) throw new Error("config.maxEventBytes must be positive");
-  if (typeof config.maxCostUsd !== "number" || !Number.isFinite(config.maxCostUsd) || config.maxCostUsd <= 0) {
-    throw new Error("config.maxCostUsd must be positive");
+  if (config.maxAuditBytes !== undefined && (!Number.isSafeInteger(config.maxAuditBytes) || config.maxAuditBytes < 1)) throw new Error("config.maxAuditBytes must be a positive storage cap");
+  if (config.executionTimeouts !== undefined) {
+    rejectUnknown(config.executionTimeouts, ["checksMs", "startupMs", "deploymentMs"], "executionTimeouts");
+    for (const key of ["checksMs", "startupMs", "deploymentMs"]) {
+      if (!Number.isSafeInteger(config.executionTimeouts[key]) || config.executionTimeouts[key] < 1) throw new Error(`executionTimeouts.${key} must be explicit and positive`);
+    }
+  }
+  if (config.maxCostUsd !== null && (typeof config.maxCostUsd !== "number" || !Number.isFinite(config.maxCostUsd) || config.maxCostUsd <= 0)) {
+    throw new Error("config.maxCostUsd must be null (no monetary cap) or positive");
   }
   if (config.codingStandards !== undefined) {
     const standards = config.codingStandards;
@@ -357,6 +370,7 @@ export function validateConfig(config) {
     }
   }
   return { ...config, implementationScope: config.implementationScope ?? "project",
+    executionTimeouts: config.executionTimeouts ?? { checksMs: 300000, startupMs: 120000, deploymentMs: 600000 },
     thinking: config.thinking ?? "off", modelUsage: { ...defaultModelUsage, ...config.modelUsage },
     codingStandards: config.codingStandards ?? { globalRules: [] },
     excludedPaths: [...new Set([...reserved, ...config.excludedPaths])] };
@@ -422,6 +436,7 @@ export function describePolicy(input) {
       fastPath: config.fastPath ?? { enabled: false },
       admission: admissionPolicy(config),
       limits: { maxSnapshotBytes: config.maxSnapshotBytes, maxPiMs: config.maxPiMs,
+        executionTimeouts: config.executionTimeouts, maxAuditBytes: config.maxAuditBytes ?? null,
         maxToolCalls: config.maxToolCalls, maxEventBytes: config.maxEventBytes,
         maxCostUsd: config.maxCostUsd, modelUsage: config.modelUsage },
       environmentNames: config.environment,

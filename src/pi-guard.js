@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import Ajv from "ajv";
 import { runCommand } from "./commands.js";
 import { manifest, manifestHash } from "./files.js";
@@ -34,12 +35,32 @@ function relativePath(input) {
 }
 
 export default function (pi) {
+  const dependencies = [];
   pi.on("session_start", (_event, ctx) => {
     if (fs.realpathSync(ctx.cwd) !== root) {
       process.stderr.write(`REQFLOW_WORKSPACE_STOP: Pi session cwd ${ctx.cwd} differs from authorized workspace ${root}\n`);
       process.exit(1);
     }
     pi.appendEntry("reqflow_workspace_bound", { workspace: root, phase });
+    if (phase !== "initialize") {
+      for (const names of [["fd", "fdfind"], ["rg"]]) {
+        let checked;
+        for (const name of names) {
+          const result = spawnSync(name, ["--version"], { encoding: "utf8", timeout: 5000, maxBuffer: 8192 });
+          if (result.error?.code === "ENOENT") continue;
+          checked = { name, result }; break;
+        }
+        if (!checked || checked.result.error || checked.result.status !== 0) {
+          const reason = checked ? checked.result.error?.message ?? `exit ${checked.result.status}: ${checked.result.stderr.trim()}` : "not installed";
+          process.stderr.write(`REQFLOW_DEPENDENCY_STOP: ${names[0]} ${reason}. Install fd and ripgrep in the service PATH or shared Pi bin directory before retrying; model was not called.\n`);
+          process.exit(1);
+        }
+        dependencies.push({ name: checked.name, version: checked.result.stdout.trim() });
+      }
+    }
+  });
+  pi.on("before_agent_start", () => {
+    if (phase !== "initialize") pi.appendEntry("reqflow_dependencies_checked", { dependencies });
   });
   if (policy.historyProject) {
     const relevantHistory = new Set();
@@ -86,10 +107,11 @@ export default function (pi) {
       return { content: [{ type: "text", text: JSON.stringify(result) }], details: { discussion: true } };
     } });
   if (policy.historyProject && policy.discussionTask) pi.registerTool({ name: "read_plan", label: "Read archived plan details",
-    description: "Read a necessary section of the current requirement's exact archived plan, active saved planning draft or discussion. Use the supplied planHash or draftHash when a summary omits relevant logic, interfaces, test evidence or an earlier decision; do not load every section by default. AI opinions and drafts do not grant approval.",
+    description: "Read a necessary section of the current requirement's exact archived plan, active saved planning draft or discussion. Each call requires maxChars between 1 and 3000 inclusive. Results also fit the configured byte budget and may contain fewer characters. Start at offset=0, then advance offset by returned text.length until totalChars is reached when a whole section is needed. Read only sections relevant to current findings. Use supplied planHash or draftHash. AI opinions and drafts do not grant approval.",
     parameters: { type: "object", additionalProperties: false, required: ["planHash", "section", "offset", "maxChars"],
       properties: { planHash: { type: "string" }, section: { type: "string", enum: planMaterialSections },
-        offset: { type: "integer", minimum: 0 }, maxChars: { type: "integer", minimum: 1, maximum: 1000 } } },
+        offset: { type: "integer", minimum: 0, description: "Character offset; advance by the previous returned text.length to read the next page." },
+        maxChars: { type: "integer", minimum: 1, maximum: 3000, description: "Requested page size, 1–3000 characters; actual page also fits the byte budget. Advance by returned text.length." } } },
     async execute(_id, input) {
       const result = await readPlanMaterial(policy.historyProject, policy.discussionTask, input);
       pi.appendEntry("reqflow_plan_read", { taskId: result.taskId, planHash: result.planHash,
@@ -100,7 +122,7 @@ export default function (pi) {
     if (!process.env[provider.apiKeyEnv]) throw new Error(`Missing provider credential environment variable: ${provider.apiKeyEnv}`);
     pi.registerProvider(provider.name, { baseUrl: provider.baseUrl, apiKey: `$${provider.apiKeyEnv}`,
       api: "openai-completions", models: provider.models.map(model => ({ ...model, name: model.id,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        cost: model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         compat: { maxTokensField: "max_tokens", supportsDeveloperRole: false, supportsReasoningEffort: model.supportsReasoningEffort === true } })) });
   }
   let requests = 0;
@@ -114,6 +136,8 @@ export default function (pi) {
   let planStopped;
   let intakeCorrections = 0;
   let intakeStopped;
+  let reviewCorrections = 0;
+  const validationFailures = { intake: { fingerprint: null, repeated: 0 }, plan: { fingerprint: null, repeated: 0 }, review: { fingerprint: null, repeated: 0 } };
   let tokensUsed = 0;
   let compacting = false;
   let compacted = false;
@@ -138,11 +162,11 @@ export default function (pi) {
     const inputReserve = Math.ceil(Buffer.byteLength(JSON.stringify({ messages: preparation.messagesToSummarize,
       turn: preparation.turnPrefixMessages, previousSummary: preparation.previousSummary })) / 2) + 4000 * compactionCalls;
     const requestedOutput = Math.min(Math.floor(0.8 * preparation.settings.reserveTokens), ctx.model.maxTokens) * compactionCalls;
-    if (phase !== "implement" && policy.modelUsage && (requests + cumulativeCompactionCalls + compactionCalls + 1 > requestCeiling + planCorrections + intakeCorrections
+    if (policy.modelUsage?.budgetMode !== "adaptive" && policy.modelUsage && (requests + cumulativeCompactionCalls + compactionCalls + 1 > requestCeiling + planCorrections + intakeCorrections + reviewCorrections
         || policy.providerRequestLimit !== undefined && providerRequests + cumulativeCompactionCalls + compactionCalls + 1 > policy.providerRequestLimit)) {
       process.stderr.write("REQFLOW_BUDGET_STOP: native compaction and final response exceed remaining request limit\n"); process.exit(1);
     }
-    if (phase !== "implement" && policy.modelUsage && tokensUsed + inputReserve + requestedOutput > tokenCeiling) {
+    if (policy.modelUsage && tokensUsed + inputReserve + requestedOutput > tokenCeiling) {
       if (policy.modelUsage.budgetMode !== "adaptive") {
         process.stderr.write("REQFLOW_BUDGET_STOP: remaining tokens cannot fund native compaction\n"); process.exit(1);
       }
@@ -209,7 +233,8 @@ export default function (pi) {
     const inlineFields = [];
     const additional = Object.fromEntries(Object.entries(policy.authoritativeContext).filter(([key, value]) => {
       const text = typeof value === "string" ? value : JSON.stringify(value);
-      if (text !== undefined && Buffer.byteLength(text) >= 256 && current.includes(text)) {
+      if (text !== undefined && Buffer.byteLength(text) >= 256
+          && (current.includes(text) || typeof value === "string" && current.includes(JSON.stringify(value)))) {
         inlineFields.push(key); return false;
       }
       return true;
@@ -242,15 +267,21 @@ export default function (pi) {
   pi.on("turn_end", event => { lastFailure = event.message?.stopReason === "error" ? event.message : undefined; });
   // Provider failures end this run. Administrators change the explicit selection; never switch models automatically.
   if (phase === "intake" && policy.intakeValidation) {
+    const validateIntake = policy.outputSchema ? new Ajv({ allErrors: true }).compile(policy.outputSchema.schema) : null;
     pi.on("agent_before_settle", async () => {
       if (lastFailure) return;
       try {
         const text = latestAssistant.content.filter(part => part.type === "text").map(part => part.text).join("\n");
-        analysisInput(JSON.parse(text), policy.intakeValidation.inputHash, policy.intakeValidation.sourceFiles);
+        const output = JSON.parse(text);
+        if (validateIntake && !validateIntake(output)) throw new Error(JSON.stringify(validateIntake.errors));
+        analysisInput(output, policy.intakeValidation.inputHash, policy.intakeValidation.sourceFiles);
         pi.appendEntry("reqflow_intake_validation", { attempt: intakeCorrections + 1, status: "valid" });
       } catch (error) {
         pi.appendEntry("reqflow_intake_validation", { attempt: intakeCorrections + 1, status: "invalid", error: error.message });
-        if (policy.modelUsage.budgetMode !== "adaptive" || intakeCorrections >= 2) {
+        const fingerprint = error.message;
+        validationFailures.intake.repeated = validationFailures.intake.fingerprint === fingerprint ? validationFailures.intake.repeated + 1 : 1;
+        validationFailures.intake.fingerprint = fingerprint;
+        if (policy.modelUsage.budgetMode !== "adaptive" || validationFailures.intake.repeated >= 3) {
           intakeStopped = error.message;
           return;
         }
@@ -259,6 +290,27 @@ export default function (pi) {
         return { continue: true, entries: [{ type: "custom_message", customType: "reqflow_intake_correction",
           content: `Your product analysis was rejected: ${error.message}. Correct the complete original JSON using the same discussion and evidence. Explain only user actions, business outcomes and real unresolved business choices. Do not ask product to design command syntax, JSON fields, source code or locking. Do not add unrequested features or invent agreement. Retain all explicit business decisions and acceptance boundaries.`,
           display: false, details: { correction: intakeCorrections } }] };
+      }
+    });
+  }
+  if (phase === "review" && policy.outputSchema) {
+    const validateReview = new Ajv({ allErrors: true }).compile(policy.outputSchema.schema);
+    pi.on("agent_before_settle", async () => {
+      if (lastFailure) return;
+      try {
+        const text = latestAssistant.content.filter(part => part.type === "text").map(part => part.text).join("\n");
+        if (!validateReview(JSON.parse(text))) throw new Error(JSON.stringify(validateReview.errors));
+        pi.appendEntry("reqflow_review_validation", { attempt: reviewCorrections + 1, status: "valid" });
+      } catch (error) {
+        pi.appendEntry("reqflow_review_validation", { attempt: reviewCorrections + 1, status: "invalid", error: error.message });
+        validationFailures.review.repeated = validationFailures.review.fingerprint === error.message ? validationFailures.review.repeated + 1 : 1;
+        validationFailures.review.fingerprint = error.message;
+        if (policy.modelUsage.budgetMode !== "adaptive" || validationFailures.review.repeated >= 3) return;
+        reviewCorrections++;
+        pi.setActiveTools([]);
+        return { continue: true, entries: [{ type: "custom_message", customType: "reqflow_review_correction",
+          content: `Review output rejected: ${error.message}. Return one complete JSON object matching the current review schema exactly. Preserve your findings and evidence; correct only the output structure. Do not perform new research, change the review scope or drop blocking findings to pass validation.`,
+          display: false, details: { correction: reviewCorrections } }] };
       }
     });
   }
@@ -281,7 +333,9 @@ export default function (pi) {
         pi.appendEntry("reqflow_plan_validation", { attempt: planCorrections + 1, status: "valid" });
       } catch (error) {
         pi.appendEntry("reqflow_plan_validation", { attempt: planCorrections + 1, status: "invalid", error: error.message });
-        if (policy.modelUsage.budgetMode !== "adaptive" || planCorrections >= 2) {
+        validationFailures.plan.repeated = validationFailures.plan.fingerprint === error.message ? validationFailures.plan.repeated + 1 : 1;
+        validationFailures.plan.fingerprint = error.message;
+        if (policy.modelUsage.budgetMode !== "adaptive" || validationFailures.plan.repeated >= 3) {
           planStopped = error.message;
           return;
         }
@@ -358,6 +412,20 @@ export default function (pi) {
   });
   if (policy.modelUsage !== undefined) {
     let contextCeiling = policy.modelUsage.maxContextBytes;
+    const toolInputs = new Map();
+    const observedEvidence = new Set();
+    let previousEvidenceCount = 0;
+    let stalledRequests = 0;
+    pi.on("tool_call", event => { toolInputs.set(event.toolCallId, [event.toolName, event.input]); });
+    pi.on("tool_result", event => {
+      if (event.isError) return;
+      const bytes = event.content.reduce((total, part) => total + (part.type === "text" ? Buffer.byteLength(part.text) : 0), 0);
+      if (phase !== "implement" && bytes > policy.modelUsage.maxToolResultBytes) return;
+      const input = toolInputs.get(event.toolCallId);
+      const signature = createHash("sha256").update(JSON.stringify([input, event.content])).digest("hex");
+      observedEvidence.add(signature);
+      toolInputs.delete(event.toolCallId);
+    });
     let previousRequest = policy.priorRequestLayout;
     let lastMeasuredInput;
     let lastMeasuredModel;
@@ -399,13 +467,23 @@ export default function (pi) {
           limit.default = name === "read" ? 80 : 30;
           limit.description = `Requested maximum ${name === "read" ? "lines" : "results"}, a positive integer; defaults to ${limit.default}. Actual output must fit ${policy.modelUsage.maxToolResultBytes} bytes.`;
         }
-        const guidance = ` Read only needed evidence; actual output exceeding ${policy.modelUsage.maxToolResultBytes} bytes is rejected.`;
+        const guidance = ` Read only needed evidence; actual output exceeding ${policy.modelUsage.maxToolResultBytes} bytes is rejected.`
+           + (tool.function.name === "read" ? " Read accepts FILES only. Use ls for directories, including the current workspace root; never read a directory. Use an exact existing file path confirmed by a directory listing, search result or source import. Do not invent conventional filenames such as seed/config/state; inline declarations do not imply a separate file. Missing paths are errors and stop this run." : "");
         if (!tool.function.description.endsWith(guidance)) tool.function.description += guidance;
+      }
+      if (policy.modelUsage.budgetMode === "adaptive" && requests >= requestCeiling
+          && planCorrections + intakeCorrections + reviewCorrections === 0) {
+        stalledRequests = observedEvidence.size > previousEvidenceCount ? 0 : stalledRequests + 1;
+        previousEvidenceCount = observedEvidence.size;
+        if (stalledRequests >= 3) {
+          process.stderr.write("REQFLOW_PROGRESS_STOP: three requests without new relevant tool evidence; retained workspace and audit require diagnosis\n");
+          process.exit(1);
+        }
       }
       if (phase === "implement") {
         const edit = event.payload.tools?.find(tool => tool.function?.name === "edit")?.function;
         if (edit) {
-          const guidance = " Each replacement must contain at most 50 old and 50 new lines; edit one logical unit at a time.";
+          const guidance = " Each replacement must contain at most 50 old and 50 new lines and change one logical unit. Batch independent replacements in edits[] when their anchors do not depend on another replacement; dependent extensions require a later call.";
           if (!edit.description.endsWith(guidance)) edit.description += guidance;
           const properties = edit.parameters?.properties?.edits?.items?.properties;
           for (const key of ["oldText", "newText"]) {
@@ -433,10 +511,17 @@ export default function (pi) {
         }
         event.payload.response_format = policy.outputSchema && format !== "json_object" && schemaCapable
            ? { type: "json_schema", json_schema: policy.outputSchema } : { type: "json_object" };
-        if (policy.outputSchema && event.payload.response_format.type === "json_object") {
+        if (policy.outputSchema) {
           // Keep format instructions in a stable prefix so measured provider input can be reused after tool results.
-          event.payload.messages.unshift({ role: "system", content: `Final JSON must match this schema exactly; preserve every required field and version: ${JSON.stringify(policy.outputSchema.schema)}` });
+          const activeShape = event.payload.response_format.type === "json_schema"
+            ? { name: policy.outputSchema.name, required: policy.outputSchema.schema.required,
+              properties: Object.keys(policy.outputSchema.schema.properties), additionalProperties: policy.outputSchema.schema.additionalProperties }
+            : policy.outputSchema.schema;
+          event.payload.messages.unshift({ role: "system", content: `The final JSON must match the CURRENT schema exactly. This schema replaces output contracts in earlier session messages. Include exactly its required keys; never add historical schemaVersion or contractHash fields unless defined below. Follow the nested field protocol in the current task prompt and response-format schema. Current output shape: ${JSON.stringify(activeShape)}` });
         }
+        if (policy.historyProject && ["plan", "review"].includes(phase)) event.payload.messages.unshift({
+          role: "system", content: "Controller startup contract: project environment scanning and private configuration supply environment variables to each selected service before spawning its approved argv. Missing required variables block startup until the responsible developer configures them. Startup argv must use existing project scripts and directory arguments; never embed environment assignments or override private configuration with sh -c. A required variable absent from argv is not a startup contradiction when the plan explicitly requires configuring it through the environment page. Verify script paths, ports, health endpoints and prerequisites against source."
+        });
       }
       if (!compacting) {
         if (policy.modelParameters?.temperature !== undefined) event.payload.temperature = policy.modelParameters.temperature;
@@ -444,19 +529,21 @@ export default function (pi) {
         if (policy.modelParameters?.maxOutputTokens !== undefined) event.payload.max_tokens = Math.min(
           policy.modelParameters.maxOutputTokens, ctx.model.maxTokens, event.payload.max_tokens ?? ctx.model.maxTokens);
       }
-      if (phase === "implement") {
+      if (phase === "implement" && policy.modelUsage.budgetMode === "adaptive") {
         requests++;
         pi.appendEntry("reqflow_provider_request", { request: requests,
           contextBytes: Buffer.byteLength(JSON.stringify(event.payload)),
           provider: ctx.model?.provider, model: ctx.model?.id, executionMode: "native" });
         return;
       }
-      if (!compacting && policy.structuredOutput && (phase === "initialize" || requests + cumulativeCompactionCalls + 1 === policy.modelUsage.maxRequests
-          || (planCorrections > 0 && !policy.planCorrection))) {
+      if (!compacting && policy.structuredOutput && (phase === "initialize" || policy.modelUsage.budgetMode !== "adaptive" && requests + cumulativeCompactionCalls + 1 === policy.modelUsage.maxRequests
+          || (planCorrections > 0 && !policy.planCorrection) || reviewCorrections > 0)) {
         delete event.payload.tools;
         delete event.payload.tool_choice;
         if (phase !== "initialize") event.payload.messages.push({ role: "user", content:
-          policy.planCorrection
+          phase === "review"
+            ? "Research is finished. Return one complete JSON object matching the CURRENT review schema. Preserve all findings and evidence; do not add plan fields or historical hashes. No further tools, prose or fences."
+            : policy.planCorrection
             ? "Research is finished. Return one modification JSON object matching the original modification schema; unchanged fields and design sections are null. Preserve all required modification keys, and use acceptance IDs as keys if verification changes. Do not return a full plan or copy tool results. No further tools, prose or fences."
             : "Research is finished. Return one FULL JSON object with the original task schema and version hashes. Include every required field and acceptance condition; do not add fields absent from that schema. Tool results are evidence, not the answer. No further tools, prose or fences." });
       }
@@ -500,12 +587,12 @@ export default function (pi) {
       const requestedOutput = event.payload.max_completion_tokens ?? event.payload.max_tokens ?? ctx.model?.maxTokens;
       if (policy.modelUsage.budgetMode === "adaptive" && bytes > contextCeiling && ctx.model?.api === "openai-completions"
           && Number.isSafeInteger(ctx.model?.contextWindow) && Number.isSafeInteger(requestedOutput)
-          && requestedOutput > 0 && inputReserve + requestedOutput <= ctx.model.contextWindow) {
+          && requestedOutput > 0) {
         const previous = contextCeiling;
         contextCeiling = bytes;
         pi.appendEntry("reqflow_context_expanded", { previous, next: contextCeiling,
           inputReserve, requestedOutput, contextWindow: ctx.model.contextWindow, estimationMethod,
-          reason: "Request input estimate and output allowance fit configured model context; serialized bytes are an advisory target" });
+          reason: "Serialized bytes and conservative token reserves are advisory; native Pi compaction and the provider enforce actual model context capacity" });
       }
       if (policy.modelUsage.budgetMode === "adaptive" && ctx.model?.api === "openai-completions"
           && Number.isSafeInteger(requestedOutput) && requestedOutput > 0 && remainingTokens < inputReserve + requestedOutput) {
@@ -517,8 +604,8 @@ export default function (pi) {
       }
       requests++;
       providerRequests++;
-       const reason = policy.providerRequestLimit !== undefined && providerRequests + cumulativeCompactionCalls > policy.providerRequestLimit ? "remaining requirement provider request limit reached"
-         : requests + cumulativeCompactionCalls > requestCeiling + planCorrections + intakeCorrections ? "model request limit reached"
+       const reason = policy.modelUsage.budgetMode !== "adaptive" && policy.providerRequestLimit !== undefined && providerRequests + cumulativeCompactionCalls > policy.providerRequestLimit ? "remaining requirement provider request limit reached"
+          : policy.modelUsage.budgetMode !== "adaptive" && requests + cumulativeCompactionCalls > requestCeiling + planCorrections + intakeCorrections + reviewCorrections ? "model request limit reached"
         : bytes > contextCeiling ? "request context byte limit exceeded"
           : tokensUsed >= tokenCeiling ? "cumulative token budget exhausted"
             : ctx.model?.api === "openai-completions" && remainingTokens <= inputReserve ? "remaining tokens cannot fund request context"
@@ -558,11 +645,10 @@ export default function (pi) {
       if (bytes > policy.modelUsage.maxToolResultBytes) {
         const reason = `${event.toolName} result has ${bytes} bytes; limit is ${policy.modelUsage.maxToolResultBytes}. Result rejected. Request a narrower source range or fewer matches.`;
         process.stderr.write(`REQFLOW_TOOL_BUDGET_REJECTED: ${reason}\n`);
-        if (readTools.has(event.toolName) && typeof event.toolCallId === "string" && event.toolCallId
-            && recoverableEditErrors.size < 2) {
+        if (readTools.has(event.toolName) && typeof event.toolCallId === "string" && event.toolCallId) {
           recoverableEditErrors.add(event.toolCallId);
           pi.appendEntry("reqflow_tool_retry", { toolCallId: event.toolCallId, toolName: event.toolName,
-            reason, remainingCorrections: 2 - recoverableEditErrors.size,
+            reason,
             decision: "Narrow oversized read arguments; original path permissions and byte limit remain unchanged" });
         }
         return { isError: true, content: [{ type: "text", text: reason }],
@@ -601,6 +687,12 @@ export default function (pi) {
       const excluded = policy.excludedPaths.some((p) => relative === p || relative.startsWith(`${p}/`));
       const allowed = policy.allowedPaths.some((p) => p === "." || relative === p || relative.startsWith(`${p}/`));
       if (excluded || (writeTools.has(name) && !allowed)) return { block: true, reason: `Path is outside approved scope: ${relative}` };
+      if (name === "read" && fs.existsSync(path.join(root, relative)) && fs.statSync(path.join(root, relative)).isDirectory()) {
+        recoverableEditErrors.add(event.toolCallId);
+        pi.appendEntry("reqflow_tool_retry", { toolCallId: event.toolCallId, toolName: name,
+          reason: "read requires a file; use ls for the verified directory", path: relative });
+        return { block: true, reason: `read requires a FILE, but ${relative || "."} is a directory. Use ls on that directory, then read a verified file. No source content was read.` };
+      }
       if (writeTools.has(name) && (policy.restrictedPaths ?? []).some(prefix => prefix === "." || relative === prefix || relative.startsWith(`${prefix}/`))) {
         return { block: true, reason: `Path requires owner authorization: ${relative}` };
       }
