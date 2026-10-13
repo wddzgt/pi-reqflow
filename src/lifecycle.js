@@ -51,6 +51,7 @@ export function lifecycleStatus(meta, events, now) {
     fast: ["fast_path_attempt_failed", "fast_path_scope_failed", "plan_created"],
     budget: ["pi_budget_exhausted", "role_review_submitted", "plan_created", "implemented"],
     boundary: ["execution_boundary_stopped", "plan_created", "implemented"],
+    acceptance: ["acceptance_discussion_failed", "acceptance_reply", "acceptance_feedback_closed", "acceptance_repair_requested"],
   };
   for (const event of events) {
     if (["workspace_rolled_back", "development_restarted"].includes(event.type)) failures.clear();
@@ -84,6 +85,55 @@ export function lifecycleStatus(meta, events, now) {
     needsAttention: !closed && unresolved.length > 0,
     unresolved: unresolved.map((event) => ({ type: event.type, at: event.at, hash: event.hash })),
     latestMilestone: latest ? { type: latest.type, at: latest.at } : null };
+}
+
+export function lifecycleResults(meta, events) {
+  const aligned = Boolean(meta.contractHash) && lifecycleStage(meta.state) !== "alignment";
+  const confirmed = aligned ? events.findLast(event => ["contract_confirmed", "contract_revised"].includes(event.type)
+    && event.meta.contractHash === meta.contractHash && event.meta.contractVersion === meta.contractVersion) : null;
+  const currentPlan = event => aligned && meta.state !== "contract_confirmed" && event.meta.planHash === meta.planHash
+    && event.meta.contractHash === meta.contractHash;
+  const approved = events.findLast(event => event.type === "plan_approved" && currentPlan(event));
+  const planned = events.findLast(event => event.type === "plan_created" && currentPlan(event));
+  const boundary = events.findLastIndex(event => ["acceptance_repair_requested", "implementation_attempt_retained",
+    "local_validation_changes_retained", "development_restarted", "workspace_rolled_back"].includes(event.type));
+  const currentCode = event => currentPlan(event) && event.meta.afterHash === meta.afterHash && Boolean(meta.afterHash);
+  const implemented = events.slice(boundary + 1).findLast(event => event.type === "implemented" && currentCode(event));
+  const verified = implemented && events.slice(boundary + 1).findLast(event => event.type === "verified" && currentCode(event));
+  const accepted = verified && events.slice(boundary + 1).findLast(event => event.type === "test_accepted" && currentCode(event));
+  const archived = events.findLast(event => ["archived", "archived_test_only"].includes(event.type) && currentCode(event));
+  const assignment = meta.assignments?.developer;
+  const result = (stage, title, event, summary, owner) => ({ stage, title, status: event ? "completed" : "pending",
+    summary, owner, at: event?.at ?? null });
+  const rows = [
+    result("alignment", "需求对齐", confirmed, confirmed ? `需求 v${meta.contractVersion} 已定版`
+      : meta.contractHash ? "需求正在修订，待重新定版" : "待明确目标与验收标准", confirmed ? confirmed.detail.actor ?? null : meta.createdBy),
+    result("design", "研发方案", approved, approved ? `方案 v${meta.planVersion} 已确认，计划修改 ${approved.meta.developmentFiles.length} 个文件`
+      : planned ? `方案 v${meta.planVersion} 已生成，待审核确认` : "待生成并确认方案", approved ? approved.meta.planApprovedBy : assignment?.userId ?? null),
+    result("implementation", "代码实施", implemented, implemented ? `已完成 ${implemented.detail.changes.length} 个文件的变更`
+      : meta.state === "rolled_back" ? "代码已回退，待重新开发" : "待按当前方案完成开发", implemented ? implemented.meta.assignments?.developer?.userId ?? null : assignment?.userId ?? null),
+  ];
+  rows.push(result("validation", "研发检查", verified, verified
+    ? verified.meta.verificationMode === "manual_pending" ? accepted ? "未运行自动检查，已完成人工核验" : "没有自动检查，待人工核验结果"
+      : `${verified.detail.checks.length} 项相关检查通过` : "待完成当前版本的研发检查", verified ? verified.meta.assignments?.developer?.userId ?? null : assignment?.userId ?? null));
+  const modes = { manual: "人工核对研发交付", local: "本地验证", deployed: "测试环境验证" };
+  rows.push(result("acceptance", "人工验收", accepted, accepted ? `已按${modes[accepted.meta.acceptanceMode]}确认验收`
+    : meta.acceptanceFeedback && ["open", "discussing", "awaiting_acceptance"].includes(meta.acceptanceFeedback.status)
+      ? "验收反馈待处理或再次确认" : "待人工确认业务结果", accepted ? accepted.detail.actor ?? null : meta.createdBy));
+  rows.push(result("delivery", "交付归档", archived, archived ? meta.state === "archived"
+    ? "正式发布观察完成，交付已归档" : "研发交付已归档" : "待完成交付归档", meta.archivedBy ?? meta.observedBy ?? assignment?.userId ?? null));
+  const failures = { implementation: ["implementation_failed", "implementation_inspection_failed", "implementation_interrupted", "rolled_back"],
+    validation: ["verification_failed"], design: ["plan_review"] };
+  for (const row of rows) {
+    if (failures[row.stage]?.includes(meta.state) && (row.stage !== "design" || meta.planBlockers?.length)) {
+      row.status = "blocked";
+      row.summary = row.stage === "implementation" ? meta.state === "rolled_back" ? "代码已回退，待重新开发" : "开发未完成，现场已保存"
+        : row.stage === "validation" ? "研发检查未通过，需处理后重检" : "方案存在待解决问题，暂不能开发";
+    }
+    if (meta.state === "implementing" && row.stage === "implementation") { row.status = "active"; row.summary = "正在实施当前已确认方案"; }
+    if (row.stage === "validation" && row.status === "completed" && verified?.meta.verificationMode === "manual_pending" && !accepted) row.status = "pending";
+  }
+  return rows;
 }
 
 export function lifecycleEvents(events) {

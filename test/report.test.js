@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { addCredential } from "../src/auth.js";
 import { initialize, createTask, appendEvent, readTask } from "../src/store.js";
 import { executeRequirementAction, getAuditReport, getRequirementLifecycle, getTaskHistory } from "../src/core.js";
-import { lifecycleStatus } from "../src/lifecycle.js";
+import { lifecycleResults, lifecycleStatus } from "../src/lifecycle.js";
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const product = { id: "product", roles: ["product"] };
@@ -147,6 +147,48 @@ test("owners and assigned members can page the whole lifecycle, while raw histor
   await assert.rejects(getTaskHistory(root, developer, "REQ-LONG"), { code: "EACCES" });
   assert.equal((await getTaskHistory(root, admin, "REQ-LONG")).total, 110);
   await assert.rejects(getRequirementLifecycle(root, product, "REQ-LONG", -1), /Offset/);
+});
+
+test("lifecycle results retain six current milestones across retries without exposing diagnostics", () => {
+  const meta = { state: "archived_test_only", createdBy: "product", contractHash: "contract", contractVersion: 2,
+    planHash: "plan", planVersion: 3, afterHash: "code", developmentFiles: ["app.js", "app.test.js"],
+    assignments: { developer: { userId: "dev", status: "accepted" } }, planApprovedBy: "dev", acceptedBy: "product",
+    acceptanceMode: "manual", verificationMode: "automated", archivedBy: "dev" };
+  const row = (type, detail = {}) => ({ type, meta, at: "2026-10-13T00:00:00Z", detail });
+  const events = [row("contract_confirmed", { actor: "confirmer" }), row("plan_created"), row("plan_approved"),
+    row("implemented", { changes: [{ file: "app.js" }] }), row("verification_failed", { error: "RAW_ERROR" }),
+    row("verified", { checks: [{ code: 0 }, { code: 0 }] }), row("test_accepted"), row("archived_test_only")];
+  events.splice(2, 0, ...Array.from({ length: 120 }, () => row("plan_specialist_completed", { telemetry: { model: "RAW_MODEL" } })));
+  const results = lifecycleResults(meta, events);
+  assert.equal(results.length, 6); assert.ok(results.every(result => result.status === "completed"));
+  assert.match(results[1].summary, /方案 v3.*2 个文件/); assert.match(results[2].summary, /1 个文件/);
+  assert.match(results[3].summary, /2 项相关检查通过/); assert.match(results[4].summary, /人工核对研发交付/);
+  assert.doesNotMatch(JSON.stringify(results), /RAW_ERROR|RAW_MODEL|telemetry|requestTimings/);
+  assert.equal(results[0].owner, "confirmer");
+  for (const item of events.filter(event => ["implemented", "verified"].includes(event.type)))
+    item.meta = { ...meta, assignments: { developer: { userId: "original-dev", status: "accepted" } } };
+  assert.equal(lifecycleResults(meta, events)[2].owner, "original-dev");
+  assert.equal(lifecycleResults(meta, events)[3].owner, "original-dev");
+  const revision = { ...meta, state: "intake_clarifying", acceptedBy: null };
+  const revised = lifecycleResults(revision, [...events, { ...row("acceptance_repair_requested"), meta: revision }]);
+  assert.ok(revised.every(result => result.status === "pending"));
+  const redesigned = { ...meta, state: "approved", contractHash: "new-contract", contractVersion: 3, planHash: "new-plan", planVersion: 4 };
+  const rerun = [...events, { ...row("contract_confirmed"), meta: redesigned }, { ...row("plan_approved"), meta: redesigned }];
+  assert.deepEqual(lifecycleResults(redesigned, rerun).map(result => result.status), ["completed", "completed", "pending", "pending", "pending", "pending"]);
+});
+
+test("manual checks and a failed recheck never claim automated success", () => {
+  const meta = { state: "verified", createdBy: "product", contractHash: "contract", contractVersion: 1,
+    planHash: "plan", planVersion: 1, afterHash: "code", developmentFiles: ["app.js"], verificationMode: "manual_pending" };
+  const row = (type, detail = {}) => ({ type, meta, at: "2026-10-13T00:00:00Z", detail });
+  const events = [row("contract_confirmed"), row("plan_approved"), row("implemented", { changes: [] }), row("verified", { checks: [] })];
+  const result = lifecycleResults(meta, events)[3];
+  assert.equal(result.status, "pending"); assert.match(result.summary, /待人工核验/); assert.doesNotMatch(result.summary, /检查通过/);
+  const accepted = { ...meta, state: "test_accepted", acceptanceMode: "manual", acceptedBy: "product" };
+  const acceptedResults = lifecycleResults(accepted, [...events, { ...row("test_accepted"), meta: accepted }]);
+  assert.match(acceptedResults[3].summary, /未运行自动检查.*人工核验/); assert.equal(acceptedResults[3].status, "completed");
+  const failed = lifecycleResults({ ...meta, state: "verification_failed" }, events)[3];
+  assert.equal(failed.status, "blocked"); assert.match(failed.summary, /未通过/);
 });
 
 test("state age ignores repeated polling, and closure stops the delivery clock", () => {

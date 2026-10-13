@@ -39,11 +39,11 @@ export function workspacePath(project, id) {
   return path.join(path.dirname(project.root), ".reqflow-workspaces", projectKey, id);
 }
 
-export async function preparePlanWorkspace(project, id, attempt, baseline) {
+export async function preparePlanWorkspace(project, id, attempt, baseline, sourceRoot = project.root) {
   const workspace = `${workspacePath(project, id)}-plan-${attempt}`;
   await fs.mkdir(path.dirname(workspace), { recursive: true });
   await fs.mkdir(workspace, { recursive: false });
-  await copyFiles(project.root, workspace, Object.keys(baseline));
+  await copyFiles(sourceRoot, workspace, Object.keys(baseline));
   return workspace;
 }
 

@@ -150,7 +150,8 @@ export async function createTask(project, id, title, request, actor, images = []
     const attachments = await persistImages(directory, validatedImages);
     const meta = { id, title, createdBy: actor, requestHash: sha256(request),
       state: "intake_draft", createdAt: new Date().toISOString(),
-      assignments: {}, planVersion: 0, reviewCostUsd: 0, reviewAttempts: {}, intakeRevision: 0, intakeCostUsd: 0, intakeAnalysisAttempts: 0 };
+      assignments: {}, planVersion: 0, reviewCostUsd: 0, reviewAttempts: {}, intakeRevision: 0, intakeCostUsd: 0,
+      intakeAnalysisAttempts: 0, feedbackVersion: 0 };
     const event = { at: meta.createdAt, type: "intake_draft", detail: { title, actor, requestHash: meta.requestHash, attachments },
       meta, previous: null };
     event.hash = sha256(JSON.stringify({ ...event, hash: undefined }));

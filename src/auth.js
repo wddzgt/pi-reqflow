@@ -23,6 +23,8 @@ const access = {
   "discuss-plan": ["developer", "admin"], "edit-plan": ["developer", "admin"],
   "resolve-plan-findings": ["developer", "admin"],
   "resume-implementation": ["developer", "admin"],
+  "discuss-acceptance": ["product", "developer", "admin"], "close-acceptance-feedback": ["product", "developer", "admin"],
+  "start-acceptance-repair": ["product", "developer", "admin"],
   "pause-execution": ["product", "developer", "admin"], "continue-execution": ["product", "developer", "admin"],
   "local-validation": ["developer", "admin"], "recheck-local": ["developer", "admin"], "publish-test": ["developer", "admin"],
   "redeploy-test": ["developer", "admin"],
@@ -125,6 +127,11 @@ export function authorizeTaskRead(principal, meta) {
 export function authorizeTaskAction(principal, action, meta, role = null) {
   authorize(principal, action);
   if (action === "accept-test" && meta.createdBy === principal.id) return;
+  if (["discuss-acceptance", "close-acceptance-feedback", "start-acceptance-repair"].includes(action)) {
+    if (meta.createdBy === principal.id || Object.values(meta.assignments ?? {}).some(row =>
+      row.userId === principal.id && row.status === "accepted")) return;
+    const error = new Error("Only requirement participants may discuss acceptance feedback"); error.code = "EACCES"; throw error;
+  }
   if (["assign-member", "assign-team", "confirm-contract", "revise-contract", "intake-message", "analyze-intake"].includes(action)) {
     if (meta.createdBy === principal.id) return;
   } else if (["accept-assignment", "decline-assignment"].includes(action)) {

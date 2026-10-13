@@ -147,7 +147,46 @@ test("real Pi repeated resumes replace controller prompts and preserve source ev
   assert.ok(replacement.entry.data.replaced.reduce((bytes, row) => bytes + row.bytes, 0) > 132377);
 });
 
-for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-workspace-continuity", "plan-settings", "plan-compaction", "plan-compaction-failure", "plan-read-budget", "plan-read-directory", "plan-schema", "plan-schema-unsupported", "plan-reasoning", "plan-truncated", "plan-correction", "plan-local-correction", "plan-diagram-correction", "plan-timeout", "plan-adaptive-context", "plan-adaptive-schema", "plan-context-window", "review-correction", "review-correction-exhausted", "review-strict", "intake-correction", "intake-count-correction", "intake-schema-correction", "implement", "adaptive", "short-output", "request-progress", "read-budget-retry", "grep-path-retry", "grep-path-exhausted", "edit-retry", "edit-ambiguous-retry", "edit-limit-retry", "edit-noop-retry", "repair", "repair-adaptive", "repair-failed", "repair-budget", "check-mutation"]) test(`real Pi ${scenario} preserves budget evidence and explicit completion`, {
+test("real Pi acceptance investigation corrects field types without dropping diagnosis or opening tools", { skip: !process.env.REQFLOW_TEST_PI }, async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-acceptance-schema-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const payloads = [], reasons = ["零值错误", "特殊分支提前返回", "缺少零值回归"];
+  const server = createServer(async (request, response) => {
+    let body = ""; for await (const chunk of request) body += chunk; payloads.push(JSON.parse(body));
+    const output = payloads.length === 1 ? { rootCause: "错误类型", repair: { steps: "错误类型" }, acceptanceIds: ["AC10"] }
+      : { rootCause: reasons, repair: "删除零值特判并补充断言", acceptanceIds: ["AC1"] };
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(`data: ${JSON.stringify({ id: "local", object: "chat.completion.chunk", choices: [{ index: 0,
+      delta: { role: "assistant", content: JSON.stringify(output) }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 1000, completion_tokens: 50 } })}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve)); t.after(() => new Promise(resolve => server.close(resolve)));
+  const previous = process.env.ACCEPTANCE_SCHEMA_KEY; process.env.ACCEPTANCE_SCHEMA_KEY = "local-fixture";
+  t.after(() => { if (previous === undefined) delete process.env.ACCEPTANCE_SCHEMA_KEY; else process.env.ACCEPTANCE_SCHEMA_KEY = previous; });
+  const config = { piExecutable: process.env.REQFLOW_TEST_PI, provider: "acceptance-local", model: "local", mode: "local", thinking: "off",
+    environment: { pi: ["ACCEPTANCE_SCHEMA_KEY"] }, allowedPaths: ["."], excludedPaths: [], structuredOutput: true,
+    maxPiMs: 10000, maxToolCalls: 4, maxEventBytes: 1000000,
+    modelUsage: { maxRequests: 2, readOnlyMaxRequests: 2, maxTokens: 24000, maxContextBytes: 64000, maxToolResultBytes: 8000 },
+    compatibleProviders: [{ name: "acceptance-local", baseUrl: `http://127.0.0.1:${server.address().port}/v1`, apiKeyEnv: "ACCEPTANCE_SCHEMA_KEY",
+      models: [{ id: "local", input: ["text"], contextWindow: 65536, maxTokens: 8192, supportsJsonSchema: true,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] }] };
+  const log = path.join(directory, "events.jsonl");
+  const progress = [];
+  const result = await progressContext.run(update => progress.push(update), () => runPi({ config }, directory, "plan", "Investigate the zero case. Return the specified JSON, preserve diagnosis.", log, 1, null, [],
+    { maxTokens: 24000, budget: { mode: "adaptive", complexity: "small" }, outputSchema: { name: "acceptance_feedback", strict: true,
+      schema: { type: "object", additionalProperties: false, required: ["rootCause", "repair", "acceptanceIds"], properties: {
+        acceptanceIds: { type: "array", items: { type: "string", enum: ["AC1"] } },
+        rootCause: { type: "array", minItems: 3, items: { type: "string" } }, repair: { type: "string" } } } } }));
+  assert.ok(progress.some(update => update.message === "正在只读调查验收反馈与当前代码。"));
+  assert.ok(progress.every(update => update.message !== "正在生成研发方案。"));
+  assert.deepEqual(JSON.parse(result.text).rootCause, reasons); assert.equal(payloads.length, 2);
+  assert.deepEqual(JSON.parse(result.text).acceptanceIds, ["AC1"]);
+  assert.equal(payloads[1].tools, undefined);
+  const events = (await fs.readFile(log, "utf8")).trim().split("\n").map(row => JSON.parse(row));
+  assert.deepEqual(events.filter(event => event.entry?.customType === "reqflow_review_validation").map(event => event.entry.data.status), ["invalid", "valid"]);
+});
+
+for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-workspace-continuity", "plan-settings", "plan-compaction", "plan-compaction-failure", "plan-read-budget", "plan-read-directory", "plan-schema", "plan-schema-unsupported", "plan-reasoning", "plan-truncated", "plan-correction", "plan-local-correction", "plan-diagram-correction", "plan-timeout", "plan-adaptive-context", "plan-adaptive-schema", "plan-context-window", "review-correction", "review-correction-exhausted", "review-strict", "intake-correction", "intake-count-correction", "intake-schema-correction", "intake-quoted-correction", "implement", "adaptive", "short-output", "request-progress", "read-budget-retry", "grep-path-retry", "grep-path-exhausted", "edit-retry", "edit-ambiguous-retry", "edit-limit-retry", "edit-noop-retry", "repair", "repair-adaptive", "repair-failed", "repair-budget", "check-mutation"]) test(`real Pi ${scenario} preserves budget evidence and explicit completion`, {
   skip: !process.env.REQFLOW_TEST_PI,
 }, async t => {
   const phase = scenario.startsWith("plan") ? "plan" : scenario.startsWith("review-") ? "review" : scenario.startsWith("intake-") ? "intake" : "implement";
@@ -165,6 +204,7 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
   const analysis = { schemaVersion: 1, inputHash: "discussion-hash", status: "needs_clarification",
     reply: "请确认允许哪些用户使用新增功能。", summary: "新增功能保留现有使用方式。", suggestions: [],
     questions: [{ id: "Q1", text: "哪些用户可以使用新增功能？" }], requiredRoles: ["backend", "qa"], contract: null };
+  if (scenario === "intake-quoted-correction") analysis.reply = '保留原有"已选数量"文字，在下方完整显示名称列表。';
   if (scenario === "intake-count-correction") Object.assign(analysis, { status: "ready", questions: [], reply: "使用范围已经核对。",
     contract: { ...contract, currentBehavior: "当前值保持不变", desiredBehavior: "更新为已确认的值",
       inScope: ["更新值"], outOfScope: ["其他功能"], answers: {} } });
@@ -243,6 +283,7 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
           source: payloads.length === 2 ? "A --> B" : "flowchart TD\nA --> B" }] } }) : scenario === "plan-correction"
         ? JSON.stringify({ ...draft, boundaries: { ...draft.boundaries, modules: payloads.length === 2 ? [] : draft.boundaries.modules } })
         : '{"verified":true}' };
+    if (scenario === "intake-quoted-correction" && first) delta.content = delta.content.replaceAll('\\"', '"');
     response.writeHead(200, { "Content-Type": "text/event-stream" });
     if (phase === "intake") response.write(`data: ${JSON.stringify({ id: "local-fixture", object: "chat.completion.chunk",
       choices: [{ index: 0, delta: { reasoning_content: "PRIVATE_REASONING_DO_NOT_DISPLAY" }, finish_reason: null }] })}\n\n`);
@@ -526,11 +567,13 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
     assert.equal(payloads.length, 2);
     assert.equal(payloads[1].tools, undefined);
     assert.match(JSON.stringify(payloads[1].messages), /product analysis was rejected/);
+    if (scenario === "intake-quoted-correction") assert.match(JSON.stringify(payloads[1].messages), /never truncate string values/);
     assert.deepEqual(result.telemetry.intakeValidation.map(row => row.status), ["invalid", "valid"]);
     assert.equal(result.telemetry.assistantMessages, 2);
     assert.equal(await fs.readFile(path.join(directory, "source.py"), "utf8"), "value = 1\n");
     assert.match(await fs.readFile(logFile, "utf8"), scenario === "intake-correction" ? /Implement `source.py`/
-      : scenario === "intake-count-correction" ? /acceptance count 9 exceeds configured limit 8/ : /additionalProperties/);
+      : scenario === "intake-count-correction" ? /acceptance count 9 exceeds configured limit 8/
+      : scenario === "intake-quoted-correction" ? /JSON/ : /additionalProperties/);
     const audit = await fs.readFile(logFile, "utf8");
     assert.doesNotMatch(audit, /PRIVATE_REASONING_DO_NOT_DISPLAY/);
     assert.match(audit, /thinking_reference/);

@@ -37,6 +37,12 @@ Git 信息通过 `GET /api/project-git` 读取。`approve-plan` 可传 developme
 
 `accept-test` 必须传 evidence 和 acceptanceMode=manual/local/deployed。manual 在 verified 状态人工确认研发交付，不要求环境；local 要求当前代码及环境版本的实际本地验证；deployed 要求 test_deployed 状态和有效测试环境版本。manual/local 还须传当前 expectedPlanHash、expectedAfterHash；未经审核的实际变更先由负责研发具名确认。动作完成验收后直接归档，记录实际方式、人员与版本，不把未执行的环境验证算作通过。
 
+`discuss-acceptance` 在 verified/test_deployed 接收 `message={text,images?,expectedContractHash,expectedPlanHash,expectedAfterHash}`。原产品负责人和已接单研发可参与；图片沿用需求图片校验、私有存储与读取权限。AI 在当前实施源码的隔离副本只读调查，返回 route=repair/plan/requirement/clarify/no_change、三个“为什么”、源码证据、原验收项及修复回归建议。`getRequirementEvidence().acceptanceDiscussion` 返回每轮消息及 eventHash；失败明确记录，可继续沟通或暂停后恢复。
+
+`start-acceptance-repair` 传当前三个版本哈希和 `expectedFeedbackHash`（最新有效 acceptance_reply 的 eventHash）。repair/plan 由原负责研发确认，requirement 由原产品负责人确认；调查意见不能当成授权。repair 自动实施及复测；plan 生成待审核修订方案；requirement 保留成果并回到产品对齐，需重新定版和方案审批。全程沿用原工作目录和需求分支，保留原基线及整体变更，重新审核完整交付范围；旧检查、变更审批、本地验证、测试部署候选不用于新代码验收。发布修复版本仍需显式确认正常发布动作，不自动提交或重写已发布提交。
+
+`close-acceptance-feedback` 传三个当前版本哈希、`expectedFeedbackHash`（最新 acceptance_message 的 eventHash）和 evidence；仅本轮反馈发起人可具名结束反馈。open/discussing/repairing 阻止 accept-test；修复检查完成后为 awaiting_acceptance，人工确认当前版本才记录 accepted。归档状态不开放沟通或修复，须另建后续需求；原始归档保持不变。
+
 首次 `init` 会生成带源码与配置指纹的项目基线；维护者可用 `baseline-status` 检查当前性，源码或配置变动后用 `baseline-refresh` 明确更新。`src/baseline.js` 的 `readProjectBaseline` 可供其他适配器读取，必须保留其哈希与当前性校验。基线的静态线索会进入角色评审和方案提示词，已开始的不同角色评审不能混用新旧基线。刷新命令是本地项目维护操作，权限由项目目录的文件权限控制；它不替代需求审批。
 
 项目代码规范由 `resolveStandards(config, inScopeFiles)` 选取；网页或其他上游可用 `standardsCatalog()` 展示内置预设，使用 `validateConfig` 检查团队全局规则。CLI 的 `standards-preview` 和 `standards-show` 提供按文件的只读预览。规范哈希绑定角色评审、方案与实际变更；提示词遵循不等于静态扫描通过，机器检查必须接入 `checks`。

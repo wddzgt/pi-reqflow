@@ -46,7 +46,7 @@ export async function localValidation(projectPath, id, actor, input) {
       throw new Error("请刷新当前方案后准备开发检查。");
     if (!preparing) await assertReviewedWorkspace(project, meta, input);
     const workspace = preparing ? events.findLast(event => event.type === "plan_created").detail.planningWorkspace : meta.workspace;
-    if (preparing && manifestHash(await manifest(workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== meta.baseHash)
+    if (preparing && manifestHash(await manifest(workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== (meta.acceptanceRework?.sourceHash ?? meta.baseHash))
       throw new Error("方案基础代码已改变，请重新核对方案。");
     const validation = (await readPlanAnalysis(meta, directory)).draft.validation;
     if (!validation) throw new Error("当前方案缺少验证与启动约定，请重新生成研发方案；历史代码与日志仍保留。");
@@ -295,10 +295,10 @@ export async function redeployTest(projectPath, id, actor, input) {
     if (input.expectedAfterHash !== meta.afterHash || input.expectedPlanHash !== meta.planHash
         || describePolicy(project.config).executionConfigHash !== meta.configHash
         || manifestHash(await manifest(meta.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== meta.afterHash) throw new Error("代码或配置已改变，请核对后再发布。");
-    const log = path.join(directory, "test-deploy.log");
-    await fs.rename(log, path.join(directory, `test-deploy-retained-${events.at(-1).hash}.log`));
+    const priorSubmission = events.findLast(event => event.type === "test_deploy_submitting");
+    if (!priorSubmission || path.dirname(priorSubmission.detail.logFile) !== directory) throw new Error("原测试部署缺少日志绑定。");
     await appendEvent(project, id, "test_redeployment_authorized", { ...meta, state: "verified", updatedAt: new Date().toISOString() },
-      { actor, previousDeployment: meta.testDeployment, afterHash: meta.afterHash });
+      { actor, previousDeployment: meta.testDeployment, previousLogFile: priorSubmission.detail.logFile, afterHash: meta.afterHash });
   });
   if (project.config.mode === "git") return publishTest(projectPath, id, actor, input);
   const result = await deployTest(projectPath, id);

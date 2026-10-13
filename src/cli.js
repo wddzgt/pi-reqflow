@@ -50,6 +50,11 @@ async function actionInput(command, args) {
   if (command === "review-plan") { body.part = required(args, "part"); body.expectedPlanHash = required(args, "plan-hash"); }
   if (command === "dev-feedback") body.feedback = await readJson(required(args, "feedback-file"));
   if (command === "intake-message") body.message = await readJson(required(args, "message-file"));
+  if (command === "discuss-acceptance") body.message = await readJson(required(args, "message-file"));
+  if (["start-acceptance-repair", "close-acceptance-feedback"].includes(command)) {
+    body.expectedPlanHash = required(args, "plan-hash"); body.expectedAfterHash = required(args, "after-hash");
+    body.expectedContractHash = required(args, "contract-hash"); body.expectedFeedbackHash = required(args, "feedback-hash");
+  }
   if (["confirm-contract", "revise-contract"].includes(command)) {
     body.contract = await readJson(required(args, "contract-file"));
     if (args["analysis-hash"]) body.expectedAnalysisHash = args["analysis-hash"];
@@ -65,7 +70,7 @@ async function actionInput(command, args) {
   if (command === "resume-implementation" && args["model-selection-file"] !== undefined) {
     body.modelSelection = await readJson(required(args, "model-selection-file"));
   }
-  if (["approve-changes", "accept-test", "observe-release", "reconcile-test-deploy", "reconcile-release", "resume-implementation"].includes(command)) {
+  if (["approve-changes", "accept-test", "observe-release", "reconcile-test-deploy", "reconcile-release", "resume-implementation", "close-acceptance-feedback"].includes(command)) {
     body.evidence = await fs.readFile(required(args, "evidence-file"), "utf8");
   }
   if (command === "accept-test") {

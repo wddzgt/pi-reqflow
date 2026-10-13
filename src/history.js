@@ -12,10 +12,10 @@ export async function readDiscussionEvidence(project, taskId, input) {
   if (!input || !/^[a-f0-9]{64}$/.test(input.eventHash ?? "") || !Number.isSafeInteger(input.offset)
       || input.offset < 0 || !Number.isSafeInteger(input.maxChars) || input.maxChars < 1 || input.maxChars > 3000) throw new Error("Discussion reads require an exact event reference and bounded character range");
   const task = await readTask(project, taskId);
-  const event = task.events.find(event => event.hash === input.eventHash && ["intake_draft", "intake_message", "plan_message", "plan_reply"].includes(event.type));
+  const event = task.events.find(event => event.hash === input.eventHash && ["intake_draft", "intake_message", "plan_message", "plan_reply", "acceptance_message", "acceptance_reply"].includes(event.type));
   if (!event) throw new Error("Discussion evidence must be a human message or AI plan reply from the current requirement");
   const text = event.type === "intake_draft" ? await fs.readFile(path.join(task.directory, "request.md"), "utf8")
-    : event.type === "plan_reply" ? JSON.stringify(event.detail.reply)
+    : ["plan_reply", "acceptance_reply"].includes(event.type) ? JSON.stringify(event.detail.reply)
       : JSON.stringify({ text: event.detail.text, candidate: event.detail.candidate });
   if (input.offset >= text.length) throw new Error("Discussion read offset exceeds the archived message");
   return { taskId, eventHash: event.hash, actor: event.detail.actor, offset: input.offset, totalChars: text.length,

@@ -421,9 +421,13 @@ label .optional { font-weight: 400; color: #a0aec0; font-size: 11px; }
 .audit-responsibilities { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; padding: 14px; background: #f5f7fb; border-radius: 10px; font-size: 12px; color: #50627c; }
 .lifecycle-event { padding: 14px 18px; margin: 12px 0; border-left: 3px solid #8594de; background: #f8f9fc; border-radius: 8px; }
 .lifecycle-event.failed, .lifecycle-event.unknown, .lifecycle-event.blocked { border-color: #c96956; }
+.lifecycle-event.completed { border-color: #70a88c; }
+.lifecycle-event.pending { border-color: #c2c8d5; }
 .lifecycle-event strong { display: block; font-size: 14px; color: #2e405d; }
 .modal-card .lifecycle-event small, .audit-list-row small { color: #67768c; font-size: 12px; }
 .modal-card .lifecycle-event p { color: #50627c; margin: 8px 0; font-size: 12px; }
+.lifecycle-event.lifecycle-result { padding: 8px 14px; margin: 8px 0; }
+.modal-card .lifecycle-result p { margin: 4px 0; }
 @media (max-width: 700px) {
   .audit-metrics { grid-template-columns: repeat(3, 1fr); }
   .audit-filters { grid-template-columns: 1fr 1fr; }

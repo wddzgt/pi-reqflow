@@ -348,7 +348,9 @@ export async function reviewPlanAnalysis(project, id, meta, directory, workspace
           .filter(row => contextFiles.includes(row.file)) }).slice(0, 4000),
         authoritativeContext: { plan: reviewInput, contract, role, materialTool: "read_plan" } });
       if (manifestHash(await manifest(workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== sourceHash
-          || manifestHash(await sourceManifest(project)) !== sourceHash) throw new Error("Files changed during read-only specialist review");
+          || manifestHash(await sourceManifest(project)) !== (meta.acceptanceRework ? meta.baseHash : sourceHash)
+          || (meta.acceptanceRework && manifestHash(await manifest(meta.workspace, project.config.excludedPaths,
+            project.config.maxSnapshotBytes)) !== sourceHash)) throw new Error("Files changed during read-only specialist review");
       const output = JSON.parse(run.text);
       if (!output || typeof output !== "object" || Array.isArray(output)) throw new Error("Specialist output must be one JSON object, not an array or scalar");
       findings = { role, contractHash: meta.contractHash, analysisHash, findings: output.findings };

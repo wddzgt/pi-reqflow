@@ -101,9 +101,12 @@ export async function plan(projectPath, id) {
       await appendEvent(project, id, "pi_budget_exhausted", meta, { phase: "plan", reason: "Requirement cost budget exhausted" });
       throw new Error("Requirement cost budget exhausted before planning");
     }
-    const baseline = await sourceManifest(project);
+    const planningSource = meta.acceptanceRework ? meta.workspace : project.root;
+    const baseline = await manifest(planningSource, project.config.excludedPaths, project.config.maxSnapshotBytes);
     const baseHash = manifestHash(baseline);
-    const projectBaseline = await readProjectBaseline(project, baseHash);
+    if (meta.acceptanceRework && (baseHash !== meta.acceptanceRework.sourceHash
+        || manifestHash(await sourceManifest(project)) !== meta.baseHash)) throw new Error("验收修复现场或原项目基线已改变。");
+    const projectBaseline = await readProjectBaseline(project, meta.acceptanceRework ? meta.baseHash : baseHash);
     const configHash = describePolicy(project.config).executionConfigHash;
     const revision = await sourceRevision(project);
     const recordedRevision = meta.planFeedbackVersion ? events.findLast(event => event.type === "plan_revision_requested"
@@ -144,12 +147,12 @@ export async function plan(projectPath, id) {
       const active = { ...meta, state: "contract_confirmed", planAttempts: attempt, executionBoundary: null,
         planCostUsd: meta.planCostUsd ?? 0, updatedAt: new Date().toISOString() };
       await appendEvent(project, id, "plan_analysis_started", active, { contractHash: meta.contractHash, version });
-      const planningWorkspace = await preparePlanWorkspace(project, id, attempt, baseline);
+      const planningWorkspace = await preparePlanWorkspace(project, id, attempt, baseline, planningSource);
       if (project.config.checks.length) {
         for (const file of Object.keys(baseline).filter(file => path.posix.basename(file) === "package.json")) {
           const directory = path.posix.dirname(file);
-          if (!(await fs.readdir(path.join(project.root, directory))).includes("node_modules")) continue;
-          const dependencies = await fs.realpath(path.join(project.root, directory, "node_modules"));
+          if (!(await fs.readdir(path.join(planningSource, directory))).includes("node_modules")) continue;
+          const dependencies = await fs.realpath(path.join(planningSource, directory, "node_modules"));
           await fs.cp(dependencies, path.join(planningWorkspace, directory, "node_modules"),
             { recursive: true, verbatimSymlinks: true, filter: async source => {
               if ((await fs.lstat(source)).isSymbolicLink()) {
@@ -165,6 +168,7 @@ export async function plan(projectPath, id) {
         throw new Error("Baseline checks modified project files");
       }
       if (!checkpoint) result = await runPi(project, planningWorkspace, "plan", prompt + boundaryPrompt + designPrompt
+        + (meta.acceptanceRework ? `\n本轮在已完成的研发成果上修订，当前源码哈希${baseHash}；项目基线导航是原版，只读工作目录是当前事实。保留已完成需求及全部既有断言。affectedFiles/changes/components必须包含现有变更文件${JSON.stringify(meta.acceptanceRework.retainedFiles)}并说明保留或继续修复，以保持最终整体交付可审核；增加必要修复文件。验收沟通原文用read_discussion读取${meta.acceptanceRework.messageHash}，调查建议读取${meta.acceptanceRework.replyHash}。不得为了通过删除原验收。` : "")
         + (process.env.REQFLOW_LOCAL_RUNTIME_CONTAINER === "1"
           ? `\n本地启动运行在Docker容器中，${localRuntimePorts.join("、")}已经映射到宿主机回环地址。每个startup服务选择这5个端口之一，监听0.0.0.0，healthUrl和applicationUrl分别明确配置，均使用http://127.0.0.1:对应端口；前端代理后端也使用对应容器端口。需要更改启动参数或代理配置时列入方案，不让用户另填命令。`
           : "\n本地服务运行在工作台主机，监听回环地址；核实现有端口和依赖后选择启动参数。")
@@ -186,7 +190,7 @@ export async function plan(projectPath, id) {
       if (manifestHash(await manifest(planningWorkspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== baseHash) {
         throw new Error("Planning workspace changed during read-only Pi run");
       }
-      const after = manifestHash(await sourceManifest(project));
+      const after = manifestHash(await manifest(planningSource, project.config.excludedPaths, project.config.maxSnapshotBytes));
       if (after !== baseHash) throw new Error("Project files changed during read-only planning");
       let developerSession = checkpoint ? checkpoint.detail.telemetry.sessionCheckpoint : result.telemetry.sessionCheckpoint;
       let draft;
@@ -294,7 +298,7 @@ export async function plan(projectPath, id) {
             draft = planAnalysisInput(JSON.parse(correctionRun.text), contract, project, { draft, sourceFiles: Object.keys(baseline) });
           }
           if (manifestHash(await manifest(planningWorkspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== baseHash
-              || manifestHash(await sourceManifest(project)) !== baseHash) throw new Error("Files changed during read-only plan correction");
+              || manifestHash(await manifest(planningSource, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== baseHash) throw new Error("Files changed during read-only plan correction");
           for (const api of draft.design.interfaces) {
             if (api.status !== "new" && !Object.hasOwn(baseline, api.sourceFile)) throw new Error(`接口引用的源码不存在：${api.sourceFile}`);
           }
@@ -340,6 +344,8 @@ export async function plan(projectPath, id) {
       }
       if (manifestHash(await manifest(planningWorkspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== baseHash)
         throw new Error("Scoped baseline checks modified project files");
+      if (meta.acceptanceRework && meta.acceptanceRework.retainedFiles.some(file => !draft.affectedFiles.includes(file)))
+        throw new Error("修订方案遗漏已有变更文件，必须审核完整交付。");
       const text = draft.markdown.replace(/((?:^|\n)## 待确认\s*\n)[\s\S]*?(?=\n## |$)/,
         (_, heading) => `${heading}${blockers.length ? blockers.map((item) => `- ${item}`).join("\n") : "无"}`);
       const planFile = path.join(directory, `plan-v${version}.md`);
@@ -353,12 +359,15 @@ export async function plan(projectPath, id) {
       await fs.writeFile(planFile, text, { flag: "wx", mode: 0o600 });
       const next = { ...checked.meta, state: "plan_review", planVersion: version, planAttempts: attempt, planHash: sha256(text),
         planAnalysisHash: sha256(JSON.stringify(analysis)), developmentFiles: draft.affectedFiles,
-        planBlockers: blockers, planFeedbackVersion: null, admission: decision, admissionPolicyHash: admission.policyHash, baseHash, baseRevision: revision,
+        planBlockers: blockers, planFeedbackVersion: null, admission: decision, admissionPolicyHash: admission.policyHash,
+        baseHash: meta.acceptanceRework ? meta.baseHash : baseHash, baseRevision: meta.acceptanceRework ? meta.baseRevision : revision,
+        planScopeHash: null, planPartApprovals: {},
         projectBaselineHash: projectBaseline.snapshotHash, configHash, configBindingVersion: 2,
         standardsHash: standards.hash, planResolutionHash: null, updatedAt: new Date().toISOString() };
       await appendEvent(project, id, "plan_created", next, { planFile, analysisFile, modelRun: false, planningWorkspace, baselineChecks,
         projectBaselineHash: projectBaseline.snapshotHash, standardsHash: standards.hash,
-        analysisHash: next.planAnalysisHash, reviewPolicy, roles: specialistRoles, blockers, admission: decision });
+        analysisHash: next.planAnalysisHash, reviewPolicy, roles: specialistRoles, blockers, admission: decision,
+        planningSourceHash: baseHash });
       return { planFile, state: next.state, blocked: blockers.length > 0 };
     } catch (error) {
       const latest = (await readTask(project, id)).meta;
@@ -457,8 +466,9 @@ export async function resolvePlanFindings(projectPath, id, actor, input) {
             || source.file.split("/").some(part => part === ".env" || part.startsWith(".env."))
             || !Number.isSafeInteger(source.startLine) || source.startLine < 1 || !Number.isSafeInteger(source.endLine)
             || source.endLine < source.startLine || source.endLine - source.startLine >= 80) throw new Error("Invalid resolution source range");
-        const file = await fs.realpath(path.join(project.root, source.file));
-        assertInside(project.root, file);
+        const evidenceRoot = meta.acceptanceRework ? meta.workspace : project.root;
+        const file = await fs.realpath(path.join(evidenceRoot, source.file));
+        assertInside(evidenceRoot, file);
         const content = await fs.readFile(file, "utf8");
         const lines = content.split("\n");
         if (source.endLine > lines.length) throw new Error("Resolution evidence exceeds source lines");
@@ -505,16 +515,20 @@ export async function approvePlan(projectPath, id, actor, scope, authorizationHa
     if (sha256(JSON.stringify(contract)) !== meta.contractHash) throw new Error("Confirmed contract changed after planning");
     await assertTaskStandards(project, meta, directory);
     if (describePolicy(project.config).executionConfigHash !== meta.configHash) throw new Error("Project policy changed after planning");
-    const sourceHash = project.config.mode === "git"
+    const sourceHash = project.config.mode === "git" || meta.acceptanceRework
       ? manifestHash(await manifest(created.detail.planningWorkspace, project.config.excludedPaths, project.config.maxSnapshotBytes))
       : manifestHash(await sourceManifest(project));
-    if (sourceHash !== meta.baseHash) throw new Error("Project files changed after planning");
-    const currentBaseline = await readProjectBaseline(project, sourceHash, project.config.mode !== "git");
+    if (sourceHash !== (meta.acceptanceRework ? meta.acceptanceRework.sourceHash : meta.baseHash)) throw new Error("Project files changed after planning");
+    if (meta.acceptanceRework && (manifestHash(await sourceManifest(project)) !== meta.baseHash
+        || manifestHash(await manifest(meta.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== meta.afterHash))
+      throw new Error("验收修复现场或原项目源码已改变，请重新核对方案。");
+    const currentBaseline = await readProjectBaseline(project, meta.baseHash, project.config.mode !== "git");
     if (currentBaseline.sourceHash !== meta.baseHash || currentBaseline.configHash !== meta.configHash) {
       throw new Error("Project baseline changed after planning");
     }
     if (project.config.mode === "local" && await sourceRevision(project) !== meta.baseRevision) throw new Error("Project revision changed after planning");
-    const branchSelection = project.config.mode === "git" ? await validateDevelopmentBranch(project, meta,
+    if (meta.acceptanceRework && developmentBranch !== undefined) throw new Error("验收修复沿用当前需求分支，不重新选择分支。");
+    const branchSelection = project.config.mode === "git" && !meta.acceptanceRework ? await validateDevelopmentBranch(project, meta,
       developmentBranch ?? { kind: "new", branch: `${project.config.branchPrefix}/${id}${meta.restartCount ? `-restart-${meta.restartCount}` : ""}` }) : null;
     if (project.config.mode === "local" && developmentBranch !== undefined) throw new Error("目录项目不支持 Git 分支选择。");
     if (meta.assignments?.developer?.userId !== actor || meta.assignments.developer.status !== "accepted") {
@@ -533,11 +547,15 @@ export async function approvePlan(projectPath, id, actor, scope, authorizationHa
       }
       scopeDecision = { schemaVersion: 1, actor, planVersion: meta.planVersion, planAnalysisHash: meta.planAnalysisHash,
         proposedFiles: meta.developmentFiles, files: scope.files, reason: scope.reason, at: new Date().toISOString() };
+      if (meta.acceptanceRework && meta.acceptanceRework.retainedFiles.some(file => !scope.files.includes(file)))
+        throw new Error("验收修订审批范围必须包含已有交付变更。");
       await fs.writeFile(path.join(directory, `plan-scope-v${meta.planVersion}.json`), JSON.stringify(scopeDecision, null, 2), { flag: "wx" });
     }
     const next = { ...meta, state: "approved", developmentBranch: branchSelection, developmentChecks,
       planApprovedBy: actor, planApprovedAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-      ...(scopeDecision ? { developmentFiles: scopeDecision.files, planScopeHash: sha256(JSON.stringify(scopeDecision)) } : {}) };
+      ...(scopeDecision ? { developmentFiles: scopeDecision.files, planScopeHash: sha256(JSON.stringify(scopeDecision)) } : {}),
+      ...(meta.acceptanceRework ? { resumeImplementationFiles: scopeDecision?.files ?? meta.developmentFiles,
+        resumeContinuation: false, changeApproval: null } : {}) };
     await appendEvent(project, id, "plan_approved", next, { actor,
       approvalKind: authorizationHash === undefined ? "human" : "delegated", authorizationHash: authorizationHash ?? null,
       contractHash: meta.contractHash, planHash: meta.planHash, baseHash: meta.baseHash,
@@ -545,24 +563,42 @@ export async function approvePlan(projectPath, id, actor, scope, authorizationHa
       admissionHash: sha256(JSON.stringify(analysis.admission)), riskOwner: actor,
        planResolutionHash: meta.planResolutionHash ?? null, scopeDecision: scopeDecision ?? null, developmentBranch: branchSelection,
        teamReview });
+    if (meta.acceptanceRework) await appendEvent(project, id, "implementation_resumed", next,
+      { actor, evidence: "已人工确认验收修订方案，基于保留成果继续实施并重新验证。", files: next.resumeImplementationFiles,
+        acceptanceReplyHash: meta.acceptanceRework.replyHash, continuation: false });
     return next;
   });
 }
 
-export async function resumeImplementation(projectPath, id, actor, evidence, files, reviewedEdits, modelSelection, continuation) {
+export async function resumeImplementation(projectPath, id, actor, evidence, files, reviewedEdits, modelSelection, continuation, acceptanceRepair) {
   requireActor(actor);
   if (typeof evidence !== "string" || !evidence.trim() || evidence.length > 4000) throw new Error("Resume requires the responsible developer's diagnosis");
   const project = await loadProject(projectPath);
-  if (project.config.mode !== "local" && !continuation) throw new Error("Implementation resume currently supports isolated local workspaces only");
+  if (project.config.mode !== "local" && !continuation && !acceptanceRepair) throw new Error("Implementation resume currently supports isolated local workspaces only");
   return withLock(path.join(taskPath(project, id), "task.lock"), async () => {
     const { meta, directory, events } = await readTask(project, id);
-    if (!["implementation_failed", "verification_failed", "verified"].includes(meta.state)) throw new Error("Resume requires implementation or verification failure, or verified reviewer rework");
+    if (!["implementation_failed", "verification_failed", "verified"].includes(meta.state)
+        && !(acceptanceRepair && meta.state === "test_deployed")) throw new Error("Resume requires implementation or verification failure, or verified reviewer rework");
+    if (acceptanceRepair) {
+      const reply = events.findLast(event => event.type === "acceptance_reply");
+      const message = events.findLast(event => event.type === "acceptance_message");
+      if (!["verified", "test_deployed"].includes(meta.state) || !reply || !message
+          || acceptanceRepair.replyHash !== reply.hash || acceptanceRepair.messageHash !== message.hash
+          || reply.detail.messageHash !== message.hash || acceptanceRepair.expectedAfterHash !== meta.afterHash
+          || acceptanceRepair.expectedPlanHash !== meta.planHash || acceptanceRepair.expectedContractHash !== meta.contractHash
+          || reply.detail.afterHash !== meta.afterHash || reply.detail.planHash !== meta.planHash
+          || reply.detail.reply.route !== acceptanceRepair.route || reply.detail.reply.questions.length
+          || meta.acceptanceFeedback?.status !== "discussing") throw new Error("验收反馈或研发版本已改变，请刷新后确认修复。");
+      if (acceptanceRepair.route === "requirement" && meta.createdBy !== actor)
+        throw new Error("业务需求变更须由原产品负责人重新对齐。");
+    }
     if (continuation && (reviewedEdits !== undefined || modelSelection !== undefined
         || continuation.expectedPlanHash !== meta.planHash || continuation.expectedAfterHash !== meta.afterHash
         || !["implementation_failed", "verification_failed"].includes(meta.state))) throw new Error("继续执行的方案或代码版本已改变，请刷新查看当前现场。");
-    if (meta.state === "verified" && reviewedEdits === undefined) throw new Error("Verified reviewer rework requires explicit reviewed replacements");
-    if (meta.assignments?.developer?.userId !== actor || meta.assignments.developer.status !== "accepted"
-        || meta.planApprovedBy !== actor) throw new Error("Only the assigned plan approver can resume implementation");
+    if (meta.state === "verified" && reviewedEdits === undefined && !acceptanceRepair) throw new Error("Verified reviewer rework requires explicit reviewed replacements");
+    if (acceptanceRepair?.route !== "requirement" && (meta.assignments?.developer?.userId !== actor
+        || meta.assignments.developer.status !== "accepted" || meta.planApprovedBy !== actor))
+      throw new Error("Only the assigned plan approver can resume implementation");
     if (modelSelection !== undefined && (reviewedEdits !== undefined || !modelSelection
         || Object.keys(modelSelection).sort().join() !== "model,provider,thinking"
         || (!project.config.compatibleProviders?.some(provider => provider.name === modelSelection.provider
@@ -584,10 +620,10 @@ export async function resumeImplementation(projectPath, id, actor, evidence, fil
     if (!Array.isArray(files) || !files.length || new Set(files).size !== files.length
         || files.some(file => !resumableFiles.has(file))) throw new Error("Resume files must explicitly select approved implementation files or audited project additions");
     const source = project.config.mode === "git"
-      ? await manifest(events.findLast(event => event.type === "plan_created").detail.planningWorkspace, project.config.excludedPaths, project.config.maxSnapshotBytes)
+      ? await manifest(events.find(event => event.type === "plan_created").detail.planningWorkspace, project.config.excludedPaths, project.config.maxSnapshotBytes)
       : await sourceManifest(project);
     if (project.config.mode === "git" && (await runGit(meta.workspace, ["branch", "--show-current"]) !== meta.branch
-        || await runGit(meta.workspace, ["rev-parse", "HEAD"]) !== meta.baseRevision)) throw new Error("需求分支或基础提交已改变，请先核对工作目录。");
+        || await runGit(meta.workspace, ["rev-parse", "HEAD"]) !== (meta.gitCommit?.revision ?? meta.baseRevision))) throw new Error("需求分支或基础提交已改变，请先核对工作目录。");
     if (describePolicy(project.config).executionConfigHash !== meta.configHash || manifestHash(source) !== meta.baseHash
         || manifestHash(await manifest(meta.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== meta.afterHash
         || manifestHash(await manifest(path.join(directory, "baseline"), project.config.excludedPaths, project.config.maxSnapshotBytes)) !== meta.baselineHash) throw new Error("Source, policy, workspace or recovery snapshot changed before resume");
@@ -618,7 +654,7 @@ export async function resumeImplementation(projectPath, id, actor, evidence, fil
         else replacements.push({ ...edit, path: file, text: replaced });
       }
     } else modelAllowance(events, admissionPolicy(project.config));
-    const retained = path.join(directory, `implementation-${meta.state === "verified" ? "review" : "failure"}-${failed.hash}`);
+    const retained = path.join(directory, `implementation-${["verified", "test_deployed"].includes(meta.state) ? "review" : "failure"}-${failed.hash}`);
     const saved = await manifest(path.join(directory, "after"), project.config.excludedPaths, project.config.maxSnapshotBytes);
     if (report.changes.some(change => change.after && JSON.stringify(saved[change.file]) !== JSON.stringify(change.after))) throw new Error("Implementation snapshot changed before resume");
     await fs.mkdir(retained, { mode: 0o700 });
@@ -626,6 +662,25 @@ export async function resumeImplementation(projectPath, id, actor, evidence, fil
     await copyFiles(path.join(directory, "after"), path.join(retained, "after"), report.changes.filter(change => change.after).map(change => change.file));
     await appendEvent(project, id, "implementation_attempt_retained", meta, { actor, evidence: evidence.trim(), files,
       priorState: meta.state, priorFailureHash: failed.hash, priorImplementationHash: changeEvent.hash, retained, reportHash: sha256(JSON.stringify(report)) });
+    if (acceptanceRepair) {
+      await stopLocalRuntime(directory);
+      const rework = { sourceHash: meta.afterHash, messageHash: acceptanceRepair.messageHash,
+        replyHash: acceptanceRepair.replyHash, retainedFiles: report.changes.map(change => change.file), route: acceptanceRepair.route };
+      const next = { ...meta, state: acceptanceRepair.route === "repair" ? "approved" : "plan_review",
+        acceptanceRework: rework, acceptanceFeedback: { status: "repairing", messageHash: acceptanceRepair.messageHash },
+        resumeImplementationFiles: acceptanceRepair.route === "repair" ? files : null, resumeContinuation: false,
+        changeApproval: null, checks: null, localValidation: null, testDeployment: null, testCandidate: null,
+        gitCandidate: null, publishedRevision: null, gitDeliveryError: null, developmentPause: null,
+        fastPathEligibility: null, fastPathAuthorization: null,
+        planPartApprovals: acceptanceRepair.route === "repair" ? meta.planPartApprovals : {},
+        ...(acceptanceRepair.route === "requirement" ? { aiAligned: true } : {}), updatedAt: new Date().toISOString() };
+      await appendEvent(project, id, "acceptance_repair_requested", next, { actor, evidence, ...rework,
+        priorState: meta.state, priorAfterHash: meta.afterHash, priorPlanHash: meta.planHash, retained });
+      if (acceptanceRepair.route === "repair") await appendEvent(project, id, "implementation_resumed", next,
+        { actor, evidence, files, priorFailureHash: failed.hash, priorImplementationHash: changeEvent.hash,
+          retained, planHash: meta.planHash, afterHash: meta.afterHash, continuation: false, acceptanceReplyHash: acceptanceRepair.replyHash });
+      return next;
+    }
     if (reviewedEdits !== undefined) {
       const active = { ...meta, state: "implementing", changeApproval: null, updatedAt: new Date().toISOString() };
       await appendEvent(project, id, "reviewed_repair_started", active, { actor, riskOwner: actor,
@@ -743,9 +798,11 @@ export async function implement(projectPath, id) {
     let result;
     try {
       const diagnosis = resumed ? events.findLast(event => event.type === "implementation_resumed").detail.evidence : null;
+      const acceptanceReply = meta.acceptanceRework ? events.find(event => event.hash === meta.acceptanceRework.replyHash) : null;
       const resolvedGuidance = (analysis.resolution ? `\n责任研发人逐项澄清（${analysis.resolution.actor}；只在已批准文件和需求内实施）：\n${analysis.resolution.implementationGuidance}` : "")
         + (analysis.approvalScope ? `\nApproved owner scope note (${analysis.approvalScope.actor}): ${analysis.approvalScope.reason}` : "")
-        + (resumed ? `\nContinue from the current retained workspace: ${JSON.stringify(meta.resumeImplementationFiles)}. Prior failure and evidence: ${diagnosis}. Preserve completed edits and existing assertions. Investigate and fix the root cause; never weaken tests to pass. This is a fresh coding session: inspect current source rather than relying on historical tool results.` : "");
+        + (resumed ? `\nContinue from the current retained workspace: ${JSON.stringify(meta.resumeImplementationFiles)}. Prior failure and evidence: ${diagnosis}. Preserve completed edits and existing assertions. Investigate and fix the root cause; never weaken tests to pass. This is a fresh coding session: inspect current source rather than relying on historical tool results.` : "")
+        + (acceptanceReply ? `\n验收修复调查（建议须以当前源码核实）：${JSON.stringify(acceptanceReply.detail.reply)}。原反馈：${events.find(event => event.hash === meta.acceptanceRework.messageHash).detail.text}。修复后新增真实复现回归，报告已解决与未解决事项；不得宣称人工验收通过。` : "");
       const verificationGuidance = (analysis.draft.schemaVersion === 2 ? `\nApproved implementation design (${meta.planHash}): ${JSON.stringify(analysis.draft.design)}\nFollow these reviewed interface fields, rendering choices, component locations and data handling; a file change summary does not replace this design.` : "")
         + `\nAcceptance assertions: ${JSON.stringify(analysis.draft.verification)}. Approved validation contract: ${JSON.stringify(analysis.draft.validation)}. Only execute scoped checks; never repair skipped unrelated suites. Complete planned missing startup scripts. Do not start persistent servers during coding: the controller starts them when local validation is selected. Never claim manual acceptance. The controller independently verifies the source against these checks.`;
       const specialistGuidance = analysis.specialists.flatMap(row => row.findings.findings.filter(finding => finding.severity === "advisory")
@@ -780,6 +837,7 @@ export async function implement(projectPath, id) {
       const next = { ...active, state: "implemented", changeCount: inspected.changes.length, afterHash: inspected.afterHash, implementationCostUsd: previousImplementationCost + result.costUsd, updatedAt: new Date().toISOString() };
       await appendEvent(project, id, "implemented", next, { changes: inspected.changes, scopeAdditions: inspected.scopeAdditions,
         warnings: inspected.warnings, usage: result.usage,
+        ...(acceptanceReply ? { acceptanceReplyHash: acceptanceReply.hash, summary: result.text } : {}),
         costUsd: result.costUsd, toolCalls: result.toolCalls, telemetry: result.telemetry });
       return next;
     } catch (error) {
@@ -834,7 +892,9 @@ export async function verify(projectPath, id) {
       const after = manifestHash(await manifest(meta.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes));
       if (after !== before) throw new Error("Verification commands modified project files");
       const verificationMode = commands.length ? "automated" : "manual_pending";
-      const next = { ...meta, state: "verified", verificationAttempt, verificationMode, checks: results, updatedAt: new Date().toISOString() };
+      const next = { ...meta, state: "verified", verificationAttempt, verificationMode, checks: results,
+        ...(meta.acceptanceFeedback?.status === "repairing" ? { acceptanceRework: null,
+          acceptanceFeedback: { ...meta.acceptanceFeedback, status: "awaiting_acceptance" } } : {}), updatedAt: new Date().toISOString() };
       await appendEvent(project, id, "verified", next, { checks: results, verificationMode,
         validation: (await readPlanAnalysis(meta, directory)).draft.validation });
       return next;
@@ -988,7 +1048,8 @@ export async function deployTest(projectPath, id) {
     }
     const deploymentMeta = candidate ? { ...meta, ...candidate, afterHash: candidate.sourceHash } : meta;
     const deploymentHash = candidate ? candidate.sourceHash : current;
-    const logFile = path.join(directory, "test-deploy.log");
+    const deploymentAttempt = events.filter(event => event.type === "test_deploy_submitting").length + 1;
+    const logFile = path.join(directory, `test-deploy-${deploymentAttempt}.log`);
     const active = { ...meta, state: "test_deploy_submitting", updatedAt: new Date().toISOString() };
     await appendEvent(project, id, "test_deploy_submitting", active, { logFile, sourceHash: deploymentHash,
       revision: deploymentMeta.publishedRevision, branch: deploymentMeta.branch });
@@ -1023,11 +1084,13 @@ export async function deployTest(projectPath, id) {
 export async function pollTestDeployment(projectPath, id) {
   const project = await loadProject(projectPath);
   return withLock(path.join(taskPath(project, id), "task.lock"), async () => {
-    const { meta, directory } = await readTask(project, id);
+    const { meta, directory, events } = await readTask(project, id);
     requireState(meta, "test_deploy_running");
     if (describePolicy(project.config).executionConfigHash !== meta.configHash) throw new Error("Project policy changed after plan approval");
     if (manifestHash(await manifest(meta.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== meta.afterHash) throw new Error("Workspace changed after verification");
-    const logFile = path.join(directory, "test-deploy.log");
+    const submitted = events.findLast(event => event.type === "test_deploy_submitting");
+    if (!submitted || path.dirname(submitted.detail.logFile) !== directory) throw new Error("测试部署缺少本轮日志绑定。");
+    const logFile = submitted.detail.logFile;
     let result;
     const candidate = meta.testCandidate;
     const deploymentMeta = candidate ? { ...meta, ...candidate, afterHash: candidate.sourceHash } : meta;
@@ -1092,6 +1155,8 @@ export async function acceptTest(projectPath, id, actor, evidence, acceptanceMod
   const project = await loadProject(projectPath);
   return withLock(path.join(project.archive, "execution-config.lock"), () => withLock(path.join(project.archive, "test-environment.lock"), () => withLock(path.join(taskPath(project, id), "task.lock"), async () => {
     const { meta, directory } = await readTask(project, id);
+    if (["open", "discussing", "repairing"].includes(meta.acceptanceFeedback?.status))
+      throw new Error("验收反馈尚未处理，请完成沟通修复，或由反馈人说明原因后结束反馈。");
     const verified = acceptanceMode !== "deployed";
     if (verified) {
       requireState(meta, "verified");
@@ -1118,6 +1183,8 @@ export async function acceptTest(projectPath, id, actor, evidence, acceptanceMod
     await fs.writeFile(path.join(directory, "acceptance.md"), evidence, { flag: "wx", mode: 0o600 });
     const stopped = await stopLocalRuntime(directory);
     const next = { ...meta, state: "test_accepted", acceptanceMode,
+      ...(meta.acceptanceFeedback?.status === "awaiting_acceptance" ? {
+        acceptanceFeedback: { ...meta.acceptanceFeedback, status: "accepted", acceptedBy: actor } } : {}),
       ...(meta.localValidation?.status === "running" ? { localValidation: { ...meta.localValidation, status: stopped.status } } : {}),
       acceptedBy: actor, acceptedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
     await appendEvent(project, id, "test_accepted", next, { actor, acceptanceMode, afterHash: meta.afterHash,
@@ -1187,7 +1254,8 @@ export async function restartDevelopment(projectPath, id, actor, expectedAuditHe
       "resumeImplementationFiles", "resumeImplementationModel", "resumeContinuation", "resumeSessionCheckpoint", "developmentFailure",
       "fastPathEligibility", "fastPathAuthorization", "changeApproval", "changeCount", "checks", "verificationMode", "verificationFailure",
       "localValidation", "publishedRevision", "publishedBy", "gitDeliveryError", "gitCandidate", "gitCommit", "testCandidate", "testDeployment",
-      "acceptedBy", "acceptedAt", "acceptanceMode", "rolledBackBy", "candidateWorkspace", "candidateHash", "mergedRevision", "mergeChecks"])
+      "acceptedBy", "acceptedAt", "acceptanceMode", "rolledBackBy", "candidateWorkspace", "candidateHash", "mergedRevision", "mergeChecks",
+      "acceptanceRework"])
       delete next[field];
     await appendEvent(project, id, "development_restarted", next, { actor, retained, priorRollbackHash: rolled.hash, priorAuditHead: lastHash,
       priorImplementationHash: implementation.hash, priorPlanHash: meta.planHash, baselineHash: meta.baselineHash,

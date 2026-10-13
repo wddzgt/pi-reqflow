@@ -68,6 +68,9 @@ const eventNames = {
   release_reconciled: "发布结果已人工核实",
   archived_test_only: "研发交付归档", workspace_rolled_back: "工作区已回退", rollback_rejected: "回退被拒绝",
   stale_lock_cleared: "过期锁已清除",
+  acceptance_message: "验收反馈已提交", acceptance_reply: "验收问题调查已完成",
+  acceptance_discussion_failed: "验收调查未完成", acceptance_repair_requested: "已确认继续修复",
+  acceptance_feedback_closed: "反馈已具名结束",
   pi_budget_exhausted: "模型预算耗尽，流程已停止", fast_path_attempt_failed: "自动流程未能推进", fast_path_scope_failed: "变更超出批准范围",
   credential_added: "账号已创建", credential_revoked: "账号凭据已撤销", credentials_reprovisioned: "账号凭据已重新配置",
   user_roles_updated: "角色权限已变更", password_reset: "密码已重置", password_changed: "用户已修改密码",
@@ -93,6 +96,16 @@ function canUseAction(meta, action, role) {
     && meta.assignments?.[action.slice("review-plan-".length)]?.userId === state.principal?.id
     && meta.assignments[action.slice("review-plan-".length)].status === "accepted";
   if (!state.actions.has(action === "edit-intake-candidate" ? "intake-message" : action)) return false;
+  if (["discuss-acceptance", "close-acceptance-feedback", "start-acceptance-repair"].includes(action)) {
+    if (action === "close-acceptance-feedback") return meta.acceptanceFeedback?.owner === state.principal?.id;
+    if (action === "start-acceptance-repair") {
+      const reply = state.detail?.acceptanceDiscussion?.messages.findLast(row => row.type === "acceptance_reply");
+      return reply?.reply.route === "requirement" ? meta.createdBy === state.principal?.id
+        : meta.assignments?.developer?.userId === state.principal?.id && meta.assignments.developer.status === "accepted";
+    }
+    return meta.createdBy === state.principal?.id || Object.values(meta.assignments ?? {}).some(row =>
+      row.userId === state.principal?.id && row.status === "accepted");
+  }
   if (action === "accept-test" && meta.state === "verified" && meta.changeApproval?.afterHash !== meta.afterHash)
     return meta.assignments?.developer?.userId === state.principal?.id && meta.assignments.developer.status === "accepted";
   if (action === "accept-test" && meta.createdBy === state.principal?.id) return true;
@@ -246,6 +259,9 @@ function renderList() {
 }
 
 function nextStep(meta) {
+  if (["verified", "test_deployed"].includes(meta.state) && ["open", "discussing"].includes(meta.acceptanceFeedback?.status))
+    return ["验收反馈待处理", "先沟通复现、原因和修复范围，确认修复后重新验证；需改变业务规则时由产品重新定版。", "review",
+      [["discuss-acceptance", "查看 / 继续验收沟通", "primary"]]];
   if (meta.executionBoundary?.length) {
     return ["自动执行已停止", "已达到承接或执行预算边界，请研发负责人查看流程记录并处理具体原因。", "error", []];
   }
@@ -326,12 +342,14 @@ function nextStep(meta) {
       const git = state.overview.project.mode === "git";
       const publish = git ? ["publish-test", state.overview.project.gitDelivery?.testMode === "merge"
         ? "合并并发布测试环境" : "发布需求分支到测试环境", "secondary"] : ["deploy-test", "发布到测试环境", "secondary"];
-      return [meta.verificationMode === "manual_pending" ? "代码已就绪，待人工确认" : "研发检查通过，待人工确认", meta.gitDeliveryError ||
+      return [meta.acceptanceFeedback?.status === "awaiting_acceptance" ? "修复检查完成，待再次验收"
+        : meta.verificationMode === "manual_pending" ? "代码已就绪，待人工确认" : "研发检查通过，待人工确认", meta.gitDeliveryError ||
         (meta.verificationMode === "manual_pending" ? "本轮没有合适的自动检查，请核对需求、代码差异并记录实际人工检查结论。" : "核对需求、代码差异及相关测试结果，人工确认后即可归档。")
         + " 本地验证和测试环境发布均为可选步骤，不配置环境也可归档。"
         + (blocked ? " 本地启动缺少环境条件，重试前请先补齐配置。" : ""), "review",
         [["accept-test", "人工确认并归档", "primary"],
            ["local-validation", meta.localValidation?.status === "running" ? "查看本地环境" : blocked ? "重试本地验证（可选）" : "启动本地验证（可选）", "secondary"], ...(configured ? [publish] : []),
+           ["discuss-acceptance", "反馈问题，继续修复", "secondary"],
            ["recheck-local", "重新检查本地修改", "secondary"],
            ...(!configured && state.overview.project.canConfigureEnvironment ? [["configure-environment", "配置测试环境", "secondary"]] : [])]];
     }
@@ -340,7 +358,7 @@ function nextStep(meta) {
       return ["测试部署结果待核实", "先检查部署平台与日志，再由测试人员通过 CLI 记录实际结果；不要重复部署。", "error", []];
     case "test_deployed": return meta.testEnvironmentSupersededBy
       ? ["共享测试环境已用于其他需求", "当前链接不能用于本需求验收；研发可重新发布已验证代码。", "review", [["redeploy-test", "重新发布测试环境", "primary"]]]
-      : ["等待人工验证", "按需求终版在测试环境验证业务结果，确认后记录验收与归档。", "review", [["accept-test", "确认验证结果", "primary"], ["rollback", "恢复需求工作目录", "secondary"]]];
+      : ["等待人工验证", "按需求终版在测试环境验证业务结果，确认后记录验收与归档。", "review", [["accept-test", "确认验证结果", "primary"], ["discuss-acceptance", "反馈问题，继续修复", "secondary"], ["rollback", "恢复需求工作目录", "secondary"]]];
     case "test_accepted": return ["人工验收已确认", "核对验收记录后归档研发交付。", "review", [["archive-test-only", "归档需求", "primary"]]];
     case "merge_verifying": return ["候选版本验证中", "正在候选版本上运行检查，完成后刷新查看结果。", "active", []];
     case "merge_verified": return ["候选版本已验证", "可归档此次测试交付。", "done", [["archive-test-only", "归档需求", "primary"]]];
@@ -465,7 +483,7 @@ function renderDetail() {
   const attention = element("div", `attention-card ${attentionTone}`);
   attention.append(element("span", "attention-icon", attentionTone === "error" ? "!" : attentionTone === "done" ? "✓" : "◇"));
   const copy = element("div", "attention-copy");
-  const visibleDescription = !execution && !meta.executionPause && productView && stageIndex >= 1 && meta.state !== "test_deployed" && meta.assignments?.developer?.status === "accepted" && !isArchived
+  const visibleDescription = !execution && !meta.executionPause && productView && stageIndex >= 1 && !["verified", "test_deployed"].includes(meta.state) && meta.assignments?.developer?.status === "accepted" && !isArchived
     ? `需求已定版，当前由研发负责人 ${meta.assignments.developer.userId} 推进。可在流程记录中查看进展和各阶段的责任人。`
     : description;
   copy.append(element("strong", "", attentionTitle), element("p", "", visibleDescription));
@@ -540,9 +558,9 @@ function renderDetail() {
   }
   panel.append(members);
   const tabs = element("div", "detail-tabs");
-  const allTabs = [["alignment", "需求对齐"], ["plan", "研发方案"],
-    ["changes", "代码变更"], ["checks", "验证记录"], ["audit", "流程记录"], ["request", "原始需求"]];
-  const tabList = productView ? allTabs.filter(([key]) => ["alignment", "audit", "request"].includes(key)) : allTabs;
+  const allTabs = [["alignment", "需求对齐"], ["plan", "研发方案"], ["acceptance", "验收沟通"],
+    ["changes", "代码变更"], ["checks", "验证记录"], ["audit", "流程记录"]];
+  const tabList = productView ? allTabs.filter(([key]) => ["alignment", "acceptance", "audit"].includes(key)) : allTabs;
   if (isArchived && !productView) tabList.push(["result", "归档报告"]);
   if (!tabList.some(([key]) => key === state.tab)) state.tab = "alignment";
   for (const [key, title] of tabList) {
@@ -744,15 +762,116 @@ function renderDiff(container, file) {
   container.append(card);
 }
 
+function openAcceptanceRepair(action) {
+  const { meta } = state.detail; const projectId = state.currentProjectId, taskId = state.selectedId;
+  const messages = state.detail.acceptanceDiscussion.messages;
+  const reply = messages.findLast(row => row.type === "acceptance_reply");
+  const message = messages.findLast(row => row.type === "acceptance_message");
+  const closing = action === "close-acceptance-feedback";
+  const version = { expectedPlanHash: meta.planHash, expectedAfterHash: meta.afterHash,
+    expectedContractHash: meta.contractHash, expectedFeedbackHash: closing ? message.eventHash : reply.eventHash };
+  structuredModal(closing ? "结束当前反馈" : "确认继续处理验收问题", closing
+    ? "请记录澄清依据。结束反馈后仍需人工验收，原讨论与失败记录保留。"
+    : reply.reply.route === "requirement" ? "保留当前研发成果，重新对齐业务需求；产品定版和研发方案审批完成后才继续编码。"
+      : reply.reply.route === "plan" ? "保留当前研发成果，生成修订方案供研发审核；确认方案前不会改代码。"
+        : "按当前批准方案修复，保留已有功能和断言，重新运行相关检查，再交回人工验收。", form => {
+    if (closing) return formField(form, "澄清或结束反馈的依据", "textarea");
+    form.append(element("p", "plain-copy", reply.reply.repair)); return null;
+  }, async field => {
+    if (state.selectedId !== taskId || state.currentProjectId !== projectId) throw new Error("需求已切换，请重新确认。");
+    return sendAction(action, { ...version, ...(closing ? { evidence: field.value.trim() } : {}) });
+  }, closing ? "记录并结束反馈" : "确认继续");
+}
+
+function renderAcceptanceDiscussion(container) {
+  const { meta } = state.detail;
+  const messages = state.detail.acceptanceDiscussion?.messages ?? [];
+  container.append(element("h3", "content-heading", "验收沟通与修复"), element("p", "intake-caption",
+    "描述实际现象、期望结果和复现步骤。AI 先只读调查，确认修复后再开发；每轮反馈、代码与验证记录保留。"));
+  const labels = { repair: "原方案内修复", plan: "修订方案后审核", requirement: "产品重新对齐需求", clarify: "需要补充事实", no_change: "建议澄清后结束反馈" };
+  const older = element("details", "intake-older");
+  if (messages.length > 4) { older.append(element("summary", "", `查看较早的 ${messages.length - 4} 条记录`)); container.append(older); }
+  for (const [index, message] of messages.entries()) {
+    const card = element("article", `intake-turn ${message.type === "acceptance_reply" ? "ai" : "product"}`);
+    card.append(element("div", "intake-turn-header", `${message.type === "acceptance_reply" ? "AI 研发" : message.actor} · ${dateText(message.at)}`));
+    card.append(element("p", "plain-copy", message.type === "acceptance_discussion_failed"
+      ? "本轮调查未完成，反馈和现场已保存，可补充信息后继续调查。"
+      : message.type === "acceptance_repair_requested" ? `已确认${labels[message.route]}，保留已有成果及证据后继续处理。`
+        : message.text ?? message.reply?.reply ?? message.evidence));
+    if (message.error) {
+      const error = element("details", "intake-suggestions"); error.append(element("summary", "", "查看失败原因"), element("p", "error-copy", message.error));
+      card.append(error);
+    }
+    renderIntakeImages(card, message.attachments ?? [], meta.id);
+    if (message.reply) {
+      card.append(element("strong", "", labels[message.reply.route]));
+      for (const question of message.reply.questions) card.append(element("p", "intake-question", question));
+      const details = element("details", "intake-suggestions"); details.append(element("summary", "", "原因、修复与验证建议"));
+      for (const reason of message.reply.rootCause) details.append(element("p", "plain-copy", reason));
+      details.append(element("p", "plain-copy", message.reply.repair)); card.append(details);
+    }
+    (index < messages.length - 4 ? older : container).append(card);
+  }
+  if (!["verified", "test_deployed"].includes(meta.state)) {
+    container.append(element("p", "info-empty", ["archived", "archived_test_only"].includes(meta.state)
+      ? "需求已归档，沟通记录保留；后续问题请新建关联修复需求。"
+      : "当前阶段不接受新的验收反馈；已有沟通保留，研发完成后可继续验收。")); return;
+  }
+  if (meta.acceptanceFeedback?.status === "awaiting_acceptance") container.append(element("p", "plain-copy",
+    "本轮修复已完成研发检查，请重新核对反馈场景与回归结果，再确认归档；环境验证仍可按需选择。"));
+  const result = state.detail.acceptanceDiscussion?.results?.findLast(row => row.afterHash === meta.afterHash);
+  if (result) {
+    const report = element("details", "intake-suggestions"); report.append(element("summary", "", "本轮修复说明（AI 报告，须人工核对）"),
+      element("p", "plain-copy", result.text)); container.append(report);
+  }
+  const reply = messages.findLast(row => row.type === "acceptance_reply");
+  const message = messages.findLast(row => row.type === "acceptance_message");
+  if (meta.acceptanceFeedback?.status === "discussing" && reply?.messageHash === message?.eventHash
+      && ["repair", "plan", "requirement"].includes(reply.reply.route) && !reply.reply.questions.length
+      && canUseAction(meta, "start-acceptance-repair")) {
+    const button = element("button", "button primary", reply.reply.route === "requirement" ? "重新对齐业务需求" : "确认修复范围并继续");
+    button.type = "button"; button.dataset.action = "start-acceptance-repair"; button.disabled = state.busy; container.append(button);
+  }
+  if (["open", "discussing"].includes(meta.acceptanceFeedback?.status) && canUseAction(meta, "close-acceptance-feedback")) {
+    const close = element("button", "button", "问题已澄清，结束反馈"); close.type = "button";
+    close.dataset.action = "close-acceptance-feedback"; close.disabled = state.busy; container.append(close);
+  }
+  if (!canUseAction(meta, "discuss-acceptance")) return;
+  const form = element("form", "intake-compose");
+  const input = formField(form, "反馈或补充说明", "textarea", "例如：翻到下一页后仍选中了上一页的数据；期望只操作当前页。");
+  input.maxLength = 4000; const images = imageUploadField(form);
+  const draftKey = `acceptance/${state.currentProjectId}/${meta.id}/${state.principal.id}`;
+  const projectId = state.currentProjectId, taskId = meta.id;
+  input.value = state.planDrafts.get(draftKey) ?? "";
+  input.addEventListener("input", () => state.planDrafts.set(draftKey, input.value));
+  const submit = element("button", "button primary", "发送并调查"); submit.type = "submit"; submit.disabled = state.busy;
+  const version = { expectedPlanHash: meta.planHash, expectedAfterHash: meta.afterHash, expectedContractHash: meta.contractHash };
+  form.addEventListener("submit", async event => {
+    event.preventDefault(); if (state.busy || !input.value.trim()) return;
+    try {
+      const uploads = await imageUploads(images);
+      if (state.currentProjectId !== projectId || state.selectedId !== taskId) throw new Error("需求已切换，请在当前需求重新提交反馈。");
+      if (await sendAction("discuss-acceptance", { message: { ...version, text: input.value.trim(), images: uploads } })) {
+        state.planDrafts.delete(draftKey);
+        if (state.currentProjectId === projectId && state.selectedId === taskId) renderDetail();
+      }
+    } catch (error) { toast(error.message, true); }
+  }); form.append(submit); container.append(form);
+}
+
 function renderTab(container) {
   clear(container);
+  if (state.tab === "acceptance") return renderAcceptanceDiscussion(container);
   const { meta, changes, baselineChecks, events, request, feedback, contract, reviews, plan } = state.detail;
   if (state.tab === "alignment") {
+    const original = element("details", "intake-older");
+    original.append(element("summary", "", "查看最初提交内容"), element("div", "plain-copy", request));
     if (state.detail.discussion) {
       renderIntakeDiscussion(container);
+      container.append(original);
       return;
     }
-    container.append(element("h3", "content-heading", "产品原始需求"), element("div", "plain-copy", request));
+    container.append(original);
     if (feedback) {
       container.append(element("h3", "content-heading", "研发反馈"), element("p", "plain-copy", feedback.summary));
       for (const question of feedback.questions) {
@@ -838,7 +957,6 @@ function renderTab(container) {
     renderPlanDiscussion(container, questionReplies);
     return;
   }
-  if (state.tab === "request") return container.append(element("div", "plain-copy", request));
   if (state.tab === "result") {
     const { result } = state.detail;
     if (!result) return container.append(element("p", "info-empty", "归档报告尚未生成。"));
@@ -886,11 +1004,16 @@ function renderTab(container) {
   }
   if (state.tab === "audit") {
     container.append(element("h3", "content-heading", "需求生命周期"),
-      element("p", "plain-copy", "回看需求定版、方案审核、实际变更审核、验收和发布决定，查看各阶段责任人。完整需求沟通在“需求对齐”中保留。"));
-    const button = element("button", "button primary", "查看完整生命周期"); button.type = "button";
+      element("p", "plain-copy", "查看每个环节的核心结果、确认人和当前待办。完整沟通在“需求对齐”中保留，排障记录按需展开。"));
+    const button = element("button", "button primary", "查看各环节核心结果"); button.type = "button";
     button.addEventListener("click", () => openLifecycle(meta.id).catch((error) => toast(error.message, true)));
     container.append(button);
-    if (state.principal.roles.some(role => ["developer", "admin"].includes(role))) for (const event of state.detail.events.filter(row => row.timing).slice(0, 6)) {
+    if (state.principal.roles.some(role => ["developer", "admin"].includes(role))) {
+      const diagnostics = element("details", "audit-diagnostics");
+      diagnostics.append(element("summary", "", "排障详情（按需查看）"));
+      diagnostics.addEventListener("toggle", () => {
+      if (!diagnostics.open || diagnostics.children.length > 1) return;
+      for (const event of state.detail.events.filter(row => row.timing).slice(0, 6)) {
       const timing = event.timing;
       const record = element("details", "audit-event-detail");
       record.append(element("summary", "", `${dateText(event.at)} · ${eventNames[event.type] ?? event.type} · ${Math.round(timing.durationMs / 1000)} 秒`));
@@ -909,7 +1032,10 @@ function renderTab(container) {
       }
       else record.append(element("p", "plain-copy", "这条历史记录只有总耗时，未记录逐轮请求时间。"));
       if (event.error) record.append(element("p", "error-copy", event.error));
-      container.append(record);
+      diagnostics.append(record);
+      }
+      });
+      container.append(diagnostics);
     }
   }
 }
@@ -1456,19 +1582,43 @@ function renderAuditFilters(card, filters) {
 async function openLifecycle(id, offset = 0) {
   const limit = 50;
   const data = await api(`/api/tasks/${encodeURIComponent(id)}/lifecycle?offset=${offset}&limit=${limit}`);
-  const card = auditModal(`${id} · 需求生命周期`, `${statusInfo(data.state)[0]} · 当前负责 ${data.status.responsible.userId ?? "待落实"} · 当前状态停留 ${durationText(data.status.stateAgeMs)}`);
+  const card = auditModal(`${id} · 需求生命周期`, `${statusInfo(data.state)[0]} · 当前负责 ${data.status.responsible.userId ?? "待落实"}`);
+  for (const result of data.results) {
+    const item = element("div", `lifecycle-event lifecycle-result ${result.status}`);
+    const labels = { completed: "已完成", pending: "待完成", blocked: "待处理", active: "进行中" };
+    item.append(element("strong", "", `${result.title} · ${labels[result.status]}`),
+      element("p", "", result.summary));
+    if (result.conclusion) {
+      item.append(element("p", "", result.conclusion.length > 200 ? `${result.conclusion.slice(0, 200)}…` : result.conclusion));
+      if (result.conclusion.length > 200) {
+        const full = element("details", "intake-older");
+        full.append(element("summary", "", "查看完整结论"), element("p", "plain-copy", result.conclusion)); item.append(full);
+      }
+    }
+    const ownerLabel = result.status === "completed" ? { alignment: "定版", design: "方案确认", implementation: "研发负责",
+      validation: "检查负责", acceptance: "验收", delivery: "归档" }[result.stage] : "负责";
+    item.append(element("small", "", `${ownerLabel} ${result.owner ?? "未记录"}${result.at ? ` · ${dateText(result.at)}` : ""}`));
+    card.append(item);
+  }
+  if (!state.principal.roles.some(role => ["developer", "admin"].includes(role))) return;
+  const history = element("details", "audit-diagnostics");
+  history.append(element("summary", "", "排障详情与历史记录"));
+  let rendered = false;
+  const renderHistory = () => {
+    if (!history.open || rendered) return;
+    rendered = true;
   const responsible = element("div", "audit-responsibilities");
   const labels = { product: "产品负责人", planReviewer: "方案责任人", changeRiskOwner: "变更风险责任", testAcceptor: "测试验收", releaseApprover: "发布审批", releaseObserver: "发布观察" };
   for (const [key, label] of Object.entries(labels)) responsible.append(element("span", "", `${label}：${data.responsibilities[key] ?? "未发生"}`));
   responsible.append(element("span", "", `研发负责人：${data.responsibilities.developer?.userId ?? "待分配"}`));
-  card.append(responsible);
+  history.append(responsible);
   if (state.actions.has("audit-report")) {
     const actions = element("div", "audit-toolbar");
     for (const [label, action] of [["返回管理总览", () => openAdminReport()], ["原始事件与证据索引", () => openAdminEvents("task", id, 0)], ["执行诊断与模型用量", () => openDiagnostics(id)]]) {
       const button = element("button", "button", label); button.type = "button";
       button.addEventListener("click", () => action().catch((error) => toast(error.message, true))); actions.append(button);
     }
-    card.append(actions);
+    history.append(actions);
   }
   for (const event of data.events) {
     const item = element("div", `lifecycle-event ${event.outcome}`);
@@ -1481,9 +1631,13 @@ async function openLifecycle(id, offset = 0) {
       const evidence = element("button", "button", "查看该节点原始证据"); evidence.type = "button";
       evidence.addEventListener("click", () => openAdminEvents("task", id, event.sequence, 1).catch((error) => toast(error.message, true))); item.append(evidence);
     }
-    card.append(item);
+    history.append(item);
   }
-  auditPager(card, offset, limit, data.total, (page) => openLifecycle(id, page).catch((error) => toast(error.message, true)));
+  auditPager(history, offset, limit, data.total, (page) => openLifecycle(id, page).catch((error) => toast(error.message, true)));
+  };
+  history.addEventListener("toggle", renderHistory);
+  card.append(history);
+  if (offset > 0) { history.open = true; renderHistory(); }
 }
 
 async function openAdminEvents(kind, id, offset, limit = 50) {
@@ -2035,7 +2189,7 @@ async function openTestEnvironmentSettings() {
 async function openPlanApproval() {
   const { meta } = state.detail; const taskId = state.selectedId; const projectId = state.currentProjectId;
   const expectedPlanHash = meta.planHash;
-  const setup = state.overview.project.mode === "git" ? await api("/api/project-git") : null;
+  const setup = state.overview.project.mode === "git" && !meta.acceptanceRework ? await api("/api/project-git") : null;
   const development = await api(`/api/tasks/${encodeURIComponent(taskId)}/actions`, { method: "POST",
     headers: { "Content-Type": "application/json", "X-Reqflow-Token": state.token },
     body: JSON.stringify({ action: "local-validation", stage: "development", expectedPlanHash }) });
@@ -2188,6 +2342,8 @@ async function openGitDelivery(action, startupConfirmation = null) {
 }
 
 function openModal(action) {
+  if (action === "discuss-acceptance") { state.tab = "acceptance"; renderDetail(); return; }
+  if (["start-acceptance-repair", "close-acceptance-feedback"].includes(action)) return openAcceptanceRepair(action);
   if (action === "revise-plan" && state.detail.meta.state === "contract_confirmed" && state.detail.meta.planHash
       && state.detail.meta.planFeedbackVersion === state.detail.meta.planVersion) {
     return sendAction("revise-plan", { retry: true, expectedPlanHash: state.detail.meta.planHash });

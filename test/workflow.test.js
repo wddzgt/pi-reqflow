@@ -193,6 +193,179 @@ async function fixture(production = false, piExecutable = fakePi,
   return { temporary, projectRoot, project };
 }
 
+async function acceptanceFixture(t, route = "repair") {
+  const models = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-acceptance-model-"));
+  t.after(() => fs.rm(models, { recursive: true, force: true }));
+  const executable = path.join(models, "pi.mjs");
+  const delegatedFake = path.join(models, "model.mjs");
+  await fs.writeFile(delegatedFake, (await fs.readFile(fakePi, "utf8")).replace("  analysis.changes =", route === "plan"
+    ? `  if (prompt.includes('本轮在已完成')) analysis.affectedFiles.push('src/support.mjs');\n  analysis.changes =` : "  analysis.changes ="));
+  await fs.writeFile(executable, `import {promises as fs} from 'node:fs';
+const phase=process.env.REQFLOW_PHASE,prompt=process.argv.at(-1);
+if(prompt.startsWith('验收反馈调查')){
+ const assert=(await import('node:assert/strict')).default,output=JSON.parse(process.env.REQFLOW_POLICY).outputSchema.schema;
+ assert.deepEqual(output.properties.acceptanceIds.items.enum,['AC1']);
+ assert.ok(output.properties.evidence.items.properties.file.enum.includes('src/calculator.mjs'));
+ const reply={reply:'已核实零值计算遗漏，需要补充原验收边界。',route:${JSON.stringify(route)},
+ rootCause:['零值结果不正确，因为出现特殊分支。','特殊分支提前返回1，跳过乘法计算。','测试只覆盖2和3，未覆盖零值。'],
+ affectedFiles:['src/calculator.mjs','test/calculator.test.mjs'],acceptanceIds:['AC1'],
+ evidence:[{file:'src/calculator.mjs',line:1,reason:'当前已实现源码包含零值特判'}],repair:'删除零值特判，增加零值回归，保留原加法与乘法测试。',questions:[]};
+ console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:JSON.stringify(reply)}],stopReason:'stop',
+ usage:{input:120,output:40,cacheRead:0,cacheWrite:0,cost:{total:0}}}}));console.log(JSON.stringify({type:'agent_settled'}));
+}else if(phase==='implement'&&prompt.includes('验收修复调查')){
+ const file='src/calculator.mjs';const previous=await fs.readFile(file,'utf8');
+ await fs.writeFile(file,previous.replace('if (left === 0) return 1;\\n  ',''));
+ await fs.appendFile('test/calculator.test.mjs',"\\ntest('zero multiplication',()=>assert.equal(multiply(0,3),0));\\n");
+ ${route === "plan" ? "await fs.writeFile('src/support.mjs','export const repaired = true;\\n');" : ""}
+ console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'修复零值遗漏，新增回归断言。'}],stopReason:'stop',
+ usage:{input:120,output:40,cacheRead:0,cacheWrite:0,cost:{total:0}}}}));console.log(JSON.stringify({type:'agent_settled'}));
+}else{await import(${JSON.stringify(delegatedFake)});if(phase==='implement'){
+ const file='src/calculator.mjs';await fs.writeFile(file,(await fs.readFile(file,'utf8')).replace('return left * right;','if (left === 0) return 1;\\n  return left * right;'));}}
+`);
+  const value = await fixture(false, executable);
+  t.after(() => fs.rm(value.temporary, { recursive: true, force: true }));
+  await plan(value.projectRoot, "REQ-001"); await approvePlan(value.projectRoot, "REQ-001", "reviewer");
+  await implement(value.projectRoot, "REQ-001"); await verify(value.projectRoot, "REQ-001");
+  value.actor = { id: "reviewer", roles: ["developer"] }; value.product = { id: "product", roles: ["product"] };
+  value.current = () => readTask(value.project, "REQ-001");
+  value.version = meta => ({ expectedPlanHash: meta.planHash, expectedAfterHash: meta.afterHash, expectedContractHash: meta.contractHash });
+  value.action = (body, actor = value.actor) => executeRequirementAction(value.projectRoot, "REQ-001", body, actor);
+  return value;
+}
+
+test("acceptance feedback investigates current code, blocks archive and repairs retained results", async t => {
+  const f = await acceptanceFixture(t); const before = await f.current();
+  const source = await fs.readFile(path.join(before.meta.workspace, "src/calculator.mjs"), "utf8");
+  assert.match(source, /left === 0/);
+  await assert.rejects(f.action({ action: "discuss-acceptance", message: { text: "零乘3应为0", ...f.version(before.meta), expectedAfterHash: "stale" } }, f.product), /已改变/);
+  await assert.rejects(f.action({ action: "discuss-acceptance", message: { text: "零乘3应为0", ...f.version(before.meta) } }, { id: "intruder", roles: ["developer"] }), /participants/);
+  await f.action({ action: "discuss-acceptance", message: { text: "零乘3实际为1，应为0", ...f.version(before.meta) } }, f.product);
+  const discussed = await f.current(); const reply = discussed.events.findLast(event => event.type === "acceptance_reply");
+  assert.equal(discussed.meta.state, "verified"); assert.equal(discussed.meta.afterHash, before.meta.afterHash);
+  assert.equal(await fs.readFile(path.join(before.meta.workspace, "src/calculator.mjs"), "utf8"), source);
+  assert.equal(discussed.meta.acceptanceFeedback.owner, "product");
+  await assert.rejects(f.action({ action: "accept-test", acceptanceMode: "manual", evidence: "Cannot ignore reported bug", ...f.version(before.meta) }), /反馈尚未处理/);
+  const input = { action: "start-acceptance-repair", ...f.version(before.meta), expectedFeedbackHash: reply.hash };
+  await assert.rejects(f.action({ ...input, expectedFeedbackHash: "stale" }), /调查|沟通/);
+  await assert.rejects(f.action(input, f.product), /assigned plan approver/);
+  await f.action(input);
+  const repaired = await f.current();
+  assert.equal(repaired.meta.state, "verified", JSON.stringify(repaired.meta.developmentPause ?? repaired.meta.developmentFailure));
+  assert.equal(repaired.meta.workspace, before.meta.workspace);
+  assert.equal(repaired.meta.contractHash, before.meta.contractHash); assert.equal(repaired.meta.planHash, before.meta.planHash);
+  assert.notEqual(repaired.meta.afterHash, before.meta.afterHash); assert.equal(repaired.meta.changeApproval, null);
+  assert.equal(repaired.meta.localValidation, null); assert.equal(repaired.meta.testDeployment, null);
+  assert.equal(repaired.meta.acceptanceFeedback.status, "awaiting_acceptance");
+  assert.equal(repaired.meta.verificationAttempt, 2);
+  const evidence = await getRequirementEvidence(f.projectRoot, f.product, "REQ-001");
+  assert.equal(evidence.implementationAttempts.length, 1);
+  assert.equal(evidence.acceptanceDiscussion.messages.filter(row => row.type === "acceptance_reply").length, 1);
+  assert.equal(evidence.acceptanceDiscussion.results.length, 1);
+  assert.match(evidence.acceptanceDiscussion.results[0].text, /修复零值遗漏/);
+  assert.match(await fs.readFile(path.join(evidence.implementationAttempts[0].retained, "after/src/calculator.mjs"), "utf8"), /left === 0/);
+  assert.doesNotMatch(await fs.readFile(path.join(repaired.meta.workspace, "src/calculator.mjs"), "utf8"), /left === 0/);
+  await assert.rejects(f.action({ action: "accept-test", acceptanceMode: "manual", evidence: "Old code", ...f.version(before.meta) }), /已改变/);
+  await f.action({ action: "accept-test", acceptanceMode: "manual", evidence: "Zero result and original assertions verified", ...f.version(repaired.meta) });
+  assert.equal((await f.current()).meta.state, "archived_test_only");
+  await assert.rejects(f.action({ action: "discuss-acceptance", message: { text: "Another issue", ...f.version(repaired.meta) } }, f.product), /归档后的问题/);
+});
+
+test("acceptance plan changes require a new reviewed plan and preserve current work", async t => {
+  const f = await acceptanceFixture(t, "plan"); const before = await f.current();
+  await f.action({ action: "discuss-acceptance", message: { ...f.version(before.meta), text: "零值修复需要新支持模块" } }, f.product);
+  const reply = (await f.current()).events.findLast(event => event.type === "acceptance_reply");
+  await f.action({ action: "start-acceptance-repair", ...f.version(before.meta), expectedFeedbackHash: reply.hash });
+  const proposed = await f.current();
+  assert.equal(proposed.meta.state, "plan_review"); assert.equal(proposed.meta.planVersion, 2);
+  assert.equal(proposed.meta.contractHash, before.meta.contractHash);
+  assert.notEqual(proposed.meta.planHash, before.meta.planHash);
+  assert.equal(proposed.meta.workspace, before.meta.workspace);
+  assert.match(await fs.readFile(path.join(before.meta.workspace, "src/calculator.mjs"), "utf8"), /left === 0/);
+  assert.equal(proposed.meta.baseHash, before.meta.baseHash); assert.equal(proposed.meta.baselineHash, before.meta.baselineHash);
+  assert.ok(proposed.meta.developmentFiles.includes("src/support.mjs"));
+  await assert.rejects(f.action({ action: "approve-plan", expectedPlanHash: before.meta.planHash }), /plan has changed/);
+  await f.action({ action: "discuss-plan", message: { text: "保留现有成果，确认新模块修复", expectedPlanHash: proposed.meta.planHash } });
+  await f.action({ action: "approve-plan", expectedPlanHash: proposed.meta.planHash });
+  const repaired = await f.current();
+  assert.equal(repaired.meta.state, "verified", JSON.stringify(repaired.meta.developmentPause));
+  assert.equal(repaired.meta.workspace, before.meta.workspace);
+  assert.ok(repaired.meta.changeCount >= 3); assert.equal(repaired.meta.acceptanceFeedback.status, "awaiting_acceptance");
+  assert.match(await fs.readFile(path.join(repaired.meta.workspace, "src/support.mjs"), "utf8"), /repaired/);
+  assert.equal((await getRequirementEvidence(f.projectRoot, f.product, "REQ-001")).implementationAttempts.length, 1);
+});
+
+test("business changes return to product alignment and require a new contract before repair", async t => {
+  const f = await acceptanceFixture(t, "requirement"); const before = await f.current();
+  await f.action({ action: "discuss-acceptance", message: { ...f.version(before.meta), text: "补充零值计算业务要求" } }, f.product);
+  const reply = (await f.current()).events.findLast(event => event.type === "acceptance_reply");
+  const input = { action: "start-acceptance-repair", ...f.version(before.meta), expectedFeedbackHash: reply.hash };
+  await assert.rejects(f.action(input), /原产品负责人/);
+  await f.action(input, f.product);
+  const aligned = await f.current(); assert.equal(aligned.meta.state, "intake_ready");
+  assert.equal(aligned.meta.contractHash, before.meta.contractHash); assert.equal(aligned.meta.workspace, before.meta.workspace);
+  const candidate = (await getRequirementEvidence(f.projectRoot, f.product, "REQ-001")).discussion.latestAnalysis.analysis.contract;
+  await f.action({ action: "confirm-contract", contract: candidate, expectedAnalysisHash: aligned.meta.intakeAnalysisHash }, f.product);
+  const confirmed = await f.current(); assert.equal(confirmed.meta.contractVersion, 2);
+  assert.notEqual(confirmed.meta.contractHash, before.meta.contractHash);
+  await f.action({ action: "plan" }); const planned = await f.current();
+  await f.action({ action: "approve-plan", expectedPlanHash: planned.meta.planHash });
+  const repaired = await f.current(); assert.equal(repaired.meta.state, "verified", JSON.stringify(repaired.meta.developmentPause));
+  assert.equal(repaired.meta.workspace, before.meta.workspace); assert.equal(repaired.meta.baseHash, before.meta.baseHash);
+  assert.equal((await getRequirementEvidence(f.projectRoot, f.product, "REQ-001")).implementationAttempts.length, 1);
+});
+
+test("acceptance screenshots remain private and only the feedback owner can close the discussion", async t => {
+  const f = await acceptanceFixture(t, "no_change"), before = await f.current();
+  const image = { name: "复现.png", mimeType: "image/png", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNQKt8NAAITAVXMpdPnAAAAAElFTkSuQmCC" };
+  await f.action({ action: "discuss-acceptance", message: { ...f.version(before.meta), text: "截图中的零值异常", images: [image] } }, f.product);
+  let task = await f.current(); const initial = task.events.findLast(event => event.type === "acceptance_message");
+  const { getRequirementImage } = await import("../src/evidence.js");
+  assert.equal((await getRequirementImage(f.projectRoot, f.product, "REQ-001", initial.detail.attachments[0].id)).buffer.toString("base64"), image.data);
+  await assert.rejects(getRequirementImage(f.projectRoot, { id: "stranger", roles: ["product"] }, "REQ-001", initial.detail.attachments[0].id), /read this requirement/);
+  await f.action({ action: "discuss-acceptance", message: { ...f.version(task.meta), text: "已核实截图，补充操作说明" } });
+  task = await f.current(); const last = task.events.findLast(event => event.type === "acceptance_message");
+  const closing = { action: "close-acceptance-feedback", ...f.version(task.meta), expectedFeedbackHash: last.hash, evidence: "双方核实为操作理解偏差，无需修改代码" };
+  await assert.rejects(f.action(closing), /反馈人/);
+  await assert.rejects(f.action({ ...closing, expectedFeedbackHash: initial.hash }, f.product), /反馈人/);
+  await f.action(closing, f.product); assert.equal((await f.current()).meta.acceptanceFeedback.status, "closed");
+  assert.equal((await f.current()).meta.afterHash, before.meta.afterHash);
+});
+
+test("acceptance diagnosis cannot authorize a new file as a repair under the old plan", async t => {
+  const f = await acceptanceFixture(t), before = await f.current();
+  const executable = f.project.config.piExecutable;
+  await fs.writeFile(executable, (await fs.readFile(executable, "utf8")).replace("affectedFiles:['src/calculator.mjs','test/calculator.test.mjs']", "affectedFiles:['src/rogue.mjs']"));
+  await assert.rejects(f.action({ action: "discuss-acceptance", message: { ...f.version(before.meta), text: "修复零值" } }, f.product), /新增范围/);
+  const failed = await f.current(); assert.equal(failed.meta.state, "verified"); assert.equal(failed.meta.afterHash, before.meta.afterHash);
+  assert.equal(failed.events.at(-1).type, "acceptance_discussion_failed");
+  await assert.rejects(f.action({ action: "start-acceptance-repair", ...f.version(before.meta), expectedFeedbackHash: failed.lastHash }), /调查/);
+  await fs.writeFile(executable, (await fs.readFile(executable, "utf8")).replace("affectedFiles:['src/rogue.mjs']", "affectedFiles:['src/calculator.mjs','src/calculator.mjs']"));
+  await assert.rejects(f.action({ action: "discuss-acceptance", message: { ...f.version(before.meta), text: "继续调查零值" } }, f.product), /不能重复/);
+});
+
+test("paused acceptance investigation resumes the same feedback without duplicating messages", async t => {
+  const f = await acceptanceFixture(t), before = await f.current();
+  const executable = f.project.config.piExecutable, original = `${executable}.original.mjs`, marker = `${executable}.pause`;
+  await fs.rename(executable, original); await fs.writeFile(marker, "waiting");
+  const entered = `${executable}.entered`;
+  await fs.writeFile(executable, `import {promises as fs} from 'node:fs';
+if(process.argv.at(-1).startsWith('验收反馈调查')&&(await fs.readFile(${JSON.stringify(marker)},'utf8'))==='waiting'){
+ await fs.writeFile(${JSON.stringify(entered)},'running');setInterval(()=>{},1000);
+}else await import(${JSON.stringify(original)});`);
+  const executing = f.action({ action: "discuss-acceptance", message: { ...f.version(before.meta), text: "零值异常，请调查" } }, f.product);
+  const deadline = Date.now() + 5000;
+  while (!(await fs.readdir(path.dirname(executable))).includes(path.basename(entered)) && Date.now() < deadline) await pauseDelay(20);
+  assert.equal(await fs.readFile(entered, "utf8"), "running");
+  await f.action({ action: "pause-execution" }, f.product); assert.equal((await executing).paused, true);
+  const paused = await f.current(); assert.equal(paused.meta.state, "verified"); assert.equal(paused.events.at(-1).type, "execution_paused");
+  await fs.writeFile(marker, "continue");
+  await f.action({ action: "continue-execution", expectedAuditHead: paused.lastHash }, f.product);
+  const completed = await f.current();
+  assert.equal(completed.events.filter(event => event.type === "acceptance_message").length, 1);
+  assert.equal(completed.events.filter(event => event.type === "acceptance_reply").length, 1);
+  assert.equal(completed.meta.afterHash, before.meta.afterHash); assert.equal(completed.meta.acceptanceFeedback.status, "discussing");
+});
+
 const transientQaFailure = [
   ['domains: ["backend"]', 'domains: ["frontend", "backend"]'],
   ['status: refineAddition ? "changed" : "none"', 'status: "changed"'],

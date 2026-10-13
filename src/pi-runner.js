@@ -306,7 +306,9 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
   if (phase === "implement" && executionLimit?.approvedFiles && project.config.checks) {
     prompt += "\nThe approved checks are available through run_checks. Use existing verification infrastructure for changed behavior. External developer-owned check scripts may be executed only through run_checks, not read or edited. The controller independently verifies the final source and reviews its changes.";
   }
-  if (!Array.isArray(images) || images.length > 12 || (images.length && phase !== "intake")) throw new Error("Image input is limited to the intake phase");
+  if (!Array.isArray(images) || images.length > 12 || (images.length && phase !== "intake"
+      && !(phase === "plan" && executionLimit?.outputSchema?.name === "acceptance_feedback")))
+    throw new Error("Image input requires intake or read-only acceptance investigation");
   const imageInputs = [];
   for (const file of images) {
     const resolved = await fs.realpath(file);
@@ -508,7 +510,8 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
   let preview = "";
   let streamedText = "";
   let previewAt = 0;
-  reportProgress(({ intake: "正在结合项目资料核对业务需求。", plan: "正在生成研发方案。",
+  reportProgress(executionLimit?.outputSchema?.name === "acceptance_feedback" ? "正在只读调查验收反馈与当前代码。"
+    : ({ intake: "正在结合项目资料核对业务需求。", plan: "正在生成研发方案。",
     review: "正在核对方案与需求的一致性。", implement: "正在实现已确认的方案。" })[phase] ?? "正在处理本轮任务。", "", "model");
   let eventBytes = 0;
   let completedCost = 0;

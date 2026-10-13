@@ -93,12 +93,16 @@ async function analysisContext(project, task, baseline) {
          summary: row.analysis.summary, suggestions: row.analysis.suggestions });
   const candidate = humanMessages.at(-1)?.candidate ?? null;
   const inputHash = sha256(JSON.stringify({ policyVersion: intakePolicyVersion, requestHash: task.meta.requestHash, revision: task.meta.intakeRevision,
-    messages: discussion.messages.filter((row) => ["intake_draft", "intake_message"].includes(row.type)).map((row) => row.eventHash), baselineHash: baseline.snapshotHash }));
+    messages: discussion.messages.filter((row) => ["intake_draft", "intake_message"].includes(row.type)).map((row) => row.eventHash),
+    baselineHash: baseline.snapshotHash, reworkSourceHash: task.meta.acceptanceRework?.sourceHash ?? null }));
   const request = await fs.readFile(path.join(task.directory, "request.md"), "utf8");
   const original = Buffer.byteLength(request) <= 8000 ? request : { preview: request.slice(0, 1500),
     eventHash: discussion.messages.find(row => row.type === "intake_draft").eventHash, partial: true,
     note: "Original request remains archived. Read omitted requirements with read_discussion before making assumptions." };
   const context = JSON.stringify({ originalRequest: original, history, candidate, workingCandidate: checkpoint?.analysis.contract ?? null,
+    ...(task.meta.acceptanceRework ? { priorConfirmedContract: JSON.parse(await fs.readFile(path.join(task.directory,
+      `contract-v${task.meta.contractVersion}.json`), "utf8")), currentSourceHash: baseline.sourceHash,
+      instruction: "Reconcile acceptance feedback with the complete confirmed requirement; retain all prior scenarios unless the product explicitly changes them. Current workspace is implemented source, baseline navigation is historical." } : {}),
     earlierDiscussion: earlierMessages.map(row => ({ eventHash: row.eventHash, preview: row.text.slice(0, 60), partial: true })),
     note: "Working candidates and AI summaries are short-term unconfirmed understanding. Latest product decisions prevail. Read exact original messages by eventHash when omitted details or contradictions matter." });
   const images = discussion.messages.flatMap((row) => row.attachments ?? []).filter((image) => !discussion.withdrawnImageIds.includes(image.id));
@@ -113,9 +117,13 @@ export async function analyzeIntake(projectPath, id, actor) {
     const { meta, directory } = task;
     if (meta.createdBy !== actor) throw new Error("Only the product owner can initiate AI requirement analysis");
     if (!editableStates.includes(meta.state)) throw new Error(`AI requirement analysis cannot start from ${meta.state}`);
-    const source = await sourceManifest(project);
+    const source = meta.acceptanceRework ? await manifest(meta.workspace, project.config.excludedPaths,
+      project.config.maxSnapshotBytes) : await sourceManifest(project);
     const baseHash = manifestHash(source);
-    const baseline = await readProjectBaseline(project, baseHash);
+    if (meta.acceptanceRework && (baseHash !== meta.acceptanceRework.sourceHash
+        || manifestHash(await sourceManifest(project)) !== meta.baseHash)) throw new Error("验收修复现场或原项目源码已改变。");
+    const originalBaseline = await readProjectBaseline(project, meta.acceptanceRework ? meta.baseHash : baseHash);
+    const baseline = { ...originalBaseline, sourceHash: baseHash };
     const context = await analysisContext(project, task, baseline);
     if (meta.intakeAnalysisInputHash === context.inputHash && meta.intakeAnalysisHash) return meta;
     let allowance;
@@ -151,7 +159,8 @@ ready仅表示需求理解已对齐，下一步由产品定版后进入研发方
 有未解决问题时status=needs_clarification，questions非空、contract=null。只有目标、现状、期望行为、验收和边界已明确，才能ready且questions=[]，contract={objective,currentBehavior,desiredBehavior,acceptance:[{id:AC1,text}],inScope:[本次包含的业务功能],outOfScope:[本次不包含的业务事项],answers:{}}。把所有已确认的关键业务决定完整写入这些最终字段；历史问答仅供回看，answers必须为空，不携带旧建议、被否决要求或讨论过程。验收用用户操作与业务结果表述，不用函数调用或接口定义。最终需求交给下一阶段，各研发Agent再独立定位代码和设计接口。不得把猜测包装成共识，无法看懂图片必须追问。`;
   let result;
   try {
-    const workspace = await preparePlanWorkspace(project, id, `intake-${active.intakeAnalysisAttempts}`, source);
+    const workspace = await preparePlanWorkspace(project, id, `intake-${active.intakeAnalysisAttempts}`, source,
+      active.acceptanceRework ? active.workspace : project.root);
     const images = await copyIntakeImages(task.directory, workspace, context.images);
     result = await runPi(project, workspace, "intake", prompt, logFile, remaining, null, images,
       { ...allowance, discussionTask: id,
@@ -183,7 +192,9 @@ ready仅表示需求理解已对齐，下一步由产品定版后进入研发方
                 answers: { type: "object", properties: {}, required: [], additionalProperties: false } } }] },
           } } } });
     if (manifestHash(await manifest(workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== baseline.sourceHash
-        || manifestHash(await sourceManifest(project)) !== baseline.sourceHash) throw new Error("Source changed during read-only AI product alignment");
+        || manifestHash(await sourceManifest(project)) !== (active.acceptanceRework ? active.baseHash : baseline.sourceHash)
+        || (active.acceptanceRework && manifestHash(await manifest(active.workspace, project.config.excludedPaths,
+          project.config.maxSnapshotBytes)) !== baseline.sourceHash)) throw new Error("Source changed during read-only AI product alignment");
     for (let index = 0; index < images.length; index++) {
       if (sha256(await fs.readFile(images[index])) !== context.images[index].hash) throw new Error("AI alignment image snapshot changed");
     }
@@ -229,11 +240,13 @@ async function analysisArtifacts(directory, logFile, telemetry) {
 }
 
 async function persistAnalysis(project, id, actor, task, active, context, baseline, result, analysis, logFile) {
-  const file = path.join(task.directory, `development-feedback-v${active.intakeAnalysisAttempts}.json`);
+  if (!Number.isSafeInteger(active.feedbackVersion) || active.feedbackVersion < 0) throw new Error("Missing audited feedback version before analysis persistence");
+  const feedbackVersion = active.feedbackVersion + 1;
+  const file = path.join(task.directory, `development-feedback-v${feedbackVersion}.json`);
   await fs.writeFile(file, `${JSON.stringify(analysis, null, 2)}\n`, { flag: "wx", mode: 0o600 });
   const hash = sha256(JSON.stringify(analysis));
   const next = { ...active, state: analysis.status === "ready" ? "intake_ready" : "intake_clarifying",
-    feedbackVersion: active.intakeAnalysisAttempts, feedbackHash: hash, requiredRoles: analysis.requiredRoles,
+    feedbackVersion, feedbackHash: hash, requiredRoles: analysis.requiredRoles,
     intakeAnalysisHash: hash, intakeAnalysisInputHash: context.inputHash, intakeBaselineHash: baseline.snapshotHash,
     intakeCostUsd: active.intakeCostUsd + result.costUsd, aiAligned: true, updatedAt: new Date().toISOString() };
   await appendEvent(project, id, "intake_analysis_completed", next, { actor: "pi:intake", initiatedBy: actor,
@@ -251,6 +264,8 @@ export async function assertIntakeAgreement(project, task, contract) {
   if (!latest || latest.analysisHash !== meta.intakeAnalysisHash || latest.revision !== meta.intakeRevision
       || latest.analysis.status !== "ready") throw new Error("AI agreement does not match the latest product discussion");
   if ((await readProjectBaseline(project)).snapshotHash !== latest.baselineHash) throw new Error("Project baseline changed since AI alignment; rerun analysis");
+  if (meta.acceptanceRework && manifestHash(await manifest(meta.workspace, project.config.excludedPaths,
+    project.config.maxSnapshotBytes)) !== meta.acceptanceRework.sourceHash) throw new Error("验收修复现场已改变，请重新对齐需求。");
   const canonical = (value) => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
     ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item);
   if (canonical(contract) !== canonical(latest.analysis.contract)) {

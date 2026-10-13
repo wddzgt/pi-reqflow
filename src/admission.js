@@ -95,7 +95,8 @@ export function assessAdmission(draft, contract, policy) {
 const executionEvents = new Set(["plan_draft_completed", "plan_specialist_completed", "plan_specialist_failed",
   "plan_correction_completed", "plan_correction_failed",
   "plan_attempt_failed", "implemented", "implementation_failed", "implementation_inspection_failed", "role_review_submitted", "role_review_attempt_failed",
-  "intake_analysis_completed", "intake_analysis_failed", "plan_reply", "plan_discussion_failed"]);
+  "intake_analysis_completed", "intake_analysis_failed", "plan_reply", "plan_discussion_failed",
+  "acceptance_reply", "acceptance_discussion_failed"]);
 
 export function executionUsage(events) {
   const runs = events.filter((event) => executionEvents.has(event.type) && event.detail.modelRun !== false

@@ -1,8 +1,9 @@
 import path from "node:path";
+import { promises as fs } from "node:fs";
 import { authenticationHistory } from "./auth.js";
-import { readJson } from "./files.js";
+import { readJson, sha256 } from "./files.js";
 import { readTask } from "./store.js";
-import { lifecycleEvents, lifecycleStage, lifecycleStatus } from "./lifecycle.js";
+import { lifecycleEvents, lifecycleResults, lifecycleStage, lifecycleStatus } from "./lifecycle.js";
 import { executionUsage, firstDeliveryQuality, firstVerificationQuality } from "./admission.js";
 
 function page(offset, limit) {
@@ -15,7 +16,8 @@ const piEventTypes = new Set(["role_review_submitted", "role_review_attempt_fail
   "plan_draft_completed", "plan_specialist_completed", "plan_specialist_failed", "plan_draft_reused", "plan_specialist_reused",
   "plan_correction_completed", "plan_correction_failed", "plan_correction_reused",
   "plan_attempt_failed", "implemented", "implementation_failed", "implementation_inspection_failed", "pi_run_skipped",
-  "intake_analysis_completed", "intake_analysis_failed", "pi_budget_exhausted", "plan_reply", "plan_discussion_failed"]);
+  "intake_analysis_completed", "intake_analysis_failed", "pi_budget_exhausted", "plan_reply", "plan_discussion_failed",
+  "acceptance_reply", "acceptance_discussion_failed"]);
 
 function piRuns(events) {
   return events.filter((event) => piEventTypes.has(event.type)
@@ -73,12 +75,26 @@ function workflowFailures(events) {
         event.detail.deployment?.logFile].filter((file) => typeof file === "string"))] }));
 }
 
-export function taskLifecycle(task, offset = 0, limit = 50) {
+export async function taskLifecycle(task, offset = 0, limit = 50) {
   page(offset, limit);
   const { meta, lastHash, events } = task;
   const timeline = lifecycleEvents(events).reverse();
+  const results = lifecycleResults(meta, events);
+  if (results[0].status === "completed") {
+    const contract = await readJson(path.join(task.directory, `contract-v${meta.contractVersion}.json`));
+    if (sha256(JSON.stringify(contract)) !== meta.contractHash) throw new Error("Frozen requirement changed before lifecycle display");
+    results[0].conclusion = contract.objective;
+    results[0].summary += `，${contract.acceptance.length} 条验收条件`;
+  }
+  if (results[4].status === "completed") {
+    const accepted = events.findLast(event => event.type === "test_accepted" && event.meta.afterHash === meta.afterHash
+      && event.meta.planHash === meta.planHash && event.meta.contractHash === meta.contractHash);
+    const evidence = await fs.readFile(path.join(task.directory, "acceptance.md"), "utf8");
+    if (sha256(evidence) !== accepted.detail.evidenceHash) throw new Error("Acceptance evidence changed before lifecycle display");
+    results[4].conclusion = evidence;
+  }
   return { id: meta.id, title: meta.title, state: meta.state, auditHead: lastHash,
-    status: lifecycleStatus(meta, events, Date.now()),
+    status: lifecycleStatus(meta, events, Date.now()), results,
     responsibilities: { product: meta.createdBy, developer: meta.assignments?.developer ?? null,
       planReviewer: meta.planApprovedBy ?? null, changeRiskOwner: meta.changeApproval?.actor ?? null,
       testAcceptor: meta.acceptedBy ?? null, releaseApprover: meta.releaseApprovedBy ?? null,

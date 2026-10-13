@@ -11,6 +11,7 @@ import { runFastPath } from "./fast-path.js";
 import { develop } from "./development.js";
 import { addIntakeMessage, analyzeIntake } from "./intake-conversation.js";
 import { discussPlan, editPlan } from "./plan-conversation.js";
+import { discussAcceptance, closeAcceptanceFeedback, startAcceptanceRepair } from "./acceptance-feedback.js";
 import { localValidation, publishTest, recheckLocalChanges, redeployTest } from "./git-delivery.js";
 import {
   acceptTest, approveChanges, approvePlan, approveRelease, archiveTestOnly, deployTest,
@@ -20,7 +21,8 @@ import {
 } from "./workflow.js";
 
 const pausableActions = new Set(["analyze-intake", "run-review", "plan", "develop", "fast-track", "revise-plan",
-  "discuss-plan", "edit-plan", "approve-plan", "implement", "verify", "recheck-local", "local-validation", "resume-implementation"]);
+  "discuss-plan", "edit-plan", "approve-plan", "implement", "verify", "recheck-local", "local-validation", "resume-implementation",
+  "discuss-acceptance", "start-acceptance-repair"]);
 
 export async function executeRequirementAction(projectPath, id, body, principal, onProgress) {
   if (["pause-execution", "continue-execution"].includes(body.action)) {
@@ -49,7 +51,16 @@ export async function executeRequirementAction(projectPath, id, body, principal,
         && event.detail.planHash === task.meta.planHash);
       if (!message) throw new Error("暂停的方案问题没有已保存的输入记录。");
       input = { ...input, message: { ...input.message, retryEventHash: message.hash } };
+    } else if (input.action === "discuss-acceptance") {
+      const message = task.events.findLast(event => event.type === "acceptance_message" && event.detail.actor === principal.id);
+      if (!message) throw new Error("暂停的验收反馈没有已保存的输入记录。");
+      input = { ...input, message: { ...input.message, retryEventHash: message.hash } };
     } else if (input.action === "recheck-local" && task.meta.state === "verification_failed") input = { action: "verify" };
+    else if (input.action === "start-acceptance-repair" && !["verified", "test_deployed"].includes(task.meta.state)) {
+      if (["intake_clarifying", "intake_ready"].includes(task.meta.state)) input = { action: "analyze-intake" };
+      else input = { action: "develop", authorizeImplementation: true, expectedPlanHash: task.meta.planHash,
+        expectedAfterHash: task.meta.afterHash };
+    }
     return executeRequirementAction(projectPath, id, input, principal, onProgress);
   }
   const { action, evidence, feedback, contract, review } = body;
@@ -86,6 +97,14 @@ export async function executeRequirementAction(projectPath, id, body, principal,
       body.expectedPlanHash === undefined && body.retry !== true ? undefined
         : { expectedPlanHash: body.expectedPlanHash, ...(body.retry === true ? { retry: true } : {}) });
     case "discuss-plan": return discussPlan(projectPath, id, actor, body.message);
+    case "discuss-acceptance": return discussAcceptance(projectPath, id, actor, body.message);
+    case "close-acceptance-feedback": return closeAcceptanceFeedback(projectPath, id, actor, body);
+    case "start-acceptance-repair": {
+      const resumed = await startAcceptanceRepair(projectPath, id, actor, body);
+      if (resumed.state === "approved") return develop(projectPath, id, actor, true);
+      if (resumed.state === "intake_clarifying") return analyzeIntake(projectPath, id, actor);
+      return resumed;
+    }
     case "edit-plan": return editPlan(projectPath, id, actor, body);
     case "resolve-plan-findings": return resolvePlanFindings(projectPath, id, actor, body.resolution);
     case "resume-implementation": return resumeImplementation(projectPath, id, actor, evidence, body.files, body.reviewedEdits, body.modelSelection);

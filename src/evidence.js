@@ -10,6 +10,7 @@ import { intakeDiscussion } from "./intake-conversation.js";
 import { readImage } from "./intake-images.js";
 import { readPlanAnalysis } from "./plan-analysis.js";
 import { planDiscussion } from "./plan-conversation.js";
+import { acceptanceDiscussion } from "./acceptance-feedback.js";
 import { planReviewStatus } from "./plan-review.js";
 import { executionStatus } from "./action-progress.js";
 
@@ -46,9 +47,9 @@ export async function getRequirementEvidence(projectPath, principal, id) {
   const implementationAttempts = [];
   for (const resumed of eventRows.filter(event => event.type === "implementation_attempt_retained")) {
     const detail = resumed.detail;
-    const failed = eventRows.find(event => event.hash === detail.priorFailureHash && ["implementation_failed", "verification_failed", "verified"].includes(event.type));
+    const failed = eventRows.find(event => event.hash === detail.priorFailureHash && ["implementation_failed", "verification_failed", "verified", "test_deployed"].includes(event.type));
     if (!failed) throw new Error("Retained implementation state event is missing");
-    const retained = path.join(directory, `implementation-${failed.type === "verified" ? "review" : "failure"}-${failed.hash}`);
+    const retained = path.join(directory, `implementation-${["verified", "test_deployed"].includes(failed.type) ? "review" : "failure"}-${failed.hash}`);
     if (detail.retained !== retained) throw new Error("Retained implementation attempt is outside its archive");
     const implementation = failed.type !== "implementation_failed"
       ? eventRows.find(event => event.hash === detail.priorImplementationHash && event.type === "implemented") : failed;
@@ -63,7 +64,7 @@ export async function getRequirementEvidence(projectPath, principal, id) {
           || ((await fs.stat(file)).mode & 0o777) !== change.after.mode) throw new Error("Retained implementation file changed");
     }
     implementationAttempts.push({ priorState: failed.type, priorStateHash: failed.hash,
-      failureHash: failed.type === "verified" ? null : failed.hash, at: failed.at, actor: detail.actor,
+      failureHash: ["verified", "test_deployed"].includes(failed.type) ? null : failed.hash, at: failed.at, actor: detail.actor,
       diagnosis: detail.evidence, files: detail.files, retained, changes: report.changes });
   }
   for (const retained of eventRows.filter(event => event.type === "local_validation_changes_retained")) {
@@ -119,6 +120,7 @@ export async function getRequirementEvidence(projectPath, principal, id) {
   return { auditHead: lastHash, execution: executionStatus(directory), meta: { ...meta, testEnvironmentSupersededBy: supersededBy }, request, feedback, contract, reviews, plan, planAnalysis, changes, implementationAttempts, baselineChecks, events, result,
     planReview: planAnalysis ? planReviewStatus(meta, planAnalysis.draft) : null,
     planDiscussion: planDiscussion({ meta, directory, events: eventRows }),
+    acceptanceDiscussion: acceptanceDiscussion({ meta, directory, events: eventRows }),
     discussion: intakeDiscussion({ meta, directory, events: eventRows }) };
 }
 

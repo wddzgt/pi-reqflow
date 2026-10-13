@@ -72,6 +72,39 @@ async function developFixture(f, branch = { kind: "new", branch: "devsail/REQ-00
 function confirmation(meta, merge = false) { return { authorizeGit: true, expectedAfterHash: meta.afterHash,
   expectedPlanHash: meta.planHash, testMode: merge ? "merge" : "branch", ...(merge ? { testBranch: "integration" } : {}) }; }
 
+for (const merge of [false, true]) test(`acceptance repair preserves published Git history and requires a fresh ${merge ? "merge" : "branch"} deployment`, async t => {
+  const models = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-git-acceptance-model-"));
+  t.after(() => fs.rm(models, { recursive: true, force: true }));
+  const executable = path.join(models, "pi.mjs");
+  await fs.writeFile(executable, `import {promises as fs} from 'node:fs';const prompt=process.argv.at(-1);
+if(prompt.startsWith('验收反馈调查')||process.env.REQFLOW_PHASE==='implement'&&prompt.includes('验收修复调查')){
+ let text='已补充说明，保留现有实现和测试';if(prompt.startsWith('验收反馈调查'))text=JSON.stringify({reply:'补充已有函数的说明',route:'repair',
+ rootCause:['函数说明缺失','实施没有写说明','测试只检查数值'],affectedFiles:['src/calculator.mjs'],acceptanceIds:['AC1'],
+ evidence:[{file:'src/calculator.mjs',line:1,reason:'已实现源码'}],repair:'补充注释，保留现有乘法和加法',questions:[]});
+ else await fs.appendFile('src/calculator.mjs','\\n// Approved acceptance repair; existing behavior retained.\\n');
+ console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text}],stopReason:'stop',
+ usage:{input:120,output:40,cacheRead:0,cacheWrite:0,cost:{total:0}}}}));console.log(JSON.stringify({type:'agent_settled'}));
+}else await import(${JSON.stringify(path.join(repository, "test/fake-pi.mjs"))});`);
+  const f = await fixture(t, merge, { piExecutable: executable });
+  const verified = await developFixture(f);
+  await publishTest(f.root, "REQ-001", actor.id, confirmation(verified, merge));
+  const deployed = (await readTask(f.project, "REQ-001")).meta, priorCommit = deployed.gitCommit.revision;
+  const version = { expectedPlanHash: deployed.planHash, expectedAfterHash: deployed.afterHash, expectedContractHash: deployed.contractHash };
+  await executeRequirementAction(f.root, "REQ-001", { action: "discuss-acceptance", message: { ...version, text: "补充函数说明" } }, actor);
+  const reply = (await readTask(f.project, "REQ-001")).events.findLast(event => event.type === "acceptance_reply");
+  await executeRequirementAction(f.root, "REQ-001", { action: "start-acceptance-repair", ...version, expectedFeedbackHash: reply.hash }, actor);
+  const repaired = (await readTask(f.project, "REQ-001")).meta;
+  assert.equal(repaired.state, "verified", JSON.stringify(repaired.developmentPause));
+  assert.equal(repaired.workspace, deployed.workspace); assert.equal(repaired.branch, deployed.branch);
+  assert.equal(git(repaired.workspace, "rev-parse", "HEAD"), priorCommit);
+  assert.equal(repaired.testDeployment, null); assert.equal(repaired.testCandidate, null); assert.equal(repaired.publishedRevision, null);
+  assert.equal((await getRequirementEvidence(f.root, actor, "REQ-001")).implementationAttempts.length, 1);
+  await publishTest(f.root, "REQ-001", actor.id, confirmation(repaired, merge));
+  const redeployed = (await readTask(f.project, "REQ-001")).meta;
+  assert.equal(redeployed.state, "test_deployed"); assert.notEqual(redeployed.gitCommit.revision, priorCommit);
+  assert.equal(git(redeployed.workspace, "rev-parse", "HEAD^"), priorCommit);
+});
+
 test("Git rollback restart preserves the old branch and develops in a fresh worktree", async t => {
   const f = await fixture(t);
   const previous = await developFixture(f);
@@ -351,5 +384,5 @@ for (const kind of ["jenkins", "gitlab", "github"]) test(`${kind} publishes veri
   assert.deepEqual(preview, { multiply: 6, add: 5, revision: meta.publishedRevision });
   assert.equal(meta.testDeployment.environment.status, "reachable"); assert.equal(submissions, 1);
   assert.equal(git(f.root, "ls-remote", "origin", meta.branch).split(/\s+/)[0], preview.revision);
-  assert.doesNotMatch(await fs.readFile(path.join(f.project.archive, "tasks/REQ-001/test-deploy.log"), "utf8"), /chain-test-token/);
+  assert.doesNotMatch(await fs.readFile(path.join(f.project.archive, "tasks/REQ-001/test-deploy-1.log"), "utf8"), /chain-test-token/);
 });

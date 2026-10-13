@@ -43,8 +43,11 @@ export async function discussPlan(projectPath, id, actor, input) {
     if ((meta.state !== "plan_review" && !pendingRevision) || !Object.values(meta.assignments ?? {}).some(row => row.userId === actor && row.status === "accepted")) throw new Error("Only an assigned developer can discuss a plan awaiting confirmation");
     if (meta.planHash !== input.expectedPlanHash) throw new Error("The plan has changed; reload it before continuing the discussion");
     const analysis = await readPlanAnalysis(meta, directory);
-    const source = await sourceManifest(project);
-    if (manifestHash(source) !== meta.baseHash) throw new Error("项目源码已变化，请重新核对研发方案。");
+    const source = meta.acceptanceRework ? await manifest(meta.workspace, project.config.excludedPaths,
+      project.config.maxSnapshotBytes) : await sourceManifest(project);
+    const discussionSourceHash = meta.acceptanceRework ? meta.acceptanceRework.sourceHash : meta.baseHash;
+    if (manifestHash(source) !== discussionSourceHash || manifestHash(await sourceManifest(project)) !== meta.baseHash)
+      throw new Error("项目源码已变化或修复现场已变化，请重新核对研发方案。");
     if (describePolicy(project.config).executionConfigHash !== meta.configHash) throw new Error("项目执行规则已变化，请重新核对研发方案；模型和密钥设置变化不会使方案失效。");
     const contract = await readJson(path.join(directory, `contract-v${meta.contractVersion}.json`));
     const allowance = modelAllowance(task.events, admissionPolicy(project.config));
@@ -101,7 +104,7 @@ pendingQuestions=[]只表示无需人工回答，不表示当前方案已通过�
     const logFile = path.join(directory, `plan-dialogue-${attempt}.events.jsonl`);
     let result;
     try {
-      const workspace = await preparePlanWorkspace(project, id, `dialogue-${attempt}`, source);
+      const workspace = await preparePlanWorkspace(project, id, `dialogue-${attempt}`, source, meta.acceptanceRework ? meta.workspace : project.root);
       result = await runPi(project, workspace, "plan", prompt, logFile, remaining, null, [],
          { ...allowance, developerSession: true,
            resumeSession: task.events.findLast(event => event.type === "plan_reply" && event.detail.planHash === meta.planHash)?.detail.telemetry.sessionCheckpoint ?? analysis.developerSession,
@@ -111,7 +114,9 @@ pendingQuestions=[]只表示无需人工回答，不表示当前方案已通过�
           contextFiles: draft.affectedFiles, outputSchema: { ...replySchema, schema: { ...replySchema.schema,
             properties: { ...replySchema.schema.properties, planHash: { type: "string", enum: [meta.planHash] } } } } });
       if (manifestHash(await sourceManifest(project)) !== meta.baseHash
-          || manifestHash(await manifest(workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== meta.baseHash) throw new Error("Source changed during read-only plan discussion");
+          || manifestHash(await manifest(workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) !== discussionSourceHash
+          || (meta.acceptanceRework && manifestHash(await manifest(meta.workspace, project.config.excludedPaths,
+            project.config.maxSnapshotBytes)) !== discussionSourceHash)) throw new Error("Source changed during read-only plan discussion");
       const reply = JSON.parse(result.text);
       if (reply.schemaVersion !== 2 || reply.planHash !== meta.planHash || !recommendations.includes(reply.recommendation)
           || typeof reply.reply !== "string" || !reply.reply.trim() || reply.reply.length > 1800

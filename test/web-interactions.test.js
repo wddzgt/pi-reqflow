@@ -137,9 +137,39 @@ test("developer process records show request timing without exposing technical d
     timing:{durationMs:180050,model:'fixture-model',toolCalls:0,requestTimings:[{request:3,durationMs:53800,firstResponseMs:700,firstTextMs:1000,status:'timed_out'}]}}];
     globalThis.root=document.createElement('div');renderTab(root);
     globalThis.readText=node=>[node.textContent||'',...node.children.map(readText)].join(' ');`);
+  assert.doesNotMatch(run("readText(root)"), /fixture-model|首个响应|声明缺失/);
+  run("globalThis.diagnostics=root.children.find(node=>node.tagName==='DETAILS');diagnostics.open=true;diagnostics.listeners.toggle()");
   assert.match(run("readText(root)"), /fixture-model.*第 3 次模型请求：53.8 秒.*首个响应 0.7 秒.*超时终止/);
+  run("diagnostics.listeners.toggle()");
+  assert.equal(run("diagnostics.children.length"), 2);
   run("state.principal.roles=['product'];root.replaceChildren();renderTab(root)");
   assert.doesNotMatch(run("readText(root)"), /fixture-model|首个响应|声明缺失/);
+});
+
+test("lifecycle defaults to stage outcomes and only loads historical nodes on expansion", async () => {
+  const { run } = workbench();
+  run(`state.principal.roles=['admin'];state.actions.add('audit-report');
+    globalThis.data={state:'archived_test_only',status:{responsible:{userId:'dev'},stateAgeMs:1000},
+      responsibilities:{product:'product',developer:{userId:'dev'}},total:1,results:[
+        {stage:'alignment',title:'需求对齐',status:'completed',summary:'需求已定版',conclusion:'支持状态筛选',owner:'product'},
+        {stage:'design',title:'研发方案',status:'completed',summary:'方案已确认'},
+        {stage:'implementation',title:'代码实施',status:'completed',summary:'完成两个文件变更'},
+        {stage:'validation',title:'研发检查',status:'completed',summary:'相关检查通过'},
+        {stage:'acceptance',title:'人工验收',status:'completed',summary:'已确认',conclusion:'功能满足需求'},
+        {stage:'delivery',title:'交付归档',status:'completed',summary:'已归档'}],
+      events:[{type:'implementation_failed',state:'implementation_failed',outcome:'failed',at:'2026-10-13T00:00:00Z',
+        responsible:{userId:'dev'},sequence:5,actor:'dev',planVersion:1}]};
+    api=async()=>data;globalThis.readText=node=>[node.textContent||'',...node.children.map(readText)].join(' ');`);
+  await run("openLifecycle('REQ-1')");
+  run("globalThis.card=$('#modalRoot').children[0]");
+  assert.equal(run("card.children.filter(node=>node.className?.startsWith('lifecycle-event')).length"), 6);
+  assert.match(run("readText(card)"), /支持状态筛选.*功能满足需求/);
+  assert.doesNotMatch(run("readText(card)"), /查看该节点原始证据|执行诊断与模型用量|实施失败/);
+  run("globalThis.history=card.children.find(node=>node.tagName==='DETAILS');history.open=true;history.listeners.toggle()");
+  assert.match(run("readText(history)"), /执行诊断与模型用量.*实施失败.*查看该节点原始证据/);
+  const count = run("history.children.length"); run("history.listeners.toggle()"); assert.equal(run("history.children.length"), count);
+  run("state.principal.roles=['product']"); await run("openLifecycle('REQ-1')");
+  assert.equal(run("$('#modalRoot').children[0].children.filter(node=>node.tagName==='DETAILS').length"), 0);
 });
 
 test("diagnostics show results and metrics first and render raw evidence only when requested", async () => {
@@ -165,6 +195,34 @@ test("diagnostics show results and metrics first and render raw evidence only wh
   assert.match(run("readText(evidence)"), /RAW_TRACE_MARKER/);
   run("evidence.listeners.toggle();item.listeners.toggle()");
   assert.equal(run("allNodes(card).filter(node=>node.tagName==='PRE').length"), 1);
+});
+
+test("acceptance feedback exposes participant discussion and binds repair to the displayed versions", async () => {
+  const { run } = workbench();
+  run(`state.actions=new Set(['discuss-acceptance','start-acceptance-repair','close-acceptance-feedback']);
+    state.detail={meta:{state:'verified',id:'REQ-1',planHash:'plan',afterHash:'code',contractHash:'contract',
+      createdBy:'product',assignments:{developer:{userId:'dev',status:'accepted'}},acceptanceFeedback:{status:'discussing',owner:'product'}},
+      acceptanceDiscussion:{messages:[{at:'2026-10-12T10:00:00Z',type:'acceptance_message',eventHash:'message',actor:'product',text:'零值异常'},
+        {at:'2026-10-12T10:01:00Z',type:'acceptance_reply',eventHash:'reply',messageHash:'message',reply:{route:'repair',reply:'有遗漏',rootCause:['a','b','c'],repair:'补零值断言',questions:[]}}]}};
+    globalThis.root=document.createElement('div');globalThis.allNodes=node=>[node,...node.children.flatMap(allNodes)];
+    renderAcceptanceDiscussion(root);globalThis.step=nextStep(state.detail.meta);`);
+  assert.equal(run("step[3].some(row=>row[0]==='accept-test')"), false);
+  assert.equal(run("allNodes(root).some(node=>node.dataset.action==='start-acceptance-repair')"), true);
+  assert.equal(run("canUseAction(state.detail.meta,'close-acceptance-feedback')"), false);
+  run(`globalThis.sent=[];sendAction=async(action,input)=>{sent.push([action,input]);return true;};
+    structuredModal=(title,description,build,submit)=>{globalThis.fields=build(document.createElement('form'));globalThis.submit=submit;};
+    openAcceptanceRepair('start-acceptance-repair');`);
+  await run("submit(fields)"); assert.equal(run("sent[0][1].expectedFeedbackHash"), "reply");
+  assert.equal(run("sent[0][1].expectedContractHash"), "contract"); assert.equal(run("sent[0][1].expectedAfterHash"), "code");
+  run("state.detail.acceptanceDiscussion.messages[1].reply.route='requirement'");
+  assert.equal(run("canUseAction(state.detail.meta,'start-acceptance-repair')"), false);
+  run("state.principal={id:'product',roles:['product']}");
+  assert.equal(run("canUseAction(state.detail.meta,'start-acceptance-repair')"), true);
+  assert.equal(run("canUseAction(state.detail.meta,'discuss-acceptance')"), true);
+  assert.equal(run("canUseAction(state.detail.meta,'close-acceptance-feedback')"), true);
+  run("state.principal={id:'other',roles:['developer']}"); assert.equal(run("canUseAction(state.detail.meta,'discuss-acceptance')"), false);
+  run("state.detail.meta.state='archived_test_only';root.replaceChildren();renderAcceptanceDiscussion(root)");
+  assert.equal(run("allNodes(root).some(node=>node.tagName==='FORM')"), false);
 });
 
 function workbench() {

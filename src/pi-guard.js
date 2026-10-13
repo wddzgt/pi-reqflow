@@ -288,12 +288,12 @@ export default function (pi) {
         intakeCorrections++;
         pi.setActiveTools([]);
         return { continue: true, entries: [{ type: "custom_message", customType: "reqflow_intake_correction",
-          content: `Your product analysis was rejected: ${error.message}. Correct the complete original JSON using the same discussion and evidence. Explain only user actions, business outcomes and real unresolved business choices. Do not ask product to design command syntax, JSON fields, source code or locking. Do not add unrequested features or invent agreement. Retain all explicit business decisions and acceptance boundaries.`,
+          content: `Your product analysis was rejected: ${error.message}. Correct the complete original JSON using the same discussion and evidence. Quotes within JSON string values must be escaped, or replaced by Chinese quotation marks without changing the quoted words. Preserve the entire sentence before, inside and after each quotation; never truncate string values to make JSON parse. Explain only user actions, business outcomes and real unresolved business choices. Do not ask product to design command syntax, JSON fields, source code or locking. Do not add unrequested features or invent agreement. Retain all explicit business decisions and acceptance boundaries.`,
           display: false, details: { correction: intakeCorrections } }] };
       }
     });
   }
-  if (phase === "review" && policy.outputSchema) {
+  if ((phase === "review" || phase === "plan" && policy.outputSchema?.name === "acceptance_feedback") && policy.outputSchema) {
     const validateReview = new Ajv({ allErrors: true }).compile(policy.outputSchema.schema);
     pi.on("agent_before_settle", async () => {
       if (lastFailure) return;
@@ -309,7 +309,7 @@ export default function (pi) {
         reviewCorrections++;
         pi.setActiveTools([]);
         return { continue: true, entries: [{ type: "custom_message", customType: "reqflow_review_correction",
-          content: `Review output rejected: ${error.message}. Return one complete JSON object matching the current review schema exactly. Preserve your findings and evidence; correct only the output structure. Do not perform new research, change the review scope or drop blocking findings to pass validation.`,
+          content: `Read-only output rejected: ${error.message}. Return one complete JSON object matching the current ${policy.outputSchema.name} schema exactly. Preserve findings, diagnosis, evidence and unresolved questions; correct only the output structure. Do not perform new research, authorize repairs, change scope or drop blocking findings to pass validation.`,
           display: false, details: { correction: reviewCorrections } }] };
       }
     });
