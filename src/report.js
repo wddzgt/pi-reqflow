@@ -65,7 +65,7 @@ function usageSummary(runs) {
 function workflowFailures(events) {
   return events.filter((event) => event.detail.executionOutcome !== "paused" && (event.type.endsWith("_failed") || event.type.endsWith("_outcome_unknown")
     || event.type === "rollback_rejected" || event.type === "execution_boundary_stopped" || event.detail.outcome === "failed"))
-    .map((event) => ({ at: event.at, stage: event.type,
+    .map((event) => ({ at: event.at, stage: event.type, eventHash: event.hash,
       reason: event.detail.error ?? event.detail.deployment?.result ?? event.detail.deployment?.evidence ?? event.detail.evidence ?? null,
       traceId: event.detail.telemetry?.traceId ?? event.detail.run?.telemetry?.traceId ?? null,
       logs: [...new Set([event.detail.logFile, event.detail.telemetry?.logFile, event.detail.run?.logFile,
@@ -73,6 +73,45 @@ function workflowFailures(events) {
         ...(event.detail.telemetry?.internalChecks ?? []).flatMap(attempt => attempt.checks.map(check => check.logFile)),
         ...(event.detail.telemetry?.developmentChecks ?? []).flatMap(attempt => attempt.checks.map(check => check.logFile)),
         event.detail.deployment?.logFile].filter((file) => typeof file === "string"))] }));
+}
+
+export function improvementCandidates(tasks) {
+  const groups = new Map();
+  for (const task of tasks) for (const failure of workflowFailures(task.events)) {
+    const fingerprint = sha256(JSON.stringify([failure.stage, failure.reason, ...(failure.reason === null ? [failure.eventHash] : [])]));
+    if (!groups.has(fingerprint)) groups.set(fingerprint, { fingerprint, stage: failure.stage,
+      observedFailure: failure.reason, status: "needs_investigation", occurrences: 0, requirements: [], evidence: [], diagnoses: [] });
+    const group = groups.get(fingerprint);
+    group.occurrences++;
+    if (!group.requirements.includes(task.meta.id)) group.requirements.push(task.meta.id);
+    group.evidence.push({ taskId: task.meta.id, eventHash: failure.eventHash, at: failure.at,
+      sourceHash: task.events.find(event => event.hash === failure.eventHash).meta.afterHash ?? null, logs: failure.logs });
+    const diagnosis = task.events.find(event => event.type === "implementation_attempt_retained"
+      && event.detail.priorFailureHash === failure.eventHash);
+    if (diagnosis) {
+      group.status = "diagnosis_recorded";
+      group.diagnoses.push({ actor: diagnosis.detail.actor, text: diagnosis.detail.evidence,
+        taskId: task.meta.id, eventHash: diagnosis.hash, failureHash: failure.eventHash, at: diagnosis.at });
+    }
+  }
+  for (const group of groups.values()) {
+    group.evidence.sort((a, b) => a.at.localeCompare(b.at));
+    group.diagnoses.sort((a, b) => a.at.localeCompare(b.at));
+  }
+  const candidates = [...groups.values()].sort((a, b) => b.occurrences - a.occurrences
+    || b.evidence.at(-1).at.localeCompare(a.evidence.at(-1).at));
+  for (const candidate of candidates) {
+    candidate.recommendation = ["verification_failed", "merge_verification_failed"].includes(candidate.stage)
+      ? "核对失败检查的断言、命令及环境。确认源码根因后修正实现并保留复现回归；若检查已有但未接入，修正执行配置。"
+      : ["local_validation_failed", "test_deploy_failed"].includes(candidate.stage)
+        ? "核对实际启动或部署日志、命令和环境版本，先确认失败根因，再修改对应项目配置并验证真实入口。"
+        : "结合原始日志、源码和负责人诊断查明根因，再选择改进项目导航、现有检查或审查规范。";
+    candidate.validation = "在同一业务场景复现原问题，验证修改后的结果；继续观察同阶段同错误的复发次数及首次交付通过率。";
+    candidate.evidenceCount = candidate.evidence.length; candidate.diagnosisCount = candidate.diagnoses.length;
+    candidate.evidence = candidate.evidence.slice(-5); candidate.diagnoses = candidate.diagnoses.slice(-5);
+  }
+  return { total: candidates.length, limit: 20, candidates: candidates.slice(0, 20),
+    note: "相同阶段及错误原文的聚合，不代表已确认同一根因。负责人诊断待源码及复现核实；候选不自动修改配置、规范或项目事实。" };
 }
 
 export async function taskLifecycle(task, offset = 0, limit = 50) {
@@ -140,6 +179,7 @@ export function taskObservability(task, offset = 0, limit = 100) {
   return { id: meta.id, state: meta.state, auditHead: lastHash, summary: usageSummary(runs),
     execution: executionUsage(events), quality: firstVerificationQuality([task]), deliveryQuality: firstDeliveryQuality([task]),
     failureCount: failures.length, recentFailures: failures.slice(-10).reverse(),
+    improvements: improvementCandidates([task]),
     total: runs.length, offset, limit, runs: runs.slice(offset, offset + limit) };
 }
 
@@ -163,7 +203,7 @@ export async function auditReport(project, offset = 0, limit = 50, filters = {})
   const now = Date.now();
   for (const row of sorted) {
     const { meta, lastHash, events } = await readTask(project, row.id);
-    qualityTasks.push({ events });
+    qualityTasks.push({ meta, events });
     const runs = piRuns(events);
     allRuns.push(...runs);
     runsById.set(row.id, runs);
@@ -187,7 +227,7 @@ export async function auditReport(project, offset = 0, limit = 50, filters = {})
     generatedAt: new Date(now).toISOString(), authEventCount: credentials.length,
     summary: { ...managementSummary(requirements), firstDelivery: firstDeliveryQuality(qualityTasks),
       firstVerification: firstVerificationQuality(qualityTasks) }, usage: usageSummary(allRuns),
-    pageUsage: usageSummary(pageRuns), requirements: paged };
+    pageUsage: usageSummary(pageRuns), improvements: improvementCandidates(qualityTasks), requirements: paged };
 }
 
 export async function taskHistory(project, id, offset = 0, limit = 100) {

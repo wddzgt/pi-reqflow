@@ -3,7 +3,6 @@ import path from "node:path";
 import { loadProject, validateConfig, defaultModelUsage, validateModelParameters, modelAgents } from "./config.js";
 import { readJson, sha256, writeJson } from "./files.js";
 import { withLock } from "./store.js";
-import { refreshProjectBaseline } from "./baseline.js";
 import { readModelCredential, saveModelCredential } from "./model-credentials.js";
 
 export { modelAgents } from "./config.js";
@@ -114,7 +113,6 @@ export async function configureModels(projectPath, actor, input) {
       agentModels: next.agentModels, note: "管理员显式配置；未配置 Agent 继承默认；不自动切换模型" };
     await fs.appendFile(path.join(current.archive, "model-settings.jsonl"), `${JSON.stringify(event)}\n`, { mode: 0o600 });
     await writeJson(path.join(current.archive, "config.json"), next);
-    await refreshProjectBaseline({ ...current, config: next });
     return readModelSettings(projectPath);
   });
 }

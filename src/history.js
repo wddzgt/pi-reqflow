@@ -16,7 +16,7 @@ export async function readDiscussionEvidence(project, taskId, input) {
   if (!event) throw new Error("Discussion evidence must be a human message or AI plan reply from the current requirement");
   const text = event.type === "intake_draft" ? await fs.readFile(path.join(task.directory, "request.md"), "utf8")
     : ["plan_reply", "acceptance_reply"].includes(event.type) ? JSON.stringify(event.detail.reply)
-      : JSON.stringify({ text: event.detail.text, candidate: event.detail.candidate });
+       : JSON.stringify({ text: event.detail.text, candidate: event.detail.candidate, attachments: event.detail.attachments });
   if (input.offset >= text.length) throw new Error("Discussion read offset exceeds the archived message");
   return { taskId, eventHash: event.hash, actor: event.detail.actor, offset: input.offset, totalChars: text.length,
     text: text.slice(input.offset, input.offset + input.maxChars), partial: input.offset > 0 || text.length > input.maxChars,

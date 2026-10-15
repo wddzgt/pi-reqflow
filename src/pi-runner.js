@@ -146,7 +146,8 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
       if (executionLimit?.sourceQuery && (stat.size > 12000 || bytes + stat.size > contextBytes)) {
         const lines = content.split("\n");
         const anchors = lines.flatMap((line, index) => {
-          const symbol = line.match(/^\s*(?:export\s+)?(?:async\s+)?(?:def|function|class)\s+([\w$]+)/)?.[1];
+          const symbolMatch = line.match(/^\s*(?:export\s+)?(?:async\s+)?(?:(?:def|function|class)\s+([\w$]+)|([\w$]+)\s*\([^)]*\)\s*\{)/);
+          const symbol = symbolMatch && (symbolMatch[1] || symbolMatch[2]);
           return symbol && new RegExp(`\\b${symbol.replace(/[$]/g, "\\$")}\\b`).test(executionLimit.sourceQuery) ? [index] : [];
         });
         const citationNames = [relative];
@@ -167,7 +168,6 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
           citedAnchors.push(line - 1);
         }
         const selectedAnchors = [...new Set([...citedAnchors, ...anchors])];
-        if (executionLimit.researchRequests !== 0 && selectedAnchors.length === 0) selectedAnchors.push(0);
         const relatedAnchors = [];
         if (executionLimit.researchRequests !== 0 && /(?:^|\/)(?:tests?|__tests__)(?:\/|\.)/.test(relative)) {
           const queriedNames = [...executionLimit.sourceQuery.matchAll(/\b[A-Za-z$][\w$]*_[\w$]+\b/g)]
@@ -179,13 +179,26 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
           relatedAnchors.push(Math.max(0, lines.length - 20));
         }
         if (selectedAnchors.length || relatedAnchors.length) {
+          const ranges = [];
           for (const anchor of [...new Set([...selectedAnchors, ...relatedAnchors])]) {
-            const declaration = lines[anchor].match(/^(\s*)(?:export\s+)?(?:async\s+)?(?:def|function|class)\s+([\w$]+)/);
+            const declaration = lines[anchor].match(/^(\s*)(?:export\s+)?(?:async\s+)?(?:(?:def|function|class)\s+[\w$]+|[\w$]+\s*\([^)]*\)\s*\{)/);
             const nextDeclaration = declaration ? lines.findIndex((line, index) => index > anchor
               && /^\s*(?:export\s+)?(?:async\s+)?(?:def|function|class)\s+/.test(line)
               && line.match(/^\s*/)[0].length <= declaration[1].length) : -1;
+            const closingBrace = declaration && lines[anchor].includes("{") ? lines.findIndex((line, index) => index > anchor
+              && /^\s*\}/.test(line) && line.match(/^\s*/)[0].length <= declaration[1].length) : -1;
             const { start, end } = citedRanges.get(anchor) ?? { start: Math.max(0, anchor - 2),
-              end: Math.min(lines.length, anchor + (anchor === 0 ? 80 : 78), nextDeclaration < 0 ? lines.length : nextDeclaration) };
+              end: Math.min(lines.length, anchor + (declaration ? 78 : 12), nextDeclaration < 0 ? lines.length : nextDeclaration,
+                closingBrace < 0 ? lines.length : closingBrace + 1) };
+            const overlapping = ranges.filter(row => start <= row.end && end >= row.start
+              && Math.max(end, row.end) - Math.min(start, row.start) <= 80);
+            const merged = { start: Math.min(start, ...overlapping.map(row => row.start)),
+              end: Math.max(end, ...overlapping.map(row => row.end)) };
+            if (overlapping.length && merged.end - merged.start <= 80) {
+              ranges.splice(0, ranges.length, ...ranges.filter(row => !overlapping.includes(row)), merged);
+            } else ranges.push({ start, end });
+          }
+          for (const { start, end } of ranges) {
             const text = lines.slice(start, end).map((line, index) => `${start + index + 1}: ${line}`).join("\n");
             if (executionLimit.researchRequests !== 0 && bytes + Buffer.byteLength(text) > contextBytes) {
               const reference = `${relative}:${start + 1}-${end}`;
@@ -193,8 +206,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
                 sourceEvidence.omitted.push(reference); continue;
               }
               sourceEvidence.indexed.push(reference);
-              const symbol = lines[anchor].match(/^\s*(?:export\s+)?(?:async\s+)?(?:def|function|class)\s+([\w$]+)/)?.[1];
-              complete.push(`${reference} sha256=${hash} (location only${symbol ? `; symbol=${symbol}` : ""}; read necessary lines before editing)`);
+              complete.push(`${reference} sha256=${hash} (location only; read necessary lines before editing)`);
               continue;
             }
             if (bytes + Buffer.byteLength(text) > contextBytes) continue;
@@ -304,11 +316,12 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
     throw new Error("Research-free resume requires verified source context for every approved existing file");
   }
   if (phase === "implement" && executionLimit?.approvedFiles && project.config.checks) {
-    prompt += "\nThe approved checks are available through run_checks. Use existing verification infrastructure for changed behavior. External developer-owned check scripts may be executed only through run_checks, not read or edited. The controller independently verifies the final source and reviews its changes.";
+    prompt += "\nAfter applying the approved changes, use run_checks for the reviewed validation contract. Do not rediscover checks or inspect another test framework. Investigate only relevant failures in its real logs; rerun after fixing their source cause. Once checks pass on the current source, finish with a concise result instead of repeating investigation or checks without a relevant change. External developer-owned check scripts may be executed only through run_checks, not read or edited. The controller independently verifies the final source and reviews its changes.";
   }
   if (!Array.isArray(images) || images.length > 12 || (images.length && phase !== "intake"
-      && !(phase === "plan" && executionLimit?.outputSchema?.name === "acceptance_feedback")))
-    throw new Error("Image input requires intake or read-only acceptance investigation");
+       && !(phase === "plan" && (executionLimit?.planContract
+         || ["acceptance_feedback", "plan_dialogue"].includes(executionLimit?.outputSchema?.name)))))
+    throw new Error("Image input requires requirement alignment or read-only plan discussion, revision or acceptance investigation");
   const imageInputs = [];
   for (const file of images) {
     const resolved = await fs.realpath(file);
@@ -330,8 +343,10 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
   if (executionLimit?.resumeSession) {
     if (!sessionFile) throw new Error("Session continuation requires a developer run");
     const previous = executionLimit.resumeSession;
-    assertInside(await fs.realpath(path.dirname(logFile)), await fs.realpath(previous.file));
-    const content = await fs.readFile(previous.file);
+    if (path.basename(path.dirname(previous.file)) !== path.basename(path.dirname(logFile))) throw new Error("Developer session belongs to another requirement");
+    const previousFile = path.join(path.dirname(logFile), path.basename(previous.file));
+    assertInside(await fs.realpath(path.dirname(logFile)), await fs.realpath(previousFile));
+    const content = await fs.readFile(previousFile);
     if (sha256(content) !== previous.hash) throw new Error("Developer session changed before continuation");
     const headerEnd = content.indexOf(10);
     if (headerEnd < 0) throw new Error("Developer session has no native session header");
@@ -382,7 +397,7 @@ export async function runPi(project, cwd, phase, prompt, logFile, costLimit, rol
   }
   args.splice(args.indexOf("--"), 0, "--append-system-prompt",
     phase === "implement"
-      ? "Work in the current isolated workspace using project-relative paths. The confirmed requirement and approved plan define the task. Use current source as truth; historical decisions do not prove current code. Use edit/write for source changes and bash for investigation and verification. Keep edits focused and each replacement at most 50 lines. Do not commit, push, deploy, modify external files or delete business data. Report actual changes, checks and unresolved issues accurately; the controller performs final verification and rollback."
+      ? "Work in the current isolated workspace using project-relative paths. Execute the confirmed requirement and approved implementation design. Check the supplied current target excerpts, apply the specified edits, run the approved verification and finish. Additional investigation needs a concrete source mismatch, missing implementation evidence or relevant check failure; keep it focused on that issue. Use current source as truth. Use edit/write for source changes and bash when needed for that investigation and verification. Keep edits focused and each replacement at most 50 lines. Do not commit, push, deploy, modify external files or delete business data. Report actual changes, checks and unresolved issues accurately; the controller performs final verification and rollback."
       : "Use project-relative paths in the current isolated workspace. Investigate only relevant source evidence. This stage is read-only; source facts require successful reads and historical opinions do not grant approval.");
   const modelCredentials = {};
   for (const provider of project.config.compatibleProviders ?? []) if (provider.credentialId) {

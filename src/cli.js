@@ -75,10 +75,9 @@ async function actionInput(command, args) {
   }
   if (command === "accept-test") {
     body.acceptanceMode = required(args, "acceptance-mode");
-    if (body.acceptanceMode !== "deployed") {
-      body.expectedPlanHash = required(args, "plan-hash");
-      body.expectedAfterHash = required(args, "after-hash");
-    }
+    body.acceptanceResults = await readJson(required(args, "acceptance-file"));
+    body.expectedPlanHash = required(args, "plan-hash");
+    body.expectedAfterHash = required(args, "after-hash");
   }
   if (["reconcile-test-deploy", "reconcile-release"].includes(command)) {
     body.outcome = required(args, "outcome");

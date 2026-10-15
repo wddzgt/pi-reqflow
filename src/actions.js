@@ -11,6 +11,8 @@ import { runFastPath } from "./fast-path.js";
 import { develop } from "./development.js";
 import { addIntakeMessage, analyzeIntake } from "./intake-conversation.js";
 import { discussPlan, editPlan } from "./plan-conversation.js";
+import { acceptanceInput } from "./plan-analysis.js";
+import { readJson, sha256 } from "./files.js";
 import { discussAcceptance, closeAcceptanceFeedback, startAcceptanceRepair } from "./acceptance-feedback.js";
 import { localValidation, publishTest, recheckLocalChanges, redeployTest } from "./git-delivery.js";
 import {
@@ -131,12 +133,14 @@ export async function executeRequirementAction(projectPath, id, body, principal,
     case "accept-test": {
       const current = await readTask(project, id);
       if (!["manual", "local", "deployed"].includes(body.acceptanceMode)) throw new Error("Acceptance mode must be manual, local or deployed");
-      if (body.acceptanceMode !== "deployed" && (current.meta.state !== "verified"
-          || body.expectedAfterHash !== current.meta.afterHash || body.expectedPlanHash !== current.meta.planHash))
+      if (body.expectedAfterHash !== current.meta.afterHash || body.expectedPlanHash !== current.meta.planHash)
         throw new Error("代码或方案已改变，请刷新后确认当前研发交付。");
+      const frozen = await readJson(path.join(current.directory, `contract-v${current.meta.contractVersion}.json`));
+      if (sha256(JSON.stringify(frozen)) !== current.meta.contractHash) throw new Error("Confirmed contract changed");
+      acceptanceInput(body.acceptanceResults, frozen);
       if (current.meta.state === "verified" && current.meta.changeApproval?.afterHash !== current.meta.afterHash)
         await approveChanges(projectPath, id, actor, evidence);
-      await acceptTest(projectPath, id, actor, evidence, body.acceptanceMode);
+      await acceptTest(projectPath, id, actor, evidence, body.acceptanceMode, body.acceptanceResults, body);
       return archiveTestOnly(projectPath, id, actor);
     }
     case "verify-candidate": return verifyCandidate(projectPath, id);

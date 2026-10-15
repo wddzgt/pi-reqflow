@@ -8,6 +8,7 @@ import { addCredential } from "../src/auth.js";
 import { initialize, createTask, appendEvent, readTask } from "../src/store.js";
 import { executeRequirementAction, getAuditReport, getRequirementLifecycle, getTaskHistory } from "../src/core.js";
 import { lifecycleResults, lifecycleStatus } from "../src/lifecycle.js";
+import { improvementCandidates } from "../src/report.js";
 
 const repository = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const product = { id: "product", roles: ["product"] };
@@ -32,6 +33,42 @@ async function event(project, id, type, state, detail = {}, fields = {}) {
   const { meta } = await readTask(project, id);
   return appendEvent(project, id, type, { ...meta, ...fields, state }, detail);
 }
+
+test("improvement evidence is ordered by actual event time and missing reasons are not grouped as the same error", () => {
+  const event=(hash,at,error)=>({hash,at,type:"verification_failed",meta:{afterHash:"source"},detail:{error}});
+  const result=improvementCandidates([
+    {meta:{id:"recent-task"},events:[event("old","2026-10-10T00:00:00Z","same error"),
+      event("latest","2026-10-14T00:00:00Z","same error"),event("unknown-a","2026-10-13T00:00:00Z",null)]},
+    {meta:{id:"older-task"},events:[event("middle","2026-10-12T00:00:00Z","same error"),
+      event("unknown-b","2026-10-11T00:00:00Z",null)]}]);
+  assert.equal(result.total,3);
+  assert.equal(result.candidates[0].occurrences,3);
+  assert.deepEqual(result.candidates[0].evidence.map(item=>item.eventHash),["old","middle","latest"]);
+  assert.deepEqual(result.candidates.slice(1).map(item=>item.occurrences),[1,1]);
+});
+
+test("failure improvement candidates preserve evidence and diagnoses without claiming a confirmed root cause", async t => {
+  const {root,project}=await fixture(t);
+  for(const id of ["REQ-A","REQ-B"]) {
+    await createTask(project,id,"Calculation","request",product.id);
+    await event(project,id,"verification_failed","verification_failed",{error:"assert product expected 6",checks:[{logFile:`${id}/check.log`}]}, {afterHash:"source"});
+  }
+  const failed=(await readTask(project,"REQ-A")).events.at(-1);
+  await event(project,"REQ-A","implementation_attempt_retained","verification_failed",{
+    actor:"developer",priorFailureHash:failed.hash,evidence:"multiply uses addition; inspect expression and preserve add regression"});
+  await event(project,"REQ-A","verification_failed","verification_failed",{error:"paused",executionOutcome:"paused"});
+  const first=await getAuditReport(root,admin,0,1);
+  const filtered=await getAuditReport(root,admin,0,1,{query:"REQ-B"});
+  assert.deepEqual(first.improvements,filtered.improvements,"page and filters cannot hide project recurrence");
+  assert.equal(first.improvements.total,1);
+  const candidate=first.improvements.candidates[0];
+  assert.equal(candidate.occurrences,2);assert.equal(candidate.status,"diagnosis_recorded");
+  assert.equal(candidate.evidenceCount,2);assert.equal(candidate.diagnosisCount,1);
+  assert.equal(candidate.diagnoses[0].actor,"developer");
+  assert.equal(candidate.diagnoses[0].failureHash,failed.hash);
+  assert.match(candidate.recommendation,/已有但未接入/);assert.match(first.improvements.note,/不代表已确认同一根因/);
+  assert.equal((await readTask(project,"REQ-A")).meta.state,"verification_failed","read-only report cannot change a failed requirement");
+});
 
 test("failed model diagnostics retain the telemetry log reference without duplicates", async (t) => {
   const { root, project } = await fixture(t);

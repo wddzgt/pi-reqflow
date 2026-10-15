@@ -31,7 +31,8 @@ test("plan validation identifies an oversized description instead of blaming fil
   const value = { schemaVersion: 1, contractHash: sha256(JSON.stringify(contract)),
     affectedFiles: ["src/cli.py", "tests/test_cli.py"], domains: ["backend"],
     impacts: Object.fromEntries(["existingBehavior", "interfaces", "data"].map(key => [key, { status: "none", evidence: "Existing behavior preserved" }])),
-    verification: [{ acceptanceId: "AC1", scenario: "Names only", regression: "Original list output unchanged" }], openQuestions: [],
+    verification: [{ acceptanceId: "AC1", scenario: "Names only", regression: "Original list output unchanged",
+      checks: [], manualSteps: "执行 CLI，核对名称列表和原列表。" }], openQuestions: [],
     validation: { checks: [], skipped: [], manualReason: "按场景执行 CLI 断言", startup: [] },
     changes: [{ file: "src/cli.py", description: "Add a flag" }, { file: "tests/test_cli.py", description: "x".repeat(525) }],
     boundaries: { modules: [{ name: "CLI", files: ["src/cli.py", "tests/test_cli.py"], evidence: "One CLI command" }],
@@ -41,6 +42,23 @@ test("plan validation identifies an oversized description instead of blaming fil
   assert.throws(() => planAnalysisInput(value, contract, project), /changes\[1\]\.description for tests\/test_cli\.py has 525 characters; maximum is 500/);
   value.changes[1].description = "x".repeat(500);
   assert.ok(planAnalysisInput(value, contract, project).markdown.includes("拟改位置与做法"));
+  const verification = value.verification[0];
+  delete verification.checks;
+  assert.throws(() => planAnalysisInput(value, contract, project), /关联检查/);
+  verification.checks = [{ checkIndex: 0, kind: "behavior", coverage: "CLI 名称断言" }];
+  assert.throws(() => planAnalysisInput(value, contract, project), /检查引用/);
+  value.validation.checks = [{ command: ["node", "--check", "src/cli.py"], reason: "语法检查" }];
+  verification.checks[0].kind = "technical";
+  verification.manualSteps = "";
+  assert.throws(() => planAnalysisInput(value, contract, project), /业务断言检查/);
+  verification.manualSteps = "执行名称列表命令，核对只输出名称。";
+  assert.match(planAnalysisInput(value, contract, project).markdown, /技术检查/);
+  verification.checks.push({ ...verification.checks[0] });
+  assert.throws(() => planAnalysisInput(value, contract, project), /检查引用/);
+  verification.checks.pop();
+  verification.checks[0].coverage = " ";
+  assert.throws(() => planAnalysisInput(value, contract, project), /覆盖依据/);
+  verification.checks = []; value.validation.checks = [];
   value.validation.startup = [{ name: "frontend", command: ["npm", "run", "dev"],
     healthUrl: "http://127.0.0.1:4180/health", applicationUrl: "http://127.0.0.1:4180/templates" }];
   assert.match(planAnalysisInput(value, contract, project).markdown, /健康检查 .*\/health；应用入口 .*\/templates/);

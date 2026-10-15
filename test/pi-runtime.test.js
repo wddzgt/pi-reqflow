@@ -203,7 +203,8 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
   const contract = { objective: "Update value", acceptance: [{ id: "AC1", text: "Value updated" }] };
   const analysis = { schemaVersion: 1, inputHash: "discussion-hash", status: "needs_clarification",
     reply: "请确认允许哪些用户使用新增功能。", summary: "新增功能保留现有使用方式。", suggestions: [],
-    questions: [{ id: "Q1", text: "哪些用户可以使用新增功能？" }], requiredRoles: ["backend", "qa"], contract: null };
+    decisions: [], deferredQuestions: [],
+    questions: [{ id: "Q1", text: "哪些用户可以使用新增功能？", dependsOn: [], recommendation: "建议沿用现有用户范围" }], requiredRoles: ["backend", "qa"], contract: null };
   if (scenario === "intake-quoted-correction") analysis.reply = '保留原有"已选数量"文字，在下方完整显示名称列表。';
   if (scenario === "intake-count-correction") Object.assign(analysis, { status: "ready", questions: [], reply: "使用范围已经核对。",
     contract: { ...contract, currentBehavior: "当前值保持不变", desiredBehavior: "更新为已确认的值",
@@ -211,7 +212,7 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
   const draft = { schemaVersion: 1, contractHash: createHash("sha256").update(JSON.stringify(contract)).digest("hex"),
     affectedFiles: ["source.py"], changes: [{ file: "source.py", description: "Update value" }], domains: ["backend"],
     impacts: Object.fromEntries(["existingBehavior", "interfaces", "data"].map(key => [key, { status: "none", evidence: "Local isolated value" }])),
-    verification: [{ acceptanceId: "AC1", scenario: "Check value", regression: "Existing tests" }], openQuestions: [],
+    verification: [{ acceptanceId: "AC1", scenario: "Check value", regression: "Existing tests", checks: [], manualSteps: "调用函数核对结果" }], openQuestions: [],
     validation: { checks: [], skipped: [], manualReason: "调用当前函数并核对验收结果", startup: [] },
     boundaries: { modules: [{ name: "value", files: ["source.py"], evidence: "Source evidence" }],
       deliveryUnits: [{ name: "app", evidence: "One app" }], designStages: 1, estimatedChangedLines: 1,
@@ -385,7 +386,7 @@ for (const scenario of ["dependency-research", "plan", "plan-continuity", "plan-
             properties: Object.fromEntries(["severity", "subject", "evidence", "recommendation"].map(key => [key, { type: "string" }])) } } }
         } } }
       : phase === "intake" ? { maxTokens: 24000,
-        intakeValidation: { inputHash: "discussion-hash", sourceFiles: ["source.py"] },
+        intakeValidation: { inputHash: "discussion-hash", sourceFiles: ["source.py"], sourceEventHashes: [] },
         outputSchema: { name: "requirement_intake", strict: true, schema: { type: "object", additionalProperties: false,
           required: Object.keys(analysis), properties: Object.fromEntries(Object.entries(analysis).map(([key, value]) => [key,
             key === "contract" ? { anyOf: [{ type: "object" }, { type: "null" }] }

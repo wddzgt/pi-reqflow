@@ -231,7 +231,7 @@ function workbench() {
     append(...children) { this.children.push(...children); for (const child of children) child.parentElement = this; },
     appendChild(child) { this.append(child); return child; },
     querySelector() { return null; }, querySelectorAll() { return []; }, focus() {},
-    replaceChildren() { this.children = []; }, setAttribute(name, value) { this.attributes[name] = value; },
+    replaceChildren(...children) { this.children = []; this.append(...children); }, setAttribute(name, value) { this.attributes[name] = value; },
     addEventListener(type, callback) { this.listeners[type] = callback; },
   });
   const modal = node();
@@ -319,7 +319,8 @@ test("editing rich design preserves file coverage, allows optional pseudocode an
   run(`state.detail={meta:{id:'REQ-1',planHash:'shown-plan',planVersion:1},planAnalysis:{draft:{schemaVersion:2,domains:['backend'],markdown:'old',
     design:{approach:'Reuse',frontend:'',backend:'Old method',data:'No writes',interfaces:[],diagrams:[],components:[{file:'src/a.js',domain:'backend',location:'method a',pseudocode:''}]},
     affectedFiles:['src/a.js'],changes:[{file:'src/a.js',description:'Change a'}],boundaries:{modules:[{name:'a',files:['src/a.js']}]},
-    verification:[{acceptanceId:'AC1',scenario:'Result',regression:'Keep old'}]}}};
+    validation:{checks:[{command:['npm','test'],reason:'Behavior'}]},
+    verification:[{acceptanceId:'AC1',scenario:'Result',regression:'Keep old',checks:[{checkIndex:0,kind:'behavior',coverage:'Expected result assertion'}],manualSteps:'Check UI'}]}}};
     structuredModal=(title,description,build,submit)=>{globalThis.fields=build(document.createElement('form'));globalThis.submit=submit;};
     globalThis.sent=[];sendAction=async(...args)=>{sent.push(args);return true;};openPlanEditor();
     fields.design.approach.value='Reuse validated parser';fields.changes[0].file.value='src/b.js';fields.changes[0].location.value='method b';
@@ -332,6 +333,8 @@ test("editing rich design preserves file coverage, allows optional pseudocode an
   assert.equal(body.candidate.design.components[0].file, "src/b.js");
   assert.equal(body.candidate.boundaries.modules[0].files[0], "src/b.js");
   assert.equal(body.candidate.markdown, undefined);
+  assert.equal(body.candidate.verification[0].checks[0].coverage, "Expected result assertion");
+  assert.equal(body.candidate.verification[0].manualSteps, "Check UI");
   run("state.selectedId='another'"); await run("submit(fields)");
   assert.equal(context.sent.length, 1); assert.match(context.messages.at(-1), /需求已切换/);
 });
@@ -397,6 +400,26 @@ test("product replies appear below current questions and are sent together in on
   assert.match(context.messages.at(-1), /需求已切换/);
   run("state.principal.id='other-product';draw()");
   assert.equal(run("nodesUnder(panel).filter(n=>n.tagName==='TEXTAREA').length"), 0);
+});
+
+test("message composer pastes images into the text draft and retains them until successful sending", async () => {
+  const { context, run } = workbench();
+  context.FileReader = class {
+    readAsDataURL(file) { this.result = `data:${file.type};base64,${file.data}`; this.onload(); }
+  };
+  run(`globalThis.form=document.createElement('form');
+    globalThis.composer=messageComposer(form,'图文消息','贴图再说明','same-message');
+    composer.text.value='这张图对应当前需求';
+    globalThis.imageFile={name:'截图.png',type:'image/png',size:3,data:'YWJj'};`);
+  await run(`composer.text.parentElement.listeners.paste({clipboardData:{items:[{kind:'file',getAsFile:()=>imageFile}]},
+    preventDefault(){globalThis.pasteHandled=true;}})`);
+  assert.equal(run("pasteHandled"), true);
+  assert.equal(run("composer.images()[0].name"), "截图.png");
+  assert.equal(run("composer.text.value"), "这张图对应当前需求");
+  run("globalThis.redrawn=messageComposer(document.createElement('form'),'图文消息','贴图再说明','same-message')");
+  assert.equal(run("redrawn.images().length"), 1);
+  run("redrawn.clearImages()");
+  assert.equal(run("state.messageImageDrafts.has('same-message')"), false);
 });
 
 test("technical checks stay visible without reply fields while business questions retain inline replies", () => {
@@ -706,16 +729,57 @@ test("manual archive remains available without an environment and with stale or 
 test("manual archive dialog submits the displayed version and explicit acceptance method", async () => {
   const { context, modal, run } = workbench();
   run(`state.detail.meta={state:'verified',planHash:'shown-plan',afterHash:'shown-code',verificationMode:'automated'};
+    state.detail.contract={acceptance:[{id:'AC1',text:'乘法正确'}]};
+    state.detail.planAnalysis={draft:{verification:[{acceptanceId:'AC1',manualSteps:'核对2×3=6'}]}};
     globalThis.sent=[];sendAction=async(...args)=>sent.push(args);openModal('accept-test');`);
   const card = modal.children[0];
   assert.equal(card.children[0].textContent, "人工确认并归档");
   card.children.find(node => node.tagName === "TEXTAREA").value = "已核对需求、代码和相关测试结果，确认交付。";
+  card.children.filter(node => node.tagName === "TEXTAREA")[1].value = "实际核对2×3=6";
   run("state.detail.meta.afterHash='new-code'");
   await card.children.at(-1).children[1].listeners.click();
   assert.equal(context.sent[0][0], "accept-test");
   assert.equal(context.sent[0][1].acceptanceMode, "manual");
   assert.equal(context.sent[0][1].expectedAfterHash, "shown-code");
   assert.equal(context.sent[0][1].expectedPlanHash, "shown-plan");
+  assert.equal(context.sent[0][1].acceptanceResults[0].conclusion, "实际核对2×3=6");
+});
+
+test("acceptance evidence keeps technical checks, incomplete execution and historical versions explicit", () => {
+  const {run}=workbench();
+  run(`state.detail={contract:{acceptance:[{id:'AC1',text:'取消订单恢复库存'}]},
+    planAnalysis:{draft:{verification:[{acceptanceId:'AC1',manualSteps:'取消订单后检查库存',checks:[{checkIndex:0,kind:'technical',coverage:'构建通过不证明库存'}]}]}},
+    humanAcceptance:null,verificationAttempts:[{attempt:1,at:'2026-10-14T00:00:00Z',current:false,
+      evidence:{sourceHash:'old-source',planHash:'old-plan',sourceUnchanged:true,items:[{acceptanceId:'AC1',checks:[
+        {kind:'technical',status:'passed',command:['npm','run','build'],coverage:'只证明构建',result:null},
+        {kind:'behavior',status:'not_run',command:['npm','test'],coverage:'库存断言',result:null}]}]}}]};
+    globalThis.root=document.createElement('div');renderAcceptanceEvidence(root);
+    globalThis.readText=node=>[node.textContent||'',...node.children.map(readText)].join(' ');`);
+  const text=run('readText(root)');
+  assert.match(text,/技术检查 · 相关检查通过/);assert.match(text,/业务断言相关检查 · 未执行/);
+  assert.match(text,/历史或已失效版本/);assert.match(text,/暂无匹配当前版本/);assert.match(text,/人工结论待填写/);
+  run(`state.detail.humanAcceptance={actor:'reviewer',at:'2026-10-14T01:00:00Z',acceptanceMode:'local',
+    results:[{acceptanceId:'AC1',conclusion:'取消后库存由8恢复为10'}]};root=document.createElement('div');renderAcceptanceEvidence(root);`);
+  assert.match(run('readText(root)'),/人工已确认 · reviewer.*本地验证 · 取消后库存由8恢复为10/);
+});
+
+test("historical verification and human conclusions remain visible without per-acceptance mappings", () => {
+  const { run } = workbench();
+  run(`state.tab='checks';state.detail={meta:{state:'archived_test_only'},baselineChecks:[],
+    contract:{acceptance:[{id:'AC1',text:'状态筛选正确'}]},planAnalysis:{draft:{verification:[]}},
+    humanAcceptance:{actor:'developer',at:'2026-10-11T07:26:50Z',coverageRecorded:false,conclusion:'人工已核对筛选结果'},
+    verificationAttempts:[{attempt:1,at:'2026-10-11T00:00:00Z',outcome:'verification_failed',evidence:null,
+      sourceHash:'source-1',planHash:'plan-1',error:'相关检查失败',checks:[
+        {command:['npm','test'],code:1,durationMs:20,logFile:'/old/archive/check-1.log',logHash:'hash-1',tail:'assertion failed'}]},
+      {attempt:2,at:'2026-10-11T01:00:00Z',outcome:'verified',evidence:null,sourceHash:'source-2',planHash:'plan-2',checks:[]}]};
+    globalThis.root=document.createElement('div');renderTab(root);
+    globalThis.readText=node=>[node.textContent||'',...node.children.map(readText)].join(' ');`);
+  const text = run('readText(root)');
+  assert.match(text, /历史方案未保存逐项检查关联/);
+  assert.match(text, /人工验收原文 · developer.*人工已核对筛选结果/);
+  assert.match(text, /第 1 次验证.*失败.*1 项命令检查.*npm test · 退出码 1.*assertion failed/s);
+  assert.match(text, /第 2 次验证.*已完成.*0 项命令检查/);
+  assert.doesNotMatch(text, /暂无验证记录|人工已确认|技术检查 · 相关检查通过|业务断言相关检查 · 相关检查通过/);
 });
 
 test("Git delivery offers optional local verification and explicit commit authorization", async () => {
@@ -835,13 +899,19 @@ test("admin model form inherits defaults, saves overrides and clears entered sec
       reasoning:true,thinkingToggle:true,supportsReasoningEffort:false,supportsJsonSchema:false,imageInput:false,
       modelParameters:{outputFormat:'auto',temperature:0.2,topP:0.8,maxOutputTokens:4096},modelUsage:{maxTokens:60000,maxContextBytes:64000,maxRequests:8,readOnlyMaxRequests:6,maxToolResultBytes:8000,
         initializationMaxTokens:30000,initializationMaxRequests:1,initializationMaxToolCalls:8}},
-      agents:Object.fromEntries(Object.keys(modelAgentLabels).map(name=>[name,null])),maxCostUsd:2};
+      agents:Object.fromEntries(Object.keys(modelAgentLabels).map(name=>[name,null])),maxCostUsd:null};
     api=async()=>setup;refresh=async()=>{};globalThis.requests=[];
     structuredModal=(title,description,build,submit)=>{globalThis.form=document.createElement('form');globalThis.fields=build(form);globalThis.submit=submit;};`);
   await run("openModelSettings()");
   assert.equal(run("fields.default.apiKey.value"), "");
   assert.equal(run("fields.default.apiKey.type"), "password");
   assert.equal(run("fields.default.apiKey.required"), false);
+  assert.equal(run("Object.values(fields.default.cost).every(input=>input.required===false)"), true,
+    "unknown optional prices must not prevent the browser from dispatching the save submit event");
+  assert.equal(run("fields.maxCostUsd.required"), false, "an omitted fee limit must not prevent submission");
+  run("fields.default.cost.input.value='1'");
+  assert.throws(() => run("modelProfileInput(fields.default)"), /全部四项单价，或全部留空/);
+  run("fields.default.cost.input.value=''");
   assert.equal(run("Object.values(fields.agents).every(row=>row.inherit.checked)"), true);
   assert.equal(run("Object.values(fields.agents).every(row=>row.inputs===null&&row.custom.hidden)"), true);
   run(`fields.default.baseUrl.value='';fields.agents.requirement.inherit.checked=false;fields.agents.requirement.inherit.listeners.change();`);
@@ -857,11 +927,14 @@ test("admin model form inherits defaults, saves overrides and clears entered sec
     fields.agents.development.inherit.checked=false;fields.agents.development.inherit.listeners.change();`);
   assert.equal(run("fields.agents.development.inputs.model.value"), "updated-default-model");
   assert.equal(run("fields.agents.development.custom.hidden"), false);
+  assert.equal(run("Object.values(fields.agents.development.inputs.cost).every(input=>input.required===false)"), true);
   run(`fields.agents.development.inputs.model.value='glm-5.3';
     fields.default.apiKey.value='new-private-key';api=async(url,options)=>{requests.push({url,body:JSON.parse(options.body)});return {};};`);
   await run("submit(fields)");
   assert.equal(context.requests.length, 1); assert.equal(context.requests[0].url, "/api/model-settings");
   assert.equal(context.requests[0].body.expectedConfigHash, "shown-config");
+  assert.equal(context.requests[0].body.maxCostUsd, null);
+  assert.equal(context.requests[0].body.default.cost, null);
   assert.equal(context.requests[0].body.agents.requirement, null); assert.equal(context.requests[0].body.agents.development.model, "glm-5.3");
   assert.equal(context.requests[0].body.default.apiKey, "new-private-key");
   assert.equal(context.requests[0].body.default.maxPiMs, 180000);

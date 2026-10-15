@@ -49,7 +49,10 @@ if (phase === "intake") {
   intake = { schemaVersion: 1, inputHash, status: ready ? "ready" : "needs_clarification",
     reply: ready ? "已确认增加乘法并保留现有加法行为，请查看验收标准后定版。" : "我理解你希望扩展计算能力。请确认新增行为与现有加法的兼容要求。",
     summary: "在现有计算器基础上扩展功能，保持原有行为。", suggestions: ["保留加法回归测试，并覆盖新乘法验收场景。"],
-    questions: ready ? [] : [{ id: "Q1", text: "是否新增乘法，并保持现有加法不变？" }], requiredRoles: ["backend", "qa"], contract: ready ? contract : null };
+    decisions: ready ? [{id:"D1",text:"新增乘法并保留原加法",sourceEventHash:context.history.findLast(row=>row.role==="product").eventHash}] : [],
+    deferredQuestions: [],
+    questions: ready ? [] : [{ id: "Q1", text: "是否新增乘法，并保持现有加法不变？", dependsOn: [],
+      recommendation: "建议新增乘法，同时保留原有加法。" }], requiredRoles: ["backend", "qa"], contract: ready ? contract : null };
   for (const file of process.argv.filter((arg) => arg.startsWith("@"))) {
     const data = (await fs.readFile(file.slice(1))).toString("base64");
     process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "user", content: [{ type: "image", data, mimeType: "image/png" }] } }) + "\n");
@@ -93,7 +96,10 @@ if (phase === "plan" && !prompt.startsWith("研发方案沟通") && !prompt.star
       interfaces: { status: "none", evidence: "计算器无外部 HTTP 接口，现有 add 参数不变。" },
       data: { status: "none", evidence: "src/calculator.mjs 不读取或写入持久数据。" } },
     verification: contract.acceptance.map((item) => ({ acceptanceId: item.id, scenario: item.text,
-      regression: "执行 test/calculator.test.mjs 中既有 add 用例" })), openQuestions: [] };
+      regression: "执行 test/calculator.test.mjs 中既有 add 用例",
+      checks: JSON.parse(prompt.match(/检查命令：(.*)$/m)[1]).length
+        ? [{ checkIndex: 0, kind: "behavior", coverage: "test/calculator.test.mjs 断言 multiply(2,3)=6 和 add(2,3)=5；不验证页面" }] : [],
+      manualSteps: "调用 multiply(2,3) 应得6，调用 add(2,3) 应得5；核对实际交付入口。" })), openQuestions: [] };
   analysis.validation = { checks: JSON.parse(prompt.match(/检查命令：(.*)$/m)[1]).map(command => ({ command,
     reason: "计算器实现与调用方验收用例；只回归当前计算器项目" })), skipped: [], manualReason: "按验收场景调用计算器导出函数，核对结果和既有加法。", startup: [] };
   analysis.changes = analysis.affectedFiles.map(file => ({ file, description: documentAddition ? "为 add 增加说明注释，不改函数实现。" : file.startsWith("test/")

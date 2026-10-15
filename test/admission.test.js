@@ -102,7 +102,8 @@ test("interrupted requests retain measured usage and mark legacy partial totals 
   const telemetry = { tokens: { input: 10, output: 5, cacheRead: 3, cacheWrite: 2 }, durationMs: 180000,
     assistantMessages: 2, promptBytes: 100, toolCalls: 3, modelSwitches: [], pricingKnown: true,
     unmeasuredRequests: 0, requestTimings: [{ status: "completed" }, { status: "completed" }, { status: "timed_out" }] };
-  const event = { type: "plan_attempt_failed", detail: { modelRun: true, error: "timeout", costUsd: .1, telemetry } };
+  const event = { type: "plan_attempt_failed", hash: "failed-event", at: "2026-10-14T00:00:00Z",
+    meta: { id: "partial", state: "contract_confirmed" }, detail: { modelRun: true, error: "timeout", costUsd: .1, telemetry } };
   assert.deepEqual(executionUsage([event]), { calls: 2, totalTokens: 20, modelMs: 180000, unmeasuredCalls: 1, unmeasuredDuration: false });
   assert.throws(() => modelAllowance([event], { ...policy, budgetMode: "strict" }), /unmeasured/);
   const allowance = modelAllowance([event], { ...policy, budgetMode: "adaptive" });

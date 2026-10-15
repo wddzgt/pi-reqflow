@@ -274,7 +274,7 @@ export default function (pi) {
         const text = latestAssistant.content.filter(part => part.type === "text").map(part => part.text).join("\n");
         const output = JSON.parse(text);
         if (validateIntake && !validateIntake(output)) throw new Error(JSON.stringify(validateIntake.errors));
-        analysisInput(output, policy.intakeValidation.inputHash, policy.intakeValidation.sourceFiles);
+        analysisInput(output, policy.intakeValidation.inputHash, policy.intakeValidation.sourceFiles, policy.intakeValidation.sourceEventHashes);
         pi.appendEntry("reqflow_intake_validation", { attempt: intakeCorrections + 1, status: "valid" });
       } catch (error) {
         pi.appendEntry("reqflow_intake_validation", { attempt: intakeCorrections + 1, status: "invalid", error: error.message });
@@ -657,17 +657,17 @@ export default function (pi) {
     });
   }
   pi.on("session_start", async (_event, ctx) => {
-    if (phase === "intake" && process.env.REQFLOW_HAS_IMAGES === "true" && !ctx.model?.input.includes("image")) {
-      process.stderr.write("Requirement model does not support image input; configure agentModels.requirement with a vision model.\n");
+    if (process.env.REQFLOW_HAS_IMAGES === "true" && !ctx.model?.input.includes("image")) {
+      process.stderr.write("Selected model does not support image input; configure this stage with a vision model.\n");
       process.exit(1);
     }
   });
   pi.on("context", async (event) => {
-    if (phase !== "intake" || process.env.REQFLOW_HAS_IMAGES !== "true") return;
-    const message = event.messages.find((row) => row.role === "user" && Array.isArray(row.content) && row.content.some(part => part.type === "image"));
+    if (process.env.REQFLOW_HAS_IMAGES !== "true") return;
+    const message = event.messages.findLast((row) => row.role === "user" && Array.isArray(row.content) && row.content.some(part => part.type === "image"));
     const count = Array.isArray(message?.content) ? message.content.filter((part) => part.type === "image").length : 0;
     if (count !== Number(process.env.REQFLOW_IMAGE_COUNT)) {
-      process.stderr.write("Pi could not decode every uploaded image; AI alignment must not continue without its visual input.\n");
+      process.stderr.write("Pi could not decode every uploaded image; this stage must not continue without its visual input.\n");
       process.exit(1);
     }
   });

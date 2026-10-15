@@ -36,6 +36,7 @@ import { acceptTest, approveChanges, approvePlan, approveRelease, archiveTestOnl
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const fakePi = path.join(root, "test", "fake-pi.mjs");
 const fakePiPartialFailure = path.join(root, "test", "fake-pi-partial-failure.mjs");
+const calculatorAcceptance = [{ acceptanceId: "AC1", conclusion: "已核对乘法2×3=6，原有加法2+3=5。" }];
 
 for (const phase of ["plan", "review", "implement", "intake", "dialogue"]) test(`user pauses ${phase}, retains evidence and continues without automatic retries`, async t => {
   const control = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-pause-model-"));
@@ -244,7 +245,7 @@ test("acceptance feedback investigates current code, blocks archive and repairs 
   assert.equal(discussed.meta.state, "verified"); assert.equal(discussed.meta.afterHash, before.meta.afterHash);
   assert.equal(await fs.readFile(path.join(before.meta.workspace, "src/calculator.mjs"), "utf8"), source);
   assert.equal(discussed.meta.acceptanceFeedback.owner, "product");
-  await assert.rejects(f.action({ action: "accept-test", acceptanceMode: "manual", evidence: "Cannot ignore reported bug", ...f.version(before.meta) }), /反馈尚未处理/);
+  await assert.rejects(f.action({ action: "accept-test", acceptanceMode: "manual", acceptanceResults: calculatorAcceptance, evidence: "Cannot ignore reported bug", ...f.version(before.meta) }), /反馈尚未处理/);
   const input = { action: "start-acceptance-repair", ...f.version(before.meta), expectedFeedbackHash: reply.hash };
   await assert.rejects(f.action({ ...input, expectedFeedbackHash: "stale" }), /调查|沟通/);
   await assert.rejects(f.action(input, f.product), /assigned plan approver/);
@@ -264,8 +265,8 @@ test("acceptance feedback investigates current code, blocks archive and repairs 
   assert.match(evidence.acceptanceDiscussion.results[0].text, /修复零值遗漏/);
   assert.match(await fs.readFile(path.join(evidence.implementationAttempts[0].retained, "after/src/calculator.mjs"), "utf8"), /left === 0/);
   assert.doesNotMatch(await fs.readFile(path.join(repaired.meta.workspace, "src/calculator.mjs"), "utf8"), /left === 0/);
-  await assert.rejects(f.action({ action: "accept-test", acceptanceMode: "manual", evidence: "Old code", ...f.version(before.meta) }), /已改变/);
-  await f.action({ action: "accept-test", acceptanceMode: "manual", evidence: "Zero result and original assertions verified", ...f.version(repaired.meta) });
+  await assert.rejects(f.action({ action: "accept-test", acceptanceMode: "manual", acceptanceResults: calculatorAcceptance, evidence: "Old code", ...f.version(before.meta) }), /已改变/);
+  await f.action({ action: "accept-test", acceptanceMode: "manual", acceptanceResults: [{acceptanceId:"AC1",conclusion:"零值乘法与原加法断言已核对"}], evidence: "Zero result and original assertions verified", ...f.version(repaired.meta) });
   assert.equal((await f.current()).meta.state, "archived_test_only");
   await assert.rejects(f.action({ action: "discuss-acceptance", message: { text: "Another issue", ...f.version(repaired.meta) } }, f.product), /归档后的问题/);
 });
@@ -403,6 +404,10 @@ test("continuing a paused verification reruns checks without recoding or changin
   assert.equal((await running).paused, true);
   const paused = await readTask(project, "REQ-001");
   assert.equal(paused.meta.state, "verification_failed"); assert.equal(paused.meta.developmentFailure.kind, "user_paused");
+  const interrupted = await getRequirementEvidence(projectRoot, actor, "REQ-001");
+  const stoppedCheck = interrupted.verificationAttempts[0].evidence.items[0].checks[0];
+  assert.equal(stoppedCheck.status, "interrupted");
+  assert.match(stoppedCheck.interruption.logHash, /^[a-f0-9]{64}$/);
   await fs.unlink(marker);
   await executeRequirementAction(projectRoot, "REQ-001", { action: "continue-execution", expectedAuditHead: paused.lastHash }, actor);
   const resumed = await readTask(project, "REQ-001");
@@ -413,6 +418,7 @@ test("continuing a paused verification reruns checks without recoding or changin
   assert.equal(resumed.meta.checks[0].code, 0);
   const diagnostics = await getTaskObservability(projectRoot, actor, "REQ-001");
   assert.equal(diagnostics.recentFailures.length, 0, "a user pause is distinct from a failed verification");
+  assert.equal(diagnostics.improvements.total, 0);
 });
 
 test("a simple frozen requirement skips model reviews and still waits for its assigned approver", async (t) => {
@@ -577,12 +583,50 @@ test("approved startup uses the root command catalogue for a nested frontend and
   await approveChanges(projectRoot, "REQ-001", "reviewer", "Checked current code and local behavior");
   await localValidation(projectRoot, "REQ-001", "reviewer", { ...input, operation: "stop" });
   await configureLocalEnvironment(project, "reviewer", { ...settings, expectedRevision: readySetup.revision });
-  await assert.rejects(acceptTest(projectRoot, "REQ-001", "reviewer", "Earlier environment was tested", "local"), /环境配置已改变/);
-  await acceptTest(projectRoot, "REQ-001", "reviewer", "重新核对当前代码，人工确认交付；不采用旧环境的验证结果。", "manual");
+  await assert.rejects(acceptTest(projectRoot, "REQ-001", "reviewer", "Earlier environment was tested", "local", calculatorAcceptance), /环境配置已改变/);
+  await acceptTest(projectRoot, "REQ-001", "reviewer", "重新核对当前代码，人工确认交付；不采用旧环境的验证结果。", "manual", calculatorAcceptance);
   assert.equal((await readTask(project, "REQ-001")).meta.acceptanceMode, "manual");
   await rollback(projectRoot, "REQ-001", "reviewer");
   await assert.rejects(fetch(url), /fetch failed/);
   assert.equal((await readTask(project, "REQ-001")).meta.state, "rolled_back");
+});
+
+test("acceptance mappings bind shared checks and individual human conclusions to the actual delivery", async t => {
+  const { projectRoot, project } = await analysisFixture(t, [['  analysis.changes =', `
+  analysis.verification.forEach(item=>item.checks=[
+    {checkIndex:0,kind:"technical",coverage:"计算器模块语法正确；不证明业务"},
+    {checkIndex:1,kind:"behavior",coverage:"calculator.test.mjs 乘法与加法独立断言"}]);
+  analysis.changes =`]], {checks:[[process.execPath,"--check","src/calculator.mjs"],
+    [process.execPath,"--test","test/calculator.test.mjs"]]});
+  await reviseContract(projectRoot,"REQ-001","product", { objective:"乘法与加法交付",currentBehavior:"只有加法",
+    desiredBehavior:"乘法正确且保留加法",acceptance:[{id:"AC1",text:"2×3=6"},{id:"AC2",text:"2+3=5"}],
+    inScope:["src/calculator.mjs","test/calculator.test.mjs"],outOfScope:[],answers:{} });
+  await plan(projectRoot,"REQ-001"); await approvePlan(projectRoot,"REQ-001","reviewer");
+  await implement(projectRoot,"REQ-001"); await verify(projectRoot,"REQ-001");
+  const actor={id:"reviewer",roles:["developer"]};
+  const detail=await getRequirementEvidence(projectRoot,actor,"REQ-001");
+  const attempt=detail.verificationAttempts[0];
+  assert.equal(attempt.current,true); assert.equal(attempt.evidence.sourceHash,detail.meta.afterHash);
+  assert.deepEqual(attempt.evidence.items.map(item=>item.checks.map(check=>check.status)),[["passed","passed"],["passed","passed"]]);
+  assert.equal(attempt.evidence.items[0].checks[0].kind,"technical");
+  assert.equal(attempt.evidence.items[0].checks[1].result.logHash,detail.meta.checks[1].logHash);
+  const body={action:"accept-test",acceptanceMode:"manual",expectedPlanHash:detail.meta.planHash,
+    expectedAfterHash:detail.meta.afterHash,evidence:"逐项核对当前交付。"};
+  for(const acceptanceResults of [undefined,[],calculatorAcceptance,
+    [{acceptanceId:"AC1",conclusion:"6"},{acceptanceId:"AC1",conclusion:"5"}],
+    [{acceptanceId:"AC1",conclusion:"6"},{acceptanceId:"AC2",conclusion:" "}]]) {
+    await assert.rejects(executeRequirementAction(projectRoot,"REQ-001",{...body,acceptanceResults},actor),/验收/);
+    assert.equal((await readTask(project,"REQ-001")).meta.changeApproval,undefined);
+  }
+  const acceptanceResults=[{acceptanceId:"AC1",conclusion:"调用乘法2×3得到6"},{acceptanceId:"AC2",conclusion:"原加法2+3仍得5"}];
+  await executeRequirementAction(projectRoot,"REQ-001",{...body,acceptanceResults},actor);
+  const archived=await getRequirementEvidence(projectRoot,actor,"REQ-001");
+  assert.deepEqual(archived.humanAcceptance.results,acceptanceResults);
+  assert.equal(archived.humanAcceptance.actor,"reviewer");
+  assert.equal(archived.humanAcceptance.planHash,detail.meta.planHash);
+  assert.match(archived.result,/技术检查 passed[\s\S]*AC2：原加法2\+3仍得5/);
+  await fs.appendFile(path.join((await readTask(project,"REQ-001")).directory,"acceptance.md"),"篡改");
+  await assert.rejects(getRequirementEvidence(projectRoot,actor,"REQ-001"),/Human acceptance evidence changed/);
 });
 
 test("manual acceptance archives verified code without configuring or starting an environment", async t => {
@@ -590,13 +634,13 @@ test("manual acceptance archives verified code without configuring or starting a
   const actor = { id: "reviewer", roles: ["developer"] };
   await plan(projectRoot, "REQ-001");
   await approvePlan(projectRoot, "REQ-001", actor.id); await implement(projectRoot, "REQ-001");
-  await assert.rejects(acceptTest(projectRoot, "REQ-001", actor.id, "Not checked yet", "manual"), /expected verified/);
+  await assert.rejects(acceptTest(projectRoot, "REQ-001", actor.id, "Not checked yet", "manual", calculatorAcceptance), /expected verified/);
   await verify(projectRoot, "REQ-001");
   const task = await readTask(project, "REQ-001");
   assert.ok(task.meta.checks.length > 0); assert.ok(task.meta.checks.every(check => check.code === 0));
   assert.equal(task.meta.localValidation, undefined);
   const input = { action: "accept-test", acceptanceMode: "manual", expectedAfterHash: task.meta.afterHash,
-    expectedPlanHash: task.meta.planHash, evidence: "已核对需求、乘法和原加法用例及代码差异，确认交付。" };
+    expectedPlanHash: task.meta.planHash, acceptanceResults: calculatorAcceptance, evidence: "已核对需求、乘法和原加法用例及代码差异，确认交付。" };
   await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", { ...input, expectedAfterHash: "old" }, actor), /代码或方案已改变/);
   await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", input, { id: "stranger", roles: ["developer"] }), /not assigned/);
   await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", input, { id: "product", roles: ["product"] }), /assigned developer/);
@@ -910,7 +954,7 @@ test("technical contradictions are corrected internally before one human plan re
 test("internal correction updates selected acceptance checks without replacing the complete coverage", async t => {
   const { projectRoot, project } = await analysisFixture(t, [...technicalCorrectionModel,
     ['analysis.design.backend = "corrected-contract:', `analysis.verification = Object.fromEntries([1,2,3,4,5,6,7,8].map(i => ["AC"+i,
-      [3,5,7].includes(i) ? {scenario:"修正场景AC"+i,regression:"保留旧行为AC"+i} : null]));
+      [3,5,7].includes(i) ? {scenario:"修正场景AC"+i,regression:"保留旧行为AC"+i,checks:[{checkIndex:0,kind:"behavior",coverage:"计算器结果断言"}],manualSteps:"核对计算入口"} : null]));
     analysis.changes = [{file:"src/calculator.mjs",description:"修正核心函数契约"}];
     analysis.design.components = [{file:"src/calculator.mjs",domain:"shared",location:"multiply",pseudocode:"return left * right"}];
     analysis.design.backend = "corrected-contract:`]]);
@@ -1091,7 +1135,7 @@ test("real Pi reads the saved draft and submits a section patch before human rev
         const correctionRequests = requests.filter(row=>row.response_format?.json_schema?.name==="delivery_plan_correction").length;
         if (correctionRequests === 2) patch.verification = [{acceptanceId:"AC1",scenario:"局部修改",regression:"保留加法"}];
         else if (correctionRequests === 3) patch.design.interfaces[0] = {...patch.design.interfaces[0],status:"modified",sourceFile:"src/missing.mjs"};
-        else patch.verification = {AC1:{scenario:"乘法返回6",regression:"加法仍返回5"}};
+        else patch.verification = {AC1:{scenario:"乘法返回6",regression:"加法仍返回5",checks:[{checkIndex:0,kind:"behavior",coverage:"计算器乘法和加法断言"}],manualSteps:"核对调用结果"}};
         delta = {role:"assistant",content:JSON.stringify(patch)};
       }
     } else if (prompt.startsWith("研发方案专项检查")) {
@@ -1276,6 +1320,63 @@ test("plan dialogue preserves the confirmed version, checks ownership and counts
   assert.equal((await getTaskObservability(projectRoot, principal, "REQ-001")).summary.attempts, 4);
 });
 
+test("plan image messages remain version-bound, reach dialogue and revision, and reject tampered pixels", async t => {
+  const { projectRoot, project } = await analysisFixture(t);
+  await plan(projectRoot, "REQ-001");
+  const before = await readTask(project, "REQ-001");
+  const image = { name: "方案示意.png", mimeType: "image/png",
+    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNQKt8NAAITAVXMpdPnAAAAAElFTkSuQmCC" };
+  const principal = { id: "reviewer", roles: ["developer"] };
+  await executeRequirementAction(projectRoot, "REQ-001", { action: "discuss-plan", message: {
+    text: "核对图片中的验收示例，冻结需求保持不变。", images: [image], expectedPlanHash: before.meta.planHash } }, principal);
+  const discussed = await readTask(project, "REQ-001");
+  const message = discussed.events.findLast(event => event.type === "plan_message");
+  const reply = discussed.events.findLast(event => event.type === "plan_reply");
+  assert.equal(message.detail.attachments.length, 1);
+  assert.equal(reply.detail.telemetry.imageInputs.length, 1);
+  assert.equal(reply.detail.telemetry.imageInputs[0].hash, message.detail.attachments[0].hash);
+  const evidence = await getRequirementEvidence(projectRoot, principal, "REQ-001");
+  assert.equal(evidence.planDiscussion.messages.find(row => row.eventHash === message.hash).attachments[0].hash,
+    message.detail.attachments[0].hash);
+  await executeRequirementAction(projectRoot, "REQ-001", { action: "revise-plan",
+    expectedPlanHash: before.meta.planHash, feedback: "结合研发图文消息核对方案，保留已确认需求。" }, principal);
+  const revised = await readTask(project, "REQ-001");
+  const draft = revised.events.findLast(event => event.type === "plan_draft_completed");
+  assert.equal(draft.detail.telemetry.imageInputs[0].hash, message.detail.attachments[0].hash);
+  assert.equal(revised.meta.contractHash, before.meta.contractHash);
+  await assert.rejects(executeRequirementAction(projectRoot, "REQ-001", { action: "discuss-plan", message: {
+    text: "旧方案的图文回复", images: [image], expectedPlanHash: "0".repeat(64) } }, principal), /plan has changed/);
+  await fs.appendFile(path.join(revised.directory, message.detail.attachments[0].file), "tampered");
+  const { getRequirementImage } = await import("../src/core.js");
+  await assert.rejects(getRequirementImage(projectRoot, principal, "REQ-001", message.detail.attachments[0].id), /Audited image size or type changed/);
+});
+
+test("rejecting excess plan images preserves the audit and allows further text discussion", async t => {
+  const { projectRoot, project } = await analysisFixture(t);
+  await plan(projectRoot, "REQ-001");
+  const task = await readTask(project, "REQ-001");
+  const image = { name: "方案示意.png", mimeType: "image/png",
+    data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNQKt8NAAITAVXMpdPnAAAAAElFTkSuQmCC" };
+  const input = { text: "核对已有验收示例。", expectedPlanHash: task.meta.planHash };
+  for (let index = 0; index < 3; index++)
+    await discussPlan(projectRoot, "REQ-001", "reviewer", { ...input, images: Array(4).fill(image) });
+  const before = await readTask(project, "REQ-001");
+  const files = await fs.readdir(path.join(before.directory, "attachments"));
+  assert.equal(files.length, 12);
+  await assert.rejects(discussPlan(projectRoot, "REQ-001", "reviewer", { ...input, images: [image] }), /12-image \/ 8 MiB context budget/);
+  assert.equal((await readTask(project, "REQ-001")).lastHash, before.lastHash);
+  assert.deepEqual(await fs.readdir(path.join(before.directory, "attachments")), files);
+  const continued = await discussPlan(projectRoot, "REQ-001", "reviewer", input);
+  assert.equal(continued.reply.recommendation, "keep");
+  const after = await readTask(project, "REQ-001");
+  assert.equal(after.events.findLast(event => event.type === "plan_reply").detail.telemetry.imageInputs.length, 12);
+  await revisePlan(projectRoot, "REQ-001", "reviewer", "按已讨论的验收示例核对方案。", undefined,
+    { expectedPlanHash: task.meta.planHash });
+  const revised = await readTask(project, "REQ-001");
+  assert.equal(revised.meta.planVersion, 2);
+  assert.equal(revised.meta.state, "plan_review");
+});
+
 test("dialogue sees data recovery classification and empty questions cannot clear technical blockers", async t => {
   const { projectRoot, project } = await analysisFixture(t, [[
     'data: { status: "none", evidence: "src/calculator.mjs 不读取或写入持久数据。" }',
@@ -1315,7 +1416,9 @@ test("plan dialogue bounds history by bytes, retrieves omitted advice and exclud
   const recent = JSON.parse(prompt.match(/^近期沟通摘录.*：(.+)$/m)[1]);
   assert.ok(Buffer.byteLength(JSON.stringify(recent)) <= 4000);
   assert.ok(recent.length > 0);
-  assert.ok(recent.every(row => row.text.length <= 400 && row.textPartial));
+  assert.ok(recent.every(row => row.text.length <= 400));
+  assert.ok(recent.some(row => row.text === "请核对当前方案" && row.textPartial === false));
+  assert.ok(recent.filter(row => row.text !== "请核对当前方案").every(row => row.textPartial));
   assert.ok(recent.some(row => row.role === "ai"));
   assert.ok(recent.some(row => row.role === "developer"));
   assert.doesNotMatch(prompt, /INTERNAL_FAILURE_NOT_ADVICE|OMITTED_ADVICE/);
@@ -1658,6 +1761,27 @@ test("verified review rework invalidates approval and retains the verified snaps
   assert.equal((await deployTest(projectRoot, "REQ-001")).state, "test_deployed");
 });
 
+test("failed checks retain partial acceptance evidence and cannot prove a later source version", async t => {
+  const {projectRoot,project}=await analysisFixture(t,[['return left * right;','return left + right;'],
+    ['  analysis.changes =',`analysis.verification.forEach(item=>item.checks=[
+      {checkIndex:0,kind:"technical",coverage:"模块语法"},{checkIndex:1,kind:"behavior",coverage:"乘法结果断言"},
+      {checkIndex:2,kind:"technical",coverage:"后续技术条件"}]);\n  analysis.changes =`]],
+    {checks:[[process.execPath,"--check","src/calculator.mjs"],[process.execPath,"--test","test/calculator.test.mjs"],
+      [process.execPath,"-e","console.log('later check')"]]});
+  await plan(projectRoot,"REQ-001");await approvePlan(projectRoot,"REQ-001","reviewer");await implement(projectRoot,"REQ-001");
+  await assert.rejects(verify(projectRoot,"REQ-001"),/Check failed/);
+  const actor={id:"reviewer",roles:["developer"]};
+  const detail=await getRequirementEvidence(projectRoot,actor,"REQ-001");
+  const checks=detail.verificationAttempts[0].evidence.items[0].checks;
+  assert.deepEqual(checks.map(item=>item.status),["passed","failed","not_run"]);
+  assert.equal(checks[2].result,null);assert.equal(detail.humanAcceptance,null);
+  const source=path.join(detail.meta.workspace,"src/calculator.mjs");
+  await fs.appendFile(source,"\n// Changed after failed verification\n");
+  assert.equal((await getRequirementEvidence(projectRoot,actor,"REQ-001")).verificationAttempts[0].current,false);
+  await fs.appendFile(checks[1].result.logFile,"Altered failed evidence");
+  await assert.rejects(getRequirementEvidence(projectRoot,actor,"REQ-001"),/Verification evidence log changed/);
+});
+
 test("verification repair retains failed evidence and uses distinct logs through test archive", async t => {
   const { projectRoot, project } = await analysisFixture(t, [['return left * right;', 'return left + right;']]);
   await plan(projectRoot, "REQ-001");
@@ -1666,7 +1790,7 @@ test("verification repair retains failed evidence and uses distinct logs through
   await assert.rejects(verify(projectRoot, "REQ-001"), /failed/);
   const failed = await readTask(project, "REQ-001");
   const firstLog = await fs.readFile(path.join(failed.directory, "check-1.log"), "utf8");
-  await assert.rejects(acceptTest(projectRoot, "REQ-001", "reviewer", "Skip failed tests", "manual"), /expected verified/);
+  await assert.rejects(acceptTest(projectRoot, "REQ-001", "reviewer", "Skip failed tests", "manual", calculatorAcceptance), /expected verified/);
   assert.equal((await readTask(project, "REQ-001")).meta.state, "verification_failed");
   const script = await fs.readFile(project.config.piExecutable, "utf8");
   const repair = 'if (phase === "implement") { const filename = path.join(process.cwd(), "src/calculator.mjs"); await fs.writeFile(filename, (await fs.readFile(filename, "utf8")).replace("export function multiply(left, right) {\\n  return left + right;", "export function multiply(left, right) {\\n  return left * right;")); }\n';
@@ -1680,15 +1804,38 @@ test("verification repair retains failed evidence and uses distinct logs through
   const repaired = await readTask(project, "REQ-001");
   assert.equal(repaired.meta.verificationAttempt, 2);
   assert.match(repaired.meta.checks[0].logFile, /verification-attempt-2-check-1.log$/);
+  const verificationHistory = await getRequirementEvidence(projectRoot, {id:"reviewer",roles:["developer"]}, "REQ-001");
+  assert.equal(verificationHistory.verificationAttempts.length, 2);
+  assert.deepEqual(verificationHistory.verificationAttempts.map(attempt=>attempt.evidence.items[0].checks[0].status), ["failed","passed"]);
+  assert.equal(verificationHistory.verificationAttempts[0].current, false);
+  assert.equal(verificationHistory.verificationAttempts[1].current, true);
   const evidence = await getRequirementEvidence(projectRoot, { id: "reviewer", roles: ["developer"] }, "REQ-001");
   assert.equal(evidence.implementationAttempts.length, 1);
   assert.match(await fs.readFile(path.join(evidence.implementationAttempts[0].retained, "after/src/calculator.mjs"), "utf8"), /return left \+ right/);
   await approveChanges(projectRoot, "REQ-001", "reviewer", "Reviewed exact repair and passing regression.");
   await deployTest(projectRoot, "REQ-001");
-  await acceptTest(projectRoot, "REQ-001", "reviewer", "Verified multiplication and existing addition.", "deployed");
+  await acceptTest(projectRoot, "REQ-001", "reviewer", "Verified multiplication and existing addition.", "deployed", calculatorAcceptance);
   await verifyCandidate(projectRoot, "REQ-001");
   await archiveTestOnly(projectRoot, "REQ-001", "reviewer", "Test-only delivery accepted; no production release.");
   assert.equal((await readTask(project, "REQ-001")).events.filter(row => row.type === "verification_failed").length, 1);
+  const archivedAuditHead = (await readTask(project, "REQ-001")).lastHash;
+  const moved = path.join(path.dirname(projectRoot), "persistent-project");
+  const preserved = path.join(path.dirname(projectRoot), "original-project");
+  await fs.cp(projectRoot, moved, { recursive: true, errorOnExist: true, force: false });
+  await fs.rename(projectRoot, preserved);
+  await assert.rejects(fs.access(projectRoot), { code: "ENOENT" });
+  const relocated = await getRequirementEvidence(moved, { id: "reviewer", roles: ["developer"] }, "REQ-001");
+  assert.equal(relocated.auditHead, archivedAuditHead);
+  assert.equal(relocated.implementationAttempts.length, 1);
+  assert.equal(relocated.verificationAttempts[1].current, true);
+  assert.equal((await getChangedFile(moved, { id: "reviewer", roles: ["developer"] }, "REQ-001", "src/calculator.mjs")).file, "src/calculator.mjs");
+  const archived = await readTask(await loadProject(moved), "REQ-001");
+  const analysis = JSON.parse(await fs.readFile(path.join(archived.directory, "plan-analysis-v1.json"), "utf8"));
+  const session = path.join(archived.directory, path.basename(analysis.developerSession.file));
+  const external = path.join(path.dirname(projectRoot), "external-session.jsonl");
+  await fs.rename(session, external);
+  await fs.symlink(external, session);
+  await assert.rejects(getRequirementEvidence(moved, { id: "reviewer", roles: ["developer"] }, "REQ-001"), /developer session changed/);
 });
 
 test("implementation passes the exact approved files to the Pi tool guard", async (t) => {
@@ -1768,7 +1915,8 @@ test("human plan confirmation and a chosen deployment deliver the changed versio
   assert.deepEqual(await (await fetch(url)).json(), { add: 5, multiply: 6 });
   assert.equal(await fs.readFile(path.join(projectRoot, "src/calculator.mjs"), "utf8"), source);
   assert.equal(task.events.some(event => event.type === "changes_approved"), false);
-  await executeRequirementAction(projectRoot, "REQ-001", { action: "accept-test", acceptanceMode: "deployed", evidence: "HTTP preview confirms 2×3=6 and existing addition=5." },
+  await executeRequirementAction(projectRoot, "REQ-001", { action: "accept-test", acceptanceMode: "deployed", acceptanceResults: calculatorAcceptance,
+    expectedPlanHash: task.meta.planHash, expectedAfterHash: task.meta.afterHash, evidence: "HTTP preview confirms 2×3=6 and existing addition=5." },
     { id: "product", roles: ["product"] });
   assert.equal((await readTask(project, "REQ-001")).meta.state, "archived_test_only");
 });
@@ -2207,6 +2355,9 @@ test("implementation receives the exact approved design and preserves it through
     assert.deepEqual(sent, policy.authoritativeContext.design);
     assert.match(sent.backend, /现有计算器模块/);
     assert.equal(sent.components[0].file, "src/calculator.mjs");
+    assert.match(prompt, /source investigation, modification locations, implementation choices and validation contract have already been reviewed/);
+    assert.match(prompt, /Do not repeat repository exploration, redesign the solution or search for another test framework/);
+    assert.match(prompt, /concrete source mismatch, missing implementation evidence or relevant check failure/);
     const paths = JSON.parse(prompt.match(/Controller-verified approved path status: ([^\\n]+?)\\. Paths marked/)[1]);
     assert.deepEqual(paths, [{file:"src/calculator.mjs",existsInWorkspace:true},{file:"test/calculator.test.mjs",existsInWorkspace:true}]);
   }
@@ -2418,7 +2569,7 @@ test("Docker sandbox configuration reaches every project check phase", async (t)
     assert.deepEqual(verified.checks.map((check) => check.sandboxImage), [image]);
     await approveChanges(projectRoot, "REQ-001", "reviewer", "Reviewed the changed files and regression tests.");
     await deployTest(projectRoot, "REQ-001");
-    await acceptTest(projectRoot, "REQ-001", "developer", "Confirmed multiplication and addition.", "deployed");
+    await acceptTest(projectRoot, "REQ-001", "developer", "Confirmed multiplication and addition.", "deployed", calculatorAcceptance);
     const candidate = await verifyCandidate(projectRoot, "REQ-001");
     assert.deepEqual(candidate.mergeChecks.map((check) => check.sandboxImage), [image]);
     const events = (await readTask(project, "REQ-001")).events;
@@ -2580,7 +2731,7 @@ test("approved plan gates implementation, verification, acceptance and rollback"
     await fs.writeFile(changedFile, approvedSource);
     const deployed = await deployTest(projectRoot, "REQ-001");
     assert.equal(deployed.state, "test_deployed");
-    const accepted = await acceptTest(projectRoot, "REQ-001", "developer", "2 × 3 = 6; 2 + 3 = 5.", "deployed");
+    const accepted = await acceptTest(projectRoot, "REQ-001", "developer", "2 × 3 = 6; 2 + 3 = 5.", "deployed", calculatorAcceptance);
     assert.equal(accepted.state, "test_accepted");
     const original = await fs.readFile(path.join(implemented.workspace, "src", "calculator.mjs"), "utf8");
     assert.match(original, /multiply/);
@@ -2786,7 +2937,7 @@ for (const unknownPricing of [false, true]) test(`test-only archive preserves ve
     await verify(projectRoot, "REQ-001");
     await approveChanges(projectRoot, "REQ-001", "reviewer", "Reviewed exact verified changes before testing.");
     await deployTest(projectRoot, "REQ-001");
-    await acceptTest(projectRoot, "REQ-001", "developer", "Manual smoke check passed.", "deployed");
+    await acceptTest(projectRoot, "REQ-001", "developer", "Manual smoke check passed.", "deployed", calculatorAcceptance);
     assert.equal((await searchProjectHistory(project, { query: "multiplication", reason: "existing_feature" })).results.length, 0,
       "Unarchived and unaccepted work must not be retrieved as long-term delivery evidence");
     assert.equal((await verifyCandidate(projectRoot, "REQ-001")).state, "merge_verified");
@@ -2845,7 +2996,7 @@ test("release requires separate approval and observation", async () => {
     await verify(projectRoot, "REQ-001");
     await approveChanges(projectRoot, "REQ-001", "reviewer", "Reviewed exact verified changes before testing.");
     await deployTest(projectRoot, "REQ-001");
-    await acceptTest(projectRoot, "REQ-001", "developer", "Manual acceptance passed.", "deployed");
+    await acceptTest(projectRoot, "REQ-001", "developer", "Manual acceptance passed.", "deployed", calculatorAcceptance);
     await verifyCandidate(projectRoot, "REQ-001");
     await assert.rejects(release(projectRoot, "REQ-001"), /expected release_approved/);
     const mergeLog = path.join(project.archive, "tasks", "REQ-001", "merge-check-1.log");
@@ -2888,7 +3039,7 @@ test("custom release adapter retains separate approval and polls the approved ca
   await plan(projectRoot, "REQ-001");
   await approvePlan(projectRoot, "REQ-001", "reviewer");
   await implement(projectRoot, "REQ-001"); await verify(projectRoot, "REQ-001");
-  await deployTest(projectRoot, "REQ-001"); await acceptTest(projectRoot, "REQ-001", "developer", "Fixture acceptance", "deployed");
+  await deployTest(projectRoot, "REQ-001"); await acceptTest(projectRoot, "REQ-001", "developer", "Fixture acceptance", "deployed", calculatorAcceptance);
   candidate = await verifyCandidate(projectRoot, "REQ-001");
   await assert.rejects(release(projectRoot, "REQ-001"), /expected release_approved/);
   assert.equal(submissions, 0);
@@ -2908,7 +3059,7 @@ test("release approval and execution reject candidate drift", async () => {
     await verify(projectRoot, "REQ-001");
     await approveChanges(projectRoot, "REQ-001", "reviewer", "Reviewed exact verified changes before testing.");
     await deployTest(projectRoot, "REQ-001");
-    await acceptTest(projectRoot, "REQ-001", "developer", "Manual smoke check passed.", "deployed");
+    await acceptTest(projectRoot, "REQ-001", "developer", "Manual smoke check passed.", "deployed", calculatorAcceptance);
     const candidate = await verifyCandidate(projectRoot, "REQ-001");
     const source = path.join(candidate.candidateWorkspace, "src", "calculator.mjs");
     const verified = await fs.readFile(source, "utf8");
@@ -2935,7 +3086,7 @@ test("production command failure never reports a successful release", async () =
     await verify(projectRoot, "REQ-001");
     await approveChanges(projectRoot, "REQ-001", "reviewer", "Reviewed exact verified changes before testing.");
     await deployTest(projectRoot, "REQ-001");
-    await acceptTest(projectRoot, "REQ-001", "developer", "Checked multiplication and addition.", "deployed");
+    await acceptTest(projectRoot, "REQ-001", "developer", "Checked multiplication and addition.", "deployed", calculatorAcceptance);
     await verifyCandidate(projectRoot, "REQ-001");
     await approveRelease(projectRoot, "REQ-001", "owner");
     await assert.rejects(release(projectRoot, "REQ-001"), /Local test deployment failed/);

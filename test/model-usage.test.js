@@ -281,6 +281,36 @@ console.log(JSON.stringify({type:'agent_settled'}));`);
   assert.equal(result.telemetry.sourceEvidence.reused.length, 1);
 });
 
+test("approved Vue locations supply one merged target excerpt without an unrelated file header", async t => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-approved-vue-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  await fs.writeFile(path.join(directory, "Editor.vue"), "// UNRELATED_HEADER\n".repeat(900)
+    + '<el-input v-model="search"></el-input>\ncomputed: {\n  filteredSavedForms() {\n'
+    + "    const keyword = this.search;\n    return this.forms.filter(form => form.name.includes(keyword));\n  }\n}\n"
+    + "// UNRELATED_TAIL\n".repeat(900));
+  const executable = path.join(directory, "pi.mjs");
+  await fs.writeFile(executable, `import {promises as fs} from 'node:fs';
+await fs.writeFile('prompt.txt',process.argv.at(-1));
+console.log(JSON.stringify({type:'message_end',message:{role:'assistant',content:[{type:'text',text:'done'}],stopReason:'stop',usage:{input:1,output:1,cacheRead:0,cacheWrite:0,cost:{total:0}}}}));
+console.log(JSON.stringify({type:'agent_settled'}));`);
+  const project = { config: { piExecutable: executable, provider: "fake", model: "fake", mode: "local",
+    environment: { pi: [] }, allowedPaths: ["."], excludedPaths: [], maxPiMs: 3000, maxToolCalls: 10, maxEventBytes: 10000 } };
+  const result = await runPi(project, directory, "implement", "Execute approved search changes", path.join(directory, "events.jsonl"),
+    1, null, [], { maxTokens: 100, approvedFiles: ["Editor.vue"], researchRequests: 1,
+      sourceQuery: "Editor.vue:901; Editor.vue:903-906; filteredSavedForms" });
+  const prompt = await fs.readFile(path.join(directory, "prompt.txt"), "utf8");
+  assert.match(prompt, /901: <el-input/);
+  assert.match(prompt, /903:   filteredSavedForms\(\)/);
+  assert.equal(prompt.match(/904:     const keyword/g).length, 1);
+  assert.doesNotMatch(prompt, /1: \/\/ UNRELATED_HEADER/);
+  assert.equal(result.telemetry.sourceEvidence.focusedFiles.length, 1);
+  assert.ok(result.telemetry.sourceEvidence.selectedBytes < 1000);
+  const unlocated = await runPi(project, directory, "implement", "Execute approved search changes", path.join(directory, "unlocated.jsonl"),
+    1, null, [], { maxTokens: 100, approvedFiles: ["Editor.vue"], researchRequests: 1, sourceQuery: "Modify search behavior" });
+  assert.equal(unlocated.telemetry.sourceEvidence.focusedFiles.length, 0);
+  assert.doesNotMatch(await fs.readFile(path.join(directory, "prompt.txt"), "utf8"), /UNRELATED_HEADER/);
+});
+
 test("local repair focuses diagnosed symbols instead of sending the entire large file", async t => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "reqflow-focused-repair-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));

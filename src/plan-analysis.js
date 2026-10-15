@@ -23,8 +23,10 @@ export async function readPlanMaterial(project, id, input) {
       && event.meta.planAttempts === task.meta.planAttempts);
     if (task.meta.state !== "contract_confirmed" || !checkpoint || checkpoint.detail.analysisHash !== input.planHash)
       throw new Error("Plan material version changed; reload the current plan");
-    if (path.dirname(checkpoint.detail.draftFile) !== task.directory) throw new Error("Plan draft material belongs to another requirement");
-    const draft = JSON.parse(await fs.readFile(checkpoint.detail.draftFile, "utf8"));
+    const file = path.join(task.directory, path.basename(checkpoint.detail.draftFile));
+    if (path.basename(path.dirname(checkpoint.detail.draftFile)) !== path.basename(task.directory)
+        || path.dirname(await fs.realpath(file)) !== await fs.realpath(task.directory)) throw new Error("Plan draft material belongs to another requirement");
+    const draft = JSON.parse(await fs.readFile(file, "utf8"));
     if (sha256(JSON.stringify(draft)) !== input.planHash || draft.contractHash !== task.meta.contractHash)
       throw new Error("Plan draft material changed");
     analysis = { draft, specialists: task.events.filter(event => event.type === "plan_specialist_completed"
@@ -78,9 +80,17 @@ export const planOutputSchema = { name: "delivery_plan", strict: true, schema: {
         type: "object", additionalProperties: false, required: ["status", "evidence"], properties: {
           status: { type: "string", enum: ["none", "changed", "unknown"] }, evidence: { type: "string", minLength: 1, maxLength: 1000 } } }])) },
     verification: { type: "array", minItems: 1, items: { type: "object", additionalProperties: false,
-      required: ["acceptanceId", "scenario", "regression"], properties: {
+      required: ["acceptanceId", "scenario", "regression", "checks", "manualSteps"], properties: {
         acceptanceId: { type: "string" }, scenario: { type: "string", minLength: 1, maxLength: 1000 },
-        regression: { type: "string", minLength: 1, maxLength: 1000 } } } },
+        regression: { type: "string", minLength: 1, maxLength: 1000 },
+        checks: { type: "array", items: { type: "object", additionalProperties: false,
+          required: ["checkIndex", "kind", "coverage"], properties: {
+            checkIndex: { type: "integer", minimum: 0, description: "Zero-based index in validation.checks." },
+            kind: { type: "string", enum: ["behavior", "technical"] },
+            coverage: { type: "string", minLength: 1, maxLength: 1000,
+              description: "Exact assertions/test locations or technical conditions proved; disclose coverage limits." } } } },
+        manualSteps: { type: "string", maxLength: 1000,
+          description: "Steps and expected results for uncovered behavior; required nonempty without behavior checks." } } } },
     validation: { type: "object", additionalProperties: false, required: ["checks", "skipped", "manualReason", "startup"], properties: {
       checks: { type: "array", items: { type: "object", additionalProperties: false,
         required: ["command", "reason"], properties: { command: { type: "array", minItems: 1, maxItems: 64, items: { type: "string", minLength: 1 } },
@@ -147,8 +157,8 @@ export function planAnalysisInput(value, contract, project, correction = null) {
       value.verification = original.verification.map(item => {
         const update = patch.verification[item.acceptanceId];
         if (update === null) return item;
-        if (!update || Object.keys(update).length !== 2 || !Object.hasOwn(update, "scenario") || !Object.hasOwn(update, "regression"))
-          throw new Error(`verification.${item.acceptanceId} 必须包含 scenario 和 regression，或为 null。`);
+        if (!update || Object.keys(update).sort().join() !== "checks,manualSteps,regression,scenario")
+          throw new Error(`verification.${item.acceptanceId} 必须包含 scenario、regression、checks 和 manualSteps，或为 null。`);
         return { acceptanceId: item.acceptanceId, ...update };
       });
     }
@@ -238,6 +248,22 @@ export function planAnalysisInput(value, contract, project, correction = null) {
   const selected = validation.checks.map(item => JSON.stringify(item.command));
   if (new Set(selected).size !== selected.length || validation.skipped.some(item => selected.includes(JSON.stringify(item.command))))
     throw new Error("检查不能重复，也不能同时标记执行和跳过。");
+  for (const item of value.verification) {
+    if (Object.keys(item).sort().join() !== "acceptanceId,checks,manualSteps,regression,scenario"
+        || !Array.isArray(item.checks) || typeof item.manualSteps !== "string" || item.manualSteps.length > 1000)
+      throw new Error(`验收 ${item.acceptanceId} 必须明确关联检查和人工验证步骤。`);
+    const indexes = new Set();
+    for (const link of item.checks) {
+      if (!link || Object.keys(link).sort().join() !== "checkIndex,coverage,kind"
+          || !Number.isSafeInteger(link.checkIndex) || link.checkIndex < 0 || link.checkIndex >= validation.checks.length
+          || indexes.has(link.checkIndex) || !["behavior", "technical"].includes(link.kind)
+          || typeof link.coverage !== "string" || !link.coverage.trim() || link.coverage.length > 1000)
+        throw new Error(`验收 ${item.acceptanceId} 的检查引用、覆盖依据或类型无效。`);
+      indexes.add(link.checkIndex);
+    }
+    if (!item.checks.some(link => link.kind === "behavior") && !item.manualSteps.trim())
+      throw new Error(`验收 ${item.acceptanceId} 缺少业务断言检查，必须提供人工验证步骤。`);
+  }
   admissionInput(value.boundaries, value.affectedFiles);
   if (value.schemaVersion === 2) validateDesign(value);
   if (correction !== null) {
@@ -256,7 +282,7 @@ export function planAnalysisInput(value, contract, project, correction = null) {
     `## 需求与验收\n${contract.objective}\n${contract.acceptance.map(item => `- ${item.id}：${item.text}`).join("\n")}`,
     ...(value.schemaVersion === 2 ? [designMarkdown(value)] : []),
     `## 拟改位置与做法\n${value.schemaVersion === 2 ? `本次允许修改 ${value.affectedFiles.length} 个文件，具体位置与改法见上文“修改位置与关键逻辑”。` : value.changes.map(item => `- ${item.file}：${item.description}`).join("\n")}`,
-    `## 验证\n${value.verification.map(item => `- ${item.acceptanceId}：${item.scenario}；回归：${item.regression}`).join("\n")}\n\n自动检查（仅影响范围）：\n${validation.checks.map(item => `- ${JSON.stringify(item.command)}：${item.reason}`).join("\n") || `无；人工验证：${validation.manualReason}`}\n\n跳过检查：\n${validation.skipped.map(item => `- ${JSON.stringify(item.command)}：${item.reason}`).join("\n") || "无"}\n\n本地启动：\n${validation.startup.map(item => `- ${item.name}：${JSON.stringify(item.command)}；健康检查 ${item.healthUrl}；应用入口 ${item.applicationUrl ?? "无页面"}`).join("\n") || "此项目没有常驻本地服务；按验收场景人工验证或发布测试环境。"}`,
+    `## 验证\n${value.verification.map(item => `- ${item.acceptanceId}：${item.scenario}；回归：${item.regression}\n${item.checks.map(link => `  - 检查 ${link.checkIndex + 1}（${link.kind === "behavior" ? "业务断言" : "技术检查"}）：${link.coverage}`).join("\n")}\n  - 人工验证：${item.manualSteps || "自动检查覆盖范围仍须由验收人核对"}`).join("\n")}\n\n自动检查（仅影响范围）：\n${validation.checks.map((item, index) => `- 检查 ${index + 1} ${JSON.stringify(item.command)}：${item.reason}`).join("\n") || `无；人工验证：${validation.manualReason}`}\n\n跳过检查：\n${validation.skipped.map(item => `- ${JSON.stringify(item.command)}：${item.reason}`).join("\n") || "无"}\n\n本地启动：\n${validation.startup.map(item => `- ${item.name}：${JSON.stringify(item.command)}；健康检查 ${item.healthUrl}；应用入口 ${item.applicationUrl ?? "无页面"}`).join("\n") || "此项目没有常驻本地服务；按验收场景人工验证或发布测试环境。"}`,
     `## 风险与回退\n${["existingBehavior", "interfaces", "data"].map((kind, index) => `- ${["历史功能", "接口", "数据"][index]}（${value.impacts[kind].status}）：${value.impacts[kind].evidence}`).join("\n")}\n- 外部影响（${value.boundaries.externalEffects.status}）：${value.boundaries.externalEffects.evidence}\n- 恢复：${value.boundaries.recovery.evidence}`,
     `## 待确认\n${value.openQuestions.length ? value.openQuestions.map(question => `- ${question}`).join("\n") : "无"}`,
   ].join("\n\n");
@@ -265,6 +291,33 @@ export function planAnalysisInput(value, contract, project, correction = null) {
     throw new Error("Plan document must match its structured analysis and required sections");
   }
   return { ...value, markdown };
+}
+
+export function verificationEvidence(analysis, meta, results, sourceHash, sourceUnchanged, startedCheck, interruption) {
+  return { contractHash: meta.contractHash, planHash: meta.planHash, sourceHash, sourceUnchanged,
+    items: analysis.verification.map(item => ({ acceptanceId: item.acceptanceId, scenario: item.scenario,
+      regression: item.regression, manualSteps: item.manualSteps,
+      checks: item.checks.map(link => {
+        const result = results[link.checkIndex];
+        return { ...link, command: analysis.validation.checks[link.checkIndex].command,
+          status: result ? (result.code === 0 && result.signal === null ? "passed" : "failed")
+            : link.checkIndex === startedCheck ? "interrupted" : "not_run",
+          result: result ?? null,
+          interruption: !result && link.checkIndex === startedCheck ? interruption : null };
+      }) })) };
+}
+
+export function acceptanceInput(results, contract) {
+  if (!Array.isArray(results) || results.length !== contract.acceptance.length
+      || new Set(results.map(item => item?.acceptanceId)).size !== results.length
+      || contract.acceptance.some(item => !results.some(result => result?.acceptanceId === item.id)))
+    throw new Error("人工验收结论必须逐项覆盖当前冻结需求，不能遗漏、重复或新增验收编号。");
+  for (const item of results) {
+    if (Object.keys(item).sort().join() !== "acceptanceId,conclusion" || typeof item.conclusion !== "string"
+        || !item.conclusion.trim() || item.conclusion.length > 1000)
+      throw new Error(`验收 ${item.acceptanceId} 必须提供具体人工结论，最多1000字。`);
+  }
+  return results;
 }
 
 export function planSpecialists(analysis, reviewPolicy) {
@@ -285,7 +338,10 @@ export async function reviewPlanAnalysis(project, id, meta, directory, workspace
       && event.detail.findings.analysisHash === analysisHash);
     if (previous) {
       const { file, hash, findings } = previous.detail;
-      if (path.dirname(file) !== directory || sha256(await fs.readFile(file)) !== sha256(`${JSON.stringify(findings, null, 2)}\n`)
+      const archivedFile = path.join(directory, path.basename(file));
+      if (path.basename(path.dirname(file)) !== path.basename(directory)
+          || path.dirname(await fs.realpath(archivedFile)) !== await fs.realpath(directory)
+          || sha256(await fs.readFile(archivedFile)) !== sha256(`${JSON.stringify(findings, null, 2)}\n`)
           || hash !== sha256(JSON.stringify(findings)) || findings.role !== role
           || findings.contractHash !== meta.contractHash || findings.analysisHash !== analysisHash) {
         throw new Error("Plan specialist checkpoint changed");
@@ -332,7 +388,7 @@ export async function reviewPlanAnalysis(project, id, meta, directory, workspace
       const allowance = modelAllowance((await readTask(project, id)).events, admissionPolicy(project.config));
       const outputContract = "\n输出顶层必须是单个对象，禁止数组。对象格式：{\"findings\":[]}。仅返回 findings；角色、需求和方案的身份由系统绑定，不要输出哈希。\n评审对象是方案是否可以实施，不是尚未编写的实现是否已经完美。方案已明确的验收和验证不要再次列为遗漏；实现顺序、变量命名、同等正确的写法属于实现指导，标 advisory。只有能够引用冻结需求与方案中明确矛盾、不可恢复的风险或缺少必要业务决策时才阻断。假设未来可能写错、要求把已有验收再写一遍，不构成 blocking。";
       const testInstructions = "\n你是唯一的独立审查 Agent，统一检查受影响的前端、后端、接口、数据恢复与测试，不再拆成多个角色反复调查。逐项核对冻结验收、必要异常边界和历史功能回归，确认真实可执行的验证路径。所有validation命令从仓库根目录运行，直接读取对应package.json/pom.xml和服务配置：子目录脚本须保留目录参数，Maven的-pl不能代替-f，startup.healthUrl须匹配真实端口和健康路径，applicationUrl须为实际应用入口（无页面为null），前端代理须对应后端地址。已存在且未计划修改的脚本或配置与启动约定明确矛盾时属于不可验证，应blocking并给出最小命令修正；不要要求增加根目录代理脚本来迁就错误命令。只读审查，核实源码；不得重新设计、扩大业务范围或宣称测试已执行。";
-      const convergenceInstructions = "\n只阻断真实无法安全实现或验收的矛盾、缺失业务决定和不可恢复风险。已确定需求内的ID重映射、文件唯一命名、过期提示、按原项目规范处理关联等普通技术细节，先核实源码后直接给最简建议，标advisory并指导Pi实现，不要求研发逐项再次确认。发现与当前方案明确相矛盾的删除范围、未受控数据改动或真实遗漏交付入口时仍应blocking，不能为了少提问隐去问题。不要把同一个问题变换措辞再开一轮。";
+      const convergenceInstructions = "\n逐项核对verification.checks引用的命令、coverage描述与实际或计划新增断言；构建、语法与类型检查只能标technical，不能标behavior。没有业务断言覆盖或存在未覆盖行为时，核对manualSteps是否包含操作和预期结果；不要把命令退出成功当成业务已验证。\n只阻断真实无法安全实现或验收的矛盾、缺失业务决定和不可恢复风险。已确定需求内的ID重映射、文件唯一命名、过期提示、按原项目规范处理关联等普通技术细节，先核实源码后直接给最简建议，标advisory并指导Pi实现，不要求研发逐项再次确认。发现与当前方案明确相矛盾的删除范围、未受控数据改动或真实遗漏交付入口时仍应blocking，不能为了少提问隐去问题。不要把同一个问题变换措辞再开一轮。";
       const materialInstructions = `\n这份交接包保留完整冻结需求、验收、接口契约与风险，只发送职责相关的设计正文。deferredSections 中的原文未发送，不能把省略误判为遗漏；检查依赖这些内容时必须通过 read_plan 读取 planHash=${analysisHash} 的对应章节，按偏移读取必要范围。其他 Agent 的判断不作为源码事实或你的评审依据。复用附带的哈希校验源码，未覆盖的调用方、实体或回归按需定位。`;
       run = await runPi(project, workspace, "review", prompt + testInstructions + outputContract + convergenceInstructions + materialInstructions, logFile, remaining, role, [], {
         outputSchema: { name: "plan_specialist", strict: true, schema: {
@@ -396,9 +452,12 @@ export async function readPlanAnalysis(meta, directory) {
       || JSON.stringify(analysis.draft.affectedFiles) !== JSON.stringify(proposedFiles)
       || JSON.stringify(analysis.blockers) !== JSON.stringify(meta.planBlockers)) throw new Error("Plan analysis changed or no longer matches the requirement and baseline");
   planSpecialists(analysis.draft, analysis.reviewPolicy);
-  if (!analysis.developerSession || path.dirname(analysis.developerSession.file) !== directory
+  if (!analysis.developerSession || typeof analysis.developerSession.file !== "string"
+      || path.basename(path.dirname(analysis.developerSession.file)) !== path.basename(directory)
       || !/^[a-f0-9]{64}$/.test(analysis.developerSession.hash)) throw new Error("Plan requires a bound developer session");
-  if (sha256(await fs.readFile(analysis.developerSession.file)) !== analysis.developerSession.hash) throw new Error("Plan developer session changed");
+  const sessionFile = path.join(directory, path.basename(analysis.developerSession.file));
+  if (path.dirname(await fs.realpath(sessionFile)) !== await fs.realpath(directory)
+      || sha256(await fs.readFile(sessionFile)) !== analysis.developerSession.hash) throw new Error("Plan developer session changed");
   const contract = JSON.parse(await fs.readFile(path.join(directory, `contract-v${meta.contractVersion}.json`), "utf8"));
   if (sha256(JSON.stringify(contract)) !== meta.contractHash) throw new Error("Confirmed contract changed after planning");
   validateAdmissionPolicy(analysis.admissionPolicy);
@@ -409,8 +468,10 @@ export async function readPlanAnalysis(meta, directory) {
       || JSON.stringify(analysis.admission) !== JSON.stringify(meta.admission)) throw new Error("Plan specialist or admission evidence is incomplete");
   const draftHash = sha256(JSON.stringify(analysis.draft));
   for (const row of analysis.specialists) {
-    if (path.dirname(row.file) !== directory) throw new Error("Specialist evidence must be archived in this requirement");
-    const evidence = JSON.parse(await fs.readFile(row.file, "utf8"));
+    const file = path.join(directory, path.basename(row.file));
+    if (path.basename(path.dirname(row.file)) !== path.basename(directory)
+        || path.dirname(await fs.realpath(file)) !== await fs.realpath(directory)) throw new Error("Specialist evidence must be archived in this requirement");
+    const evidence = JSON.parse(await fs.readFile(file, "utf8"));
     if (sha256(JSON.stringify(evidence)) !== row.hash || JSON.stringify(evidence) !== JSON.stringify(row.findings)
         || evidence.role !== row.role || evidence.contractHash !== meta.contractHash
         || evidence.analysisHash !== draftHash) throw new Error("Plan specialist evidence changed");

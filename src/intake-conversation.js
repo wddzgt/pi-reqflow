@@ -11,7 +11,7 @@ import { persistImages, readImage, validateImages } from "./intake-images.js";
 import { admissionPolicy, modelAllowance } from "./admission.js";
 
 const editableStates = ["intake_draft", "intake_clarifying", "intake_ready"];
-const intakePolicyVersion = 5;
+const intakePolicyVersion = 6;
 
 export function intakeDiscussion(task) {
   const messages = task.events.filter((event) => ["intake_draft", "intake_message", "intake_analysis_completed", "intake_analysis_failed"].includes(event.type))
@@ -21,8 +21,9 @@ export function intakeDiscussion(task) {
 }
 
 export async function addIntakeMessage(projectPath, id, actor, input) {
-  if (!input || typeof input.text !== "string" || !input.text.trim() || Buffer.byteLength(input.text) > 16000) throw new Error("Product message must contain 1–16,000 bytes");
+  if (!input || typeof input.text !== "string" || Buffer.byteLength(input.text) > 16000) throw new Error("Product message text must be a string of at most 16,000 bytes");
   const images = validateImages(input.images === undefined ? [] : input.images);
+  if (!input.text.trim() && !images.length) throw new Error("Product message needs text or an image");
   if (input.candidate !== undefined) contractInput(input.candidate, { questions: [] });
   const project = await loadProject(projectPath);
   return withLock(path.join(taskPath(project, id), "task.lock"), async () => {
@@ -50,7 +51,7 @@ export async function addIntakeMessage(projectPath, id, actor, input) {
   });
 }
 
-export function analysisInput(value, inputHash, sourceFiles) {
+export function analysisInput(value, inputHash, sourceFiles, sourceEventHashes) {
   if (!value || value.schemaVersion !== 1 || value.inputHash !== inputHash
       || !["needs_clarification", "ready"].includes(value.status)) throw new Error("AI analysis did not reference the current discussion version");
   for (const key of ["reply", "summary"]) {
@@ -61,13 +62,47 @@ export function analysisInput(value, inputHash, sourceFiles) {
   if (!Array.isArray(value.questions) || value.questions.length > 6
       || value.questions.some((item) => typeof item.text !== "string" || item.text.length > 500)) throw new Error("AI questions must be concise");
   feedbackInput(value);
-  const visibleText = [value.reply, value.summary, ...value.suggestions, ...value.questions.map((item) => item.text)].join("\n");
+  if (!Array.isArray(value.decisions) || value.decisions.length > 32 || !Array.isArray(value.deferredQuestions)
+      || value.deferredQuestions.length > 12 || !Array.isArray(sourceEventHashes))
+    throw new Error("需求澄清必须保存决定依据与后续问题。");
+  const decisions = new Set();
+  for (const item of value.decisions) {
+    if (!item || Object.keys(item).sort().join() !== "id,sourceEventHash,text" || !/^D[1-9]\d*$/.test(item.id)
+        || decisions.has(item.id) || !sourceEventHashes.includes(item.sourceEventHash)
+        || typeof item.text !== "string" || !item.text.trim() || item.text.length > 500)
+      throw new Error("业务决定必须唯一并引用当前需求的产品原文证据。");
+    decisions.add(item.id);
+  }
+  const questions = [...value.questions, ...value.deferredQuestions];
+  const questionIds = new Set(questions.map(item => item?.id));
+  if (questionIds.size !== questions.length) throw new Error("当前与后续问题的编号不能重复。");
+  for (const item of questions) {
+    if (!item || Object.keys(item).sort().join() !== "dependsOn,id,recommendation,text" || !/^Q[1-9]\d*$/.test(item.id)
+        || typeof item.text !== "string" || !item.text.trim() || item.text.length > 500
+        || typeof item.recommendation !== "string" || !item.recommendation.trim() || item.recommendation.length > 500
+        || !Array.isArray(item.dependsOn) || new Set(item.dependsOn).size !== item.dependsOn.length
+        || item.dependsOn.some(id => id === item.id || (!decisions.has(id) && !questionIds.has(id))))
+      throw new Error("澄清问题必须提供有效依赖及业务建议。");
+    const unresolved = item.dependsOn.some(id => questionIds.has(id));
+    if (value.questions.includes(item) ? unresolved : !unresolved)
+      throw new Error("只询问前置决定已明确的问题；依赖未决问题的事项必须留到后续。");
+  }
+  const settled = new Set(decisions);
+  let pending = questions;
+  while (pending.length) {
+    const ready = pending.filter(item => item.dependsOn.every(id => settled.has(id)));
+    if (!ready.length) throw new Error("澄清问题依赖不能形成循环。");
+    ready.forEach(item => settled.add(item.id));
+    pending = pending.filter(item => !settled.has(item.id));
+  }
+  const visibleText = [value.reply, value.summary, ...value.suggestions, ...value.decisions.map(item => item.text),
+    ...questions.flatMap(item => [item.text, item.recommendation])].join("\n");
   if (/`|\b(?:GET|POST|PUT|PATCH|DELETE)\s+\/\S/.test(visibleText)
       || sourceFiles.some((file) => visibleText.includes(file))) {
     throw new Error("AI product communication must explain business behavior instead of source files, code or HTTP definitions");
   }
   if (value.status === "ready") {
-    if (value.questions.length) throw new Error("AI cannot declare agreement with unresolved questions");
+    if (value.questions.length || value.deferredQuestions.length) throw new Error("AI cannot declare agreement with unresolved questions");
     contractInput(value.contract, value, { sourceFiles });
     if (!value.contract.inScope.length) throw new Error("AI agreement must define a nonempty requirement scope");
   } else if (!value.questions.length || value.contract !== null) {
@@ -90,7 +125,8 @@ async function analysisContext(project, task, baseline) {
       eventHash: row.eventHash, partial: row.text.length > 2000,
       images: row.attachments, withdrawnImageIds: row.withdrawnImageIds }
       : { role: "ai_developer", reply: row.analysis.reply, questions: row.analysis.questions,
-         summary: row.analysis.summary, suggestions: row.analysis.suggestions });
+          summary: row.analysis.summary, suggestions: row.analysis.suggestions,
+          decisions: row.analysis.decisions, deferredQuestions: row.analysis.deferredQuestions });
   const candidate = humanMessages.at(-1)?.candidate ?? null;
   const inputHash = sha256(JSON.stringify({ policyVersion: intakePolicyVersion, requestHash: task.meta.requestHash, revision: task.meta.intakeRevision,
     messages: discussion.messages.filter((row) => ["intake_draft", "intake_message"].includes(row.type)).map((row) => row.eventHash),
@@ -99,15 +135,23 @@ async function analysisContext(project, task, baseline) {
   const original = Buffer.byteLength(request) <= 8000 ? request : { preview: request.slice(0, 1500),
     eventHash: discussion.messages.find(row => row.type === "intake_draft").eventHash, partial: true,
     note: "Original request remains archived. Read omitted requirements with read_discussion before making assumptions." };
-  const context = JSON.stringify({ originalRequest: original, history, candidate, workingCandidate: checkpoint?.analysis.contract ?? null,
+  const context = { originalRequest: original, history, candidate, workingCandidate: checkpoint?.analysis.contract ?? null,
+    originalRequestEventHash: discussion.messages.find(row => row.type === "intake_draft").eventHash,
+    workingDecisions: latest?.analysis.decisions ?? null, deferredQuestions: latest?.analysis.deferredQuestions ?? null,
     ...(task.meta.acceptanceRework ? { priorConfirmedContract: JSON.parse(await fs.readFile(path.join(task.directory,
       `contract-v${task.meta.contractVersion}.json`), "utf8")), currentSourceHash: baseline.sourceHash,
       instruction: "Reconcile acceptance feedback with the complete confirmed requirement; retain all prior scenarios unless the product explicitly changes them. Current workspace is implemented source, baseline navigation is historical." } : {}),
     earlierDiscussion: earlierMessages.map(row => ({ eventHash: row.eventHash, preview: row.text.slice(0, 60), partial: true })),
-    note: "Working candidates and AI summaries are short-term unconfirmed understanding. Latest product decisions prevail. Read exact original messages by eventHash when omitted details or contradictions matter." });
+    note: "Working candidates and AI summaries are short-term unconfirmed understanding. Latest product decisions prevail. Read exact original messages by eventHash when omitted details or contradictions matter." };
   const images = discussion.messages.flatMap((row) => row.attachments ?? []).filter((image) => !discussion.withdrawnImageIds.includes(image.id));
   if (images.length > 12 || images.reduce((sum, image) => sum + image.bytes, 0) > 8 * 1024 * 1024) throw new Error("Requirement exceeds its 12-image / 8 MiB context budget");
-  return { inputHash, context, candidate, images, guide: await baselineAgentContext(project, baseline, null, "index") };
+  const imageMessages = discussion.messages.filter(row => row.attachments?.length).map(row => ({ eventHash: row.eventHash,
+    text: row.type === "intake_draft" ? original : row.text.slice(0, 2000), textPartial: row.type === "intake_message" && row.text.length > 2000,
+    images: row.attachments.filter(image => !discussion.withdrawnImageIds.includes(image.id)).map(image => ({
+      id: image.id, name: image.name, hash: image.hash, inputPosition: images.findIndex(item => item.id === image.id) + 1 })) }));
+  return { inputHash, context: JSON.stringify({ ...context, imageMessages }), candidate, images,
+    sourceEventHashes: discussion.messages.filter(row => ["intake_draft", "intake_message"].includes(row.type)).map(row => row.eventHash),
+    guide: await baselineAgentContext(project, baseline, null, "index") };
 }
 
 export async function analyzeIntake(projectPath, id, actor) {
@@ -155,8 +199,9 @@ async function runAnalysis(project, id, actor, task, active, baseline, source, c
 输入版本哈希：${context.inputHash}
 按完整用户场景组织验收，${admissionPolicy(project.config).maxAcceptance} 条仅为规划参考值，不能为了数量合并不同场景、遗漏业务边界或隐藏超范围功能。
 ready仅表示需求理解已对齐，下一步由产品定版后进入研发方案分析；不表示方案已批准，不得向产品说可以开始实施或改代码。
-只返回JSON：schemaVersion=1,inputHash（上述哈希）,status=needs_clarification或ready,reply（向产品说明，最多600字）,summary（当前共识，最多600字）,suggestions（最多6条，每条一句）,questions（最多6个真正阻断理解的问题，格式{id:Q1,text}）,requiredRoles（frontend/backend/qa，必须含qa及至少一个研发角色）,contract。
-有未解决问题时status=needs_clarification，questions非空、contract=null。只有目标、现状、期望行为、验收和边界已明确，才能ready且questions=[]，contract={objective,currentBehavior,desiredBehavior,acceptance:[{id:AC1,text}],inScope:[本次包含的业务功能],outOfScope:[本次不包含的业务事项],answers:{}}。把所有已确认的关键业务决定完整写入这些最终字段；历史问答仅供回看，answers必须为空，不携带旧建议、被否决要求或讨论过程。验收用用户操作与业务结果表述，不用函数调用或接口定义。最终需求交给下一阶段，各研发Agent再独立定位代码和设计接口。不得把猜测包装成共识，无法看懂图片必须追问。`;
+按决定依赖组织每轮澄清。decisions=[{id:D1,text,sourceEventHash}]保留产品已经明确说明且本轮仍有效的业务选择，sourceEventHash只能引用originalRequestEventHash或产品消息eventHash；这是待产品最终定版的理解，不是新的批准。旧决定被最新产品修订否定时从当前decisions移除并重新核对受影响事项，旧原文继续留存。不能引用AI回复作为产品决定。questions只询问依赖已经解决的当前问题，dependsOn可引用已明确的D编号；依赖未决Q编号的事项放入deferredQuestions。回答后重新计算问题依赖，删除已回答或已取消的问题；不得把旧问题换个编号再次问。找源码事实是你的工作，先查证再给业务建议，不把技术调查放进产品问题。每个问题给简短推荐及业务取舍，不替产品作决定。
+只返回JSON：schemaVersion=1,inputHash（上述哈希）,status=needs_clarification或ready,reply（向产品说明，最多600字）,summary（当前理解，最多600字）,suggestions（最多6条，每条一句）,decisions（最多32项）,questions（最多6个真正阻断理解的当前问题）,deferredQuestions（最多12个依赖前置决定的后续问题），两种问题格式均为{id:Q1,text,dependsOn:[D或Q编号],recommendation}，依赖必须存在、不能循环，当前questions不能依赖未决Q，deferredQuestions必须依赖至少一个未决Q。requiredRoles（frontend/backend/qa，必须含qa及至少一个研发角色）,contract。
+有未解决问题时status=needs_clarification，questions非空、contract=null。只有目标、现状、期望行为、验收和边界已明确，才能ready且questions=[]、deferredQuestions=[]，contract={objective,currentBehavior,desiredBehavior,acceptance:[{id:AC1,text}],inScope:[本次包含的业务功能],outOfScope:[本次不包含的业务事项],answers:{}}。把所有已确认的关键业务决定完整写入这些最终字段；历史问答仅供回看，answers必须为空，不携带旧建议、被否决要求或讨论过程。验收用用户操作与业务结果表述，不用函数调用或接口定义。最终需求交给下一阶段，各研发Agent再独立定位代码和设计接口。不得把猜测包装成共识，无法看懂图片必须追问。`;
   let result;
   try {
     const workspace = await preparePlanWorkspace(project, id, `intake-${active.intakeAnalysisAttempts}`, source,
@@ -166,19 +211,28 @@ ready仅表示需求理解已对齐，下一步由产品定版后进入研发方
       { ...allowance, discussionTask: id,
         authoritativeContext: { phase: "product_discussion", inputHash: context.inputHash,
           workingCandidate: context.candidate ?? JSON.parse(context.context).workingCandidate,
+          workingDecisions: JSON.parse(context.context).workingDecisions,
+          deferredQuestions: JSON.parse(context.context).deferredQuestions,
           latestProductMessage: task.events.findLast(event => event.type === "intake_message")?.detail.text ?? null,
           sourceReferences: task.events.filter(event => ["intake_draft", "intake_message"].includes(event.type)).map(event => event.hash),
           instruction: "This is unconfirmed business understanding. Latest product decisions prevail; read original discussion evidence for missing details. No implementation approval." },
-        intakeValidation: { inputHash: context.inputHash, sourceFiles: Object.keys(source) },
+        intakeValidation: { inputHash: context.inputHash, sourceFiles: Object.keys(source), sourceEventHashes: context.sourceEventHashes },
         outputSchema: { name: "requirement_intake", strict: true, schema: {
           type: "object", additionalProperties: false,
-          required: ["schemaVersion", "inputHash", "status", "reply", "summary", "suggestions", "questions", "requiredRoles", "contract"],
+           required: ["schemaVersion", "inputHash", "status", "reply", "summary", "suggestions", "questions", "decisions", "deferredQuestions", "requiredRoles", "contract"],
           properties: { schemaVersion: { type: "integer", enum: [1] }, inputHash: { type: "string", enum: [context.inputHash] },
             status: { type: "string", enum: ["needs_clarification", "ready"] },
             reply: { type: "string", minLength: 1, maxLength: 2000 }, summary: { type: "string", minLength: 1, maxLength: 2000 },
             suggestions: { type: "array", maxItems: 6, items: { type: "string", minLength: 1, maxLength: 500 } },
-            questions: { type: "array", maxItems: 6, items: { type: "object", additionalProperties: false,
-              required: ["id", "text"], properties: { id: { type: "string" }, text: { type: "string", minLength: 1, maxLength: 500 } } } },
+             decisions: { type: "array", maxItems: 32, items: { type: "object", additionalProperties: false,
+               required: ["id", "text", "sourceEventHash"], properties: { id: { type: "string" },
+                 text: { type: "string", minLength: 1, maxLength: 500 }, sourceEventHash: { type: "string", enum: context.sourceEventHashes } } } },
+             ...Object.fromEntries([["questions", 6], ["deferredQuestions", 12]].map(([key, maxItems]) => [key, {
+               type: "array", maxItems, items: { type: "object", additionalProperties: false,
+                 required: ["id", "text", "dependsOn", "recommendation"], properties: { id: { type: "string" },
+                   text: { type: "string", minLength: 1, maxLength: 500 },
+                   dependsOn: { type: "array", items: { type: "string" } },
+                   recommendation: { type: "string", minLength: 1, maxLength: 500 } } } }])),
             requiredRoles: { type: "array", minItems: 2, maxItems: 3, description: "Distinct roles, including qa and at least one development role.", items: { type: "string", enum: ["frontend", "backend", "qa"] } },
             contract: { anyOf: [{ type: "null" }, { type: "object", additionalProperties: false,
               required: ["objective", "currentBehavior", "desiredBehavior", "acceptance", "inScope", "outOfScope", "answers"],
@@ -198,7 +252,7 @@ ready仅表示需求理解已对齐，下一步由产品定版后进入研发方
     for (let index = 0; index < images.length; index++) {
       if (sha256(await fs.readFile(images[index])) !== context.images[index].hash) throw new Error("AI alignment image snapshot changed");
     }
-    const analysis = analysisInput(JSON.parse(result.text), context.inputHash, Object.keys(source));
+    const analysis = analysisInput(JSON.parse(result.text), context.inputHash, Object.keys(source), context.sourceEventHashes);
     const canonical = (value) => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
       ? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b))) : item);
     if (context.candidate && analysis.status === "ready" && canonical(analysis.contract) !== canonical(context.candidate)) {

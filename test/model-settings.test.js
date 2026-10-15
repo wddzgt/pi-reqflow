@@ -65,6 +65,22 @@ test("settings preserve inheritance, encrypt credentials and never return secret
   assert.equal((await readProjectBaseline(await loadProject(root))).snapshotHash, originalBaseline.snapshotHash);
 });
 
+test("saving model settings does not rewrite project baselines or depend on generated documentation", async t => {
+  const root = await fixture(t); const project = await loadProject(root);
+  const baselineFile = path.join(project.archive, "baseline.json");
+  const eventsFile = path.join(project.archive, "baseline-events.jsonl");
+  const originalBaseline = await fs.readFile(baselineFile, "utf8");
+  const originalEvents = await fs.readFile(eventsFile, "utf8");
+  await fs.unlink(path.join(project.archive, "documentation-mode.json"));
+  const body = input(await readModelSettings(root)); body.default.cost = null; body.maxCostUsd = null;
+  const saved = await configureModels(root, "admin", body);
+  assert.equal(saved.default.model, body.default.model);
+  assert.equal(saved.default.credentialConfigured, true);
+  assert.equal(await fs.readFile(baselineFile, "utf8"), originalBaseline);
+  assert.equal(await fs.readFile(eventsFile, "utf8"), originalEvents);
+  await assert.rejects(fs.access(path.join(project.archive, "documentation-mode.json")), { code: "ENOENT" });
+});
+
 test("all three agents resolve independent models and can return to live default inheritance", async t => {
   const root = await fixture(t); const body = input(await readModelSettings(root));
   for (const agent of modelAgents) body.agents[agent] = { ...body.default, model: `independent-${agent}`, apiKey: "" };
@@ -168,5 +184,16 @@ test("only admins can read, save or test models and writes require the session t
     assert.equal(setup.status, role === "admin" ? 200 : 403);
     for (const route of ["model-settings", "model-connection"]) assert.equal((await fetch(service.url + `/api/${route}`,
       { method: "POST", headers, body: "{}" })).status, 403);
+    if (role === "admin") {
+      const { token } = await (await fetch(service.url + "/api/bootstrap", { headers })).json();
+      const body = input(await setup.json()); body.default.cost = null; body.maxCostUsd = null;
+      const saved = await fetch(service.url + "/api/model-settings", { method: "POST",
+        headers: { ...headers, "X-Reqflow-Token": token }, body: JSON.stringify(body) });
+      assert.equal(saved.status, 200);
+      const settings = await saved.json();
+      assert.equal(settings.default.cost, null); assert.equal(settings.maxCostUsd, null);
+      const current = await loadProject(root);
+      assert.equal(await readModelCredential(current.archive, current.config.compatibleProviders[0].credentialId), body.default.apiKey);
+    }
   }
 });

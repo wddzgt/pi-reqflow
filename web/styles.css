@@ -163,6 +163,11 @@ h1 { margin-bottom: 7px; font-size: clamp(28px, 2.8vw, 36px); letter-spacing: -1
 .alignment-row { margin: 9px 0; padding: 10px 12px; border-left: 3px solid #a7b0ee; background: #f8f9fd; color: #5d6b80; font-size: 11px; line-height: 1.7; white-space: pre-wrap; }
 .info-empty { color: #a4adbb; font-size: 11px; line-height: 1.6; padding: 18px 0; }
 .change-summary { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; color: #8b96a8; font-size: 11px; }
+.acceptance-evidence { display: block; min-width: 0; margin: 14px 0; padding: 16px; border: 1px solid #e1e5ed; border-radius: 10px; }
+.acceptance-evidence > strong { display: block; margin-bottom: 10px; }
+.acceptance-evidence p, .acceptance-evidence summary { overflow-wrap: anywhere; }
+.acceptance-evidence .plain-copy { margin: 8px 0; padding: 10px; }
+.acceptance-evidence details { min-width: 0; margin: 8px 0; }
 .change-row { display: flex; align-items: center; gap: 10px; padding: 12px 8px; width: 100%; border: 0; border-bottom: 1px solid #eff1f5; background: #fff; text-align: left; font-size: 11px; color: #38465e; }
 .change-row:hover, .change-row.selected { background: #f6f7ff; color: #4353c4; }
 .change-type { width: 22px; height: 22px; border-radius: 6px; display: grid; place-items: center; font-size: 10px; font-weight: 800; }
@@ -406,6 +411,18 @@ label .optional { font-weight: 400; color: #a0aec0; font-size: 11px; }
 .intake-status { font-size: 13px; color: #5365b1; min-height: 20px; }
 .intake-composer { display: grid; gap: 12px; border-top: 1px solid #e3e9f1; padding-top: 20px; margin-top: 16px; }
 .intake-composer > button { justify-self: end; }
+.message-composer { border: 1px solid #cbd5e1; border-radius: 12px; background: #fff; overflow: hidden; }
+.message-composer:focus-within { border-color: #6274d9; box-shadow: 0 0 0 3px #6274d91a; }
+.message-composer.dragging { border-color: #6274d9; background: #f3f5ff; }
+.message-composer textarea { border: 0; border-radius: 0; box-shadow: none; margin: 0; min-height: 110px; width: 100%; }
+.message-composer textarea:focus { box-shadow: none; outline: none; }
+.message-toolbar { display: flex; align-items: center; gap: 12px; padding: 8px 12px 12px; }
+.message-toolbar small { color: #65748a; font-weight: normal; }
+.message-images { padding: 12px 12px 0; margin-top: 0; }
+.message-images[hidden] { display: none; }
+.message-images .intake-image { width: 120px; }
+.message-images img { width: 120px; height: 85px; }
+.message-images .button { font-size: 11px; padding: 4px 6px; }
 .error-copy { color: #b33847; line-height: 1.7; overflow-wrap: anywhere; }
 
 .modal-card.audit-modal { max-width: 960px; width: min(960px, 94vw); }

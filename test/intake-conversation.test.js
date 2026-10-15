@@ -23,13 +23,31 @@ const image = { name: "设计图.png", mimeType: "image/png", data: "iVBORw0KGgo
 
 test("ready intake preserves all acceptance scenarios beyond the planning estimate", () => {
   const value = { schemaVersion: 1, inputHash: "current", status: "ready", reply: "核对完成", summary: "批量状态更新",
-    suggestions: [], questions: [], requiredRoles: ["backend", "qa"], contract: {
+    suggestions: [], questions: [], decisions: [], deferredQuestions: [], requiredRoles: ["backend", "qa"], contract: {
       objective: "批量状态更新", currentBehavior: "只能单条更新", desiredBehavior: "当前页整批更新并保留筛选",
       acceptance: Array.from({ length: 9 }, (_, index) => ({ id: `AC${index + 1}`, text: `验收场景${index + 1}` })),
       inScope: ["批量状态更新"], outOfScope: ["跨页选择"], answers: {} } };
-  assert.equal(analysisInput(value, "current", []).status, "ready");
+  assert.equal(analysisInput(value, "current", [], []).status, "ready");
   assert.equal(value.contract.acceptance.length, 9, "never merge or discard valid scenarios to fit a count");
-  assert.throws(() => analysisInput({ ...value, inputHash: "old" }, "current", []), /current discussion version/);
+  assert.throws(() => analysisInput({ ...value, inputHash: "old" }, "current", [], []), /current discussion version/);
+});
+
+test("clarification only asks ready decisions and rejects invented evidence, missing dependencies and cycles", () => {
+  const value={schemaVersion:1,inputHash:"current",status:"needs_clarification",reply:"请先决定是否允许取消",summary:"明确取消规则",
+    suggestions:[],requiredRoles:["backend","qa"],contract:null,
+    decisions:[{id:"D1",text:"保留订单历史",sourceEventHash:"product-source"}],
+    questions:[{id:"Q1",text:"允许取消已付款订单吗？",dependsOn:["D1"],recommendation:"建议限定未发货订单"}],
+    deferredQuestions:[{id:"Q2",text:"退款怎样处理？",dependsOn:["Q1"],recommendation:"允许取消后再明确退款规则"}]};
+  const validate=entry=>analysisInput(entry,"current",[],["product-source"]);
+  assert.equal(validate(value),value);
+  assert.throws(()=>validate({...value,decisions:[{...value.decisions[0],sourceEventHash:"ai-message"}]}),/产品原文/);
+  assert.throws(()=>validate({...value,questions:[value.deferredQuestions[0]],deferredQuestions:[value.questions[0]]}),/前置决定/);
+  assert.throws(()=>validate({...value,questions:[{...value.questions[0],dependsOn:["missing"]}]}),/有效依赖/);
+  assert.throws(()=>validate({...value,deferredQuestions:[value.questions[0]]}),/编号不能重复/);
+  assert.throws(()=>validate({...value,deferredQuestions:[{...value.deferredQuestions[0],dependsOn:["Q3"]},
+    {id:"Q3",text:"确认退款时机",dependsOn:["Q2"],recommendation:"先明确范围"}]}),/循环/);
+  assert.throws(()=>validate({...value,status:"ready"}),/unresolved questions/);
+  assert.throws(()=>validate({...value,questions:[{...value.questions[0],recommendation:""}]}),/业务建议/);
 });
 
 async function fixture(t, overrides = {}, inventoryOnly = false, files = {}) {
@@ -96,6 +114,42 @@ test("product clarification cannot restart an exhausted token budget while cache
   assert.equal(task.meta.intakeAnalysisAttempts, 1);
   assert.equal(task.events.at(-1).type, "intake_budget_exhausted");
   await assert.rejects(fs.stat(path.join(task.directory, "intake-attempt-2.events.jsonl")), { code: "ENOENT" });
+});
+
+test("clarification carries decision evidence between rounds and replaces cancelled choices without rewriting originals", async t => {
+  const models=await fs.mkdtemp(path.join(os.tmpdir(),"reqflow-decision-rounds-"));
+  t.after(()=>fs.rm(models,{recursive:true,force:true}));
+  const executable=path.join(models,"pi.mjs");
+  const source=await fs.readFile(path.join(repository,"test/fake-pi.mjs"),"utf8");
+  await fs.writeFile(executable,source.replace('  for (const file of process.argv.filter',`
+  const latest=context.history.findLast(row=>row.role==="product");
+  if(!latest) intake.deferredQuestions=[{id:"Q2",text:"是否需要乘法操作说明？",dependsOn:["Q1"],recommendation:"先确定乘法范围"}];
+  else if(latest.text.includes("只保留")) {
+    if(context.workingDecisions[0].text!=="新增乘法并保留原加法") throw new Error("Decision context lost");
+    intake.decisions=[{id:"D1",text:"只补充原加法说明，不新增乘法",sourceEventHash:latest.eventHash}];
+    intake.questions=[];intake.deferredQuestions=[];intake.status="ready";
+    intake.contract={objective:"补充加法说明",currentBehavior:"已有加法",desiredBehavior:"加法行为不变且说明清楚",acceptance:[{id:"AC1",text:"可看到加法说明，2加3仍得5"}],inScope:["加法说明"],outOfScope:["新增乘法"],answers:{}};
+  } else {
+    intake.status="needs_clarification";intake.contract=null;intake.deferredQuestions=[];
+    intake.questions=[{id:"Q2",text:"是否需要乘法操作说明？",dependsOn:["D1"],recommendation:"建议沿用现有说明形式"}];
+  }
+  for (const file of process.argv.filter`));
+  const {root}=await fixture(t,{piExecutable:executable});
+  await createRequirement(root,product,{id:"REQ-CHAT",title:"计算器",request:"希望扩展计算能力"});
+  await action(root,{action:"analyze-intake"});
+  await action(root,{action:"intake-message",message:{text:"新增乘法并保留加法"}});
+  await action(root,{action:"analyze-intake"});
+  const second=await getRequirementEvidence(root,product,"REQ-CHAT");
+  assert.deepEqual(second.discussion.latestAnalysis.analysis.questions.map(item=>item.id),["Q2"]);
+  assert.deepEqual(second.discussion.latestAnalysis.analysis.questions[0].dependsOn,["D1"]);
+  await action(root,{action:"intake-message",message:{text:"改为只保留加法并补充说明，不新增乘法"}});
+  await action(root,{action:"analyze-intake"});
+  const third=await getRequirementEvidence(root,product,"REQ-CHAT");
+  assert.equal(third.meta.state,"intake_ready");
+  assert.equal(third.discussion.latestAnalysis.analysis.decisions[0].text,"只补充原加法说明，不新增乘法");
+  const original=third.discussion.messages.find(row=>row.eventHash===second.discussion.latestAnalysis.analysis.decisions[0].sourceEventHash);
+  assert.equal(original.text,"新增乘法并保留加法");
+  assert.deepEqual(third.discussion.latestAnalysis.analysis.deferredQuestions,[]);
 });
 
 test("AI product alignment preserves originals, image inputs and every round before developer handoff", async (t) => {
@@ -394,7 +448,8 @@ test("real Pi sends image content to a vision provider and blocks text-only mode
       : row.content.filter((part) => part.type === "text").map((part) => part.text)).join("\n");
     const inputHash = text.match(/输入版本哈希：([a-f0-9]{64})/)[1];
     const analysis = { schemaVersion: 1, inputHash, status: "needs_clarification", reply: "图片已收到，请明确乘法与现有加法的关系。",
-      summary: "扩展计算器，保留既有行为。", suggestions: [], questions: [{ id: "Q1", text: "是否保持加法不变？" }], requiredRoles: ["backend", "qa"], contract: null };
+      summary: "扩展计算器，保留既有行为。", suggestions: [], decisions: [], deferredQuestions: [],
+      questions: [{ id: "Q1", text: "是否保持加法不变？", dependsOn: [], recommendation: "建议保留加法" }], requiredRoles: ["backend", "qa"], contract: null };
     res.writeHead(200, { "Content-Type": "text/event-stream" });
     const chunk = (delta, finish_reason, usage) => `data: ${JSON.stringify({ id: "fixture-response", object: "chat.completion.chunk",
       created: 1700000000, model: "vision", choices: [{ index: 0, delta, finish_reason }], ...(usage ? { usage } : {}) })}\n\n`;

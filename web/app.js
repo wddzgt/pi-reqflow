@@ -1,6 +1,6 @@
 const state = { overview: null, detail: null, selectedId: null, filter: "all", tab: "plan", token: null,
   principal: null, actions: new Set(), busy: false, diff: null, projects: [], currentProjectId: null, detailRequest: 0,
-  planDrafts: new Map(), intakeDrafts: new Map(), page: "requirements", environmentRequest: 0 };
+  planDrafts: new Map(), intakeDrafts: new Map(), messageImageDrafts: new Map(), page: "requirements", environmentRequest: 0 };
 const $ = (selector) => document.querySelector(selector);
 const states = {
   intake_draft: ["待 AI 研发分析", "active", 0], assignment_pending: ["待研发接单", "review", 0],
@@ -431,6 +431,57 @@ function restoreReadingPosition(position) {
   if (focus) { focus.focus({ preventScroll: true }); if (position.selection) focus.setSelectionRange(...position.selection); }
   content.scrollTop = position.bottom ? content.scrollHeight : position.top;
   window.scrollTo({ top: position.y, behavior: "instant" });
+}
+
+function renderAcceptanceEvidence(container) {
+  const { contract, planAnalysis, humanAcceptance, verificationAttempts } = state.detail;
+  if (!contract || !planAnalysis) return;
+  container.append(element("h3", "content-heading", "逐项验收证据"),
+    element("p", "intake-caption", "相关检查通过仅证明所列覆盖范围。人工业务验收单独记录，历史检查不能证明当前版本。"));
+  for (const requirement of contract.acceptance) {
+    const plan = planAnalysis.draft.verification.find(item => item.acceptanceId === requirement.id);
+    const card = element("div", "acceptance-evidence");
+    card.append(element("strong", "content-heading", `${requirement.id} · ${requirement.text}`));
+    if (!plan || !Array.isArray(plan.checks)) {
+      card.append(element("p", "plain-copy", "历史方案未保存逐项检查关联。")); container.append(card); continue;
+    }
+    if (!plan.checks.length) card.append(element("p", "plain-copy", "此项没有关联自动检查，待人工验证。"));
+    for (const check of plan.checks) card.append(element("p", "plain-copy",
+      `批准的检查 ${check.checkIndex + 1} · ${check.kind === "behavior" ? "业务断言" : "技术条件"} · ${check.coverage}`));
+    if (!(verificationAttempts ?? []).some(attempt => attempt.current && attempt.evidence.items.some(item => item.acceptanceId === requirement.id)))
+      card.append(element("p", "plain-copy", "暂无匹配当前版本的检查结果。"));
+    for (const attempt of verificationAttempts ?? []) {
+      const item = attempt.evidence?.items.find(row => row.acceptanceId === requirement.id);
+      if (!item) continue;
+      const details = element("details", "audit-diagnostics"); details.open = attempt.current;
+      details.append(element("summary", "", `第 ${attempt.attempt} 次检查 · ${dateText(attempt.at)} · ${attempt.current ? "匹配当前版本" : "历史或已失效版本"}`));
+      details.append(element("p", "intake-caption", `源码 ${attempt.evidence.sourceHash.slice(0, 12)} · 方案 ${attempt.evidence.planHash.slice(0, 12)}`));
+      if (!attempt.evidence.sourceUnchanged) details.append(element("p", "error-copy", "检查期间源码发生变化，本次结果不能作为通过依据。"));
+      for (const check of item.checks) {
+        const status = { passed: "相关检查通过", failed: "检查失败", interrupted: "执行中断，未取得结果", not_run: "未执行" }[check.status];
+        details.append(element("p", "plain-copy", `${check.kind === "behavior" ? "业务断言相关检查" : "技术检查"} · ${status} · ${check.coverage}`));
+        const logs = element("details", "audit-diagnostics"); logs.append(element("summary", "", "查看命令、执行日志与完整版本"));
+        logs.append(element("p", "plain-copy", `命令 ${check.command.join(" ")}\n源码 ${attempt.evidence.sourceHash}\n方案 ${attempt.evidence.planHash}`));
+        if (check.result) logs.append(element("pre", "archive-result", `退出码 ${check.result.code} · ${check.result.durationMs} ms\n${dateText(check.result.startedAt)} → ${dateText(check.result.finishedAt)}\n日志 ${check.result.logFile}\nSHA-256 ${check.result.logHash}\n${check.result.tail}`));
+        if (check.interruption) logs.append(element("pre", "archive-result", `${check.interruption.error}\n日志 ${check.interruption.logFile === null ? "未产生" : check.interruption.logFile}\nSHA-256 ${check.interruption.logHash === null ? "未取得" : check.interruption.logHash}`));
+        details.append(logs);
+      }
+      card.append(details);
+    }
+    if (plan.manualSteps) card.append(element("p", "plain-copy", `人工验证步骤：${plan.manualSteps}`));
+    const accepted = humanAcceptance?.results?.find(item => item.acceptanceId === requirement.id);
+    card.append(element("p", "plain-copy", accepted
+      ? `人工已确认 · ${humanAcceptance.actor} · ${dateText(humanAcceptance.at)} · ${{ manual: "人工确认交付", local: "本地验证", deployed: "测试环境验证" }[humanAcceptance.acceptanceMode]} · ${accepted.conclusion}`
+      : humanAcceptance?.coverageRecorded === false ? "历史人工总评未记录此项结论，可回看原始归档。" : "人工结论待填写"));
+    container.append(card);
+  }
+  if (humanAcceptance) {
+    const original = element("details", "audit-diagnostics");
+    original.append(element("summary", "", `人工验收原文 · ${humanAcceptance.actor} · ${dateText(humanAcceptance.at)}`),
+      element("p", "plain-copy", humanAcceptance.conclusion));
+    if (!humanAcceptance.coverageRecorded) original.append(element("p", "intake-caption", "此份历史总评未记录逐项结论。"));
+    container.append(original);
+  }
 }
 
 function renderDetail() {
@@ -984,8 +1035,23 @@ function renderTab(container) {
     return;
   }
   if (state.tab === "checks") {
+    renderAcceptanceEvidence(container);
     const groups = [["修改前基线", baselineChecks], ["实施后检查", meta.checks], ["候选版本检查", meta.mergeChecks]];
-    let hasEvidence = false;
+    let hasEvidence = state.detail.verificationAttempts.length > 0;
+    for (const attempt of state.detail.verificationAttempts) {
+      const details = element("details", "audit-diagnostics");
+      details.append(element("summary", "", `第 ${attempt.attempt} 次验证 · ${dateText(attempt.at)} · ${attempt.outcome === "verified" ? "已完成" : "失败"} · ${attempt.checks.length} 项命令检查`));
+      if (!attempt.evidence) details.append(element("p", "intake-caption", "历史记录未关联逐项验收，保留原始命令结果。"));
+      if (attempt.error) details.append(element("p", "error-copy", attempt.error));
+      details.append(element("p", "intake-caption", `源码 ${attempt.sourceHash} · 方案 ${attempt.planHash}`));
+      for (const check of attempt.checks) {
+        const log = element("details", "audit-diagnostics");
+        log.append(element("summary", "", `${check.command.join(" ")} · 退出码 ${check.code}`),
+          element("pre", "archive-result", `${check.durationMs} ms\n日志 ${check.logFile}\nSHA-256 ${check.logHash}\n${check.tail}`));
+        details.append(log);
+      }
+      container.append(details);
+    }
     for (const [title, rows] of groups) {
       if (!rows?.length) continue;
       hasEvidence = true; container.append(element("h3", "content-heading", title));
@@ -1080,6 +1146,7 @@ function renderPlanDiscussion(container, questionReplies = []) {
     const ai = message.type !== "plan_message";
     const card = element("article", `intake-turn ${ai ? "ai" : "product"}`);
     card.append(element("div", "intake-turn-header", `${ai ? "AI" : message.actor} · 方案 v${message.planVersion} · ${dateText(message.at)}`));
+    renderIntakeImages(card, message.attachments ?? [], meta.id);
     if (message.type === "plan_revision_requested") card.append(element("p", "plain-copy", "方案修改意见已留存并进入重新核对。"));
     else if (["plan_discussion_failed", "plan_attempt_failed"].includes(message.type)) {
       card.append(element("p", "error-copy", message.type === "plan_attempt_failed"
@@ -1156,9 +1223,10 @@ function renderPlanDiscussion(container, questionReplies = []) {
   const form = element("form", "intake-composer");
   form.id = `plan-reply-${meta.id}`;
   if (questionReplies.length) form.append(element("p", "intake-caption", "可逐项填写处理意见，也可先回复部分问题。提交后 AI 会统一核对；方案确认仍由研发决定。"));
-  const input = formField(form, questionReplies.length ? "其他补充（可选）" : "向 AI 提问或说明建议", "textarea", "例如：这个改法会影响旧订单吗？能否复用现有校验？");
-  input.required = false; input.maxLength = 4000; input.disabled = state.busy;
   const draftKey = `${state.principal.id}/${state.currentProjectId}/${meta.id}/${meta.planHash}/supplement`;
+  const composer = messageComposer(form, questionReplies.length ? "其他补充（可选）" : "向 AI 提问或说明建议",
+    "可粘贴截图，再说明希望修正的位置或行为。", draftKey);
+  const input = composer.text; input.required = false; input.maxLength = 4000; input.disabled = state.busy;
   input.value = state.planDrafts.get(draftKey) ?? "";
   input.addEventListener("input", () => state.planDrafts.set(draftKey, input.value));
   const submit = element("button", "button primary", questionReplies.length ? "提交回复，让 AI 统一核对" : "发送并核对");
@@ -1171,12 +1239,15 @@ function renderPlanDiscussion(container, questionReplies = []) {
     const replies = questionReplies.filter(row => row.input.value.trim());
     const parts = replies.map(row => `问题：${row.question}\n回复：${row.input.value.trim()}`);
     if (input.value.trim()) parts.push(`补充说明：${input.value.trim()}`);
-    if (!parts.length) return toast("请至少回复一个问题或填写补充说明。", true);
+    let images;
+    try { images = composer.images(); } catch (error) { return toast(error.message, true); }
+    if (!parts.length && !images.length) return toast("请至少回复一个问题、填写说明或添加图片。", true);
     const text = parts.join("\n\n");
     if (text.length > 4000) return toast("本轮问题和回复合计超过 4000 字，请缩短回复或分次提交；填写内容已保留。", true);
-    if (await sendAction("discuss-plan", { message: { text, expectedPlanHash: planHash } })) {
+    if (await sendAction("discuss-plan", { message: { text, images, expectedPlanHash: planHash } })) {
       for (const row of replies) state.planDrafts.delete(row.draftKey);
       state.planDrafts.delete(draftKey);
+      composer.clearImages();
       if (state.currentProjectId === projectId && state.selectedId === taskId) renderDetail();
     }
   });
@@ -1215,6 +1286,7 @@ function renderIntakeDiscussion(container) {
       }
       for (const question of message.analysis.questions) {
         const row = element("div", "intake-question"); row.append(element("p", "", question.text));
+        if (question.recommendation) row.append(element("p", "intake-caption", `建议：${question.recommendation}`));
         if (canReply && message === discussion.messages.at(-1)) {
           const input = formField(row, "你的回复", "textarea", "说明你的选择；暂不确定也可以直接告诉 AI。");
           input.required = false; input.rows = 2;
@@ -1225,6 +1297,22 @@ function renderIntakeDiscussion(container) {
           questionReplies.push({ question, input, draftKey });
         }
         card.append(row);
+      }
+      if (message.analysis.decisions?.length) {
+        const decisions = element("details", "intake-suggestions");
+        decisions.append(element("summary", "", "已说明的业务选择（待最终定版）"));
+        for (const decision of message.analysis.decisions) {
+          decisions.append(element("p", "plain-copy", decision.text));
+          const source = discussion.messages.find(row => row.eventHash === decision.sourceEventHash);
+          if (source) decisions.append(element("p", "intake-caption", `依据：${source.type === "intake_draft" ? state.detail.request : source.text}`));
+        }
+        card.append(decisions);
+      }
+      if (message.analysis.deferredQuestions?.length) {
+        const deferred = element("details", "intake-suggestions");
+        deferred.append(element("summary", "", "后续待确认事项，先回答本轮问题"));
+        for (const question of message.analysis.deferredQuestions) deferred.append(element("p", "plain-copy", question.text));
+        card.append(deferred);
       }
     }
     renderIntakeImages(card, message.attachments ?? [], meta.id);
@@ -1270,12 +1358,12 @@ function renderIntakeAgreement(container, meta, discussion, contract, feedback, 
     const form = element("form", "intake-composer");
     form.id = `intake-reply-${meta.id}`;
     if (questionReplies.length) form.append(element("p", "intake-caption", "可逐项回复，也可先回答部分问题。点击下方按钮后，AI 会统一核对本轮回复。"));
-    const text = formField(form, questionReplies.length ? "其他补充（可选）" : "补充或修订需求", "textarea", "还有其他想法或需要调整的内容，可以在这里说明。");
-    text.required = false;
     const draftKey = `${state.principal.id}/${state.currentProjectId}/${meta.id}/supplement`;
+    const composer = messageComposer(form, questionReplies.length ? "其他补充（可选）" : "补充或修订需求",
+      "可粘贴截图，再说明背景、期望行为或需要调整的内容。", draftKey);
+    const text = composer.text; text.required = false;
     text.value = state.intakeDrafts.get(draftKey) ?? "";
     text.addEventListener("input", () => state.intakeDrafts.set(draftKey, text.value));
-    const images = imageUploadField(form);
     const submit = element("button", "button primary", questionReplies.length ? "提交回复，让 AI 统一核对" : "发送并让 AI 核对");
     submit.type = "submit"; form.append(submit);
     form.addEventListener("submit", async (event) => {
@@ -1284,13 +1372,13 @@ function renderIntakeAgreement(container, meta, discussion, contract, feedback, 
         const replies = questionReplies.filter(row => row.input.value.trim());
         const parts = replies.map(row => `问题（${row.question.id}）：${row.question.text}\n回复：${row.input.value.trim()}`);
         if (text.value.trim()) parts.push(`补充说明：${text.value.trim()}`);
-        const uploads = await imageUploads(images);
+        const uploads = composer.images();
         if (state.currentProjectId !== projectId || state.selectedId !== meta.id) throw new Error("需求已切换，请回到原需求提交回复。");
         if (!parts.length && !uploads.length) throw new Error("请至少回复一个问题、填写补充说明或上传图片。");
-        if (!parts.length) parts.push("请结合本轮补充图片核对需求；尚未回答的问题继续保留。");
         if (await runIntakeAnalysis(meta.id, { text: parts.join("\n\n"), images: uploads })) {
           for (const row of replies) state.intakeDrafts.delete(row.draftKey);
           state.intakeDrafts.delete(draftKey);
+          composer.clearImages();
           if (state.currentProjectId === projectId && state.selectedId === meta.id) renderDetail();
         }
       }
@@ -1440,20 +1528,84 @@ function openNewTask() {
     id.pattern = "[A-Za-z0-9][A-Za-z0-9_\\-]{0,63}"; id.maxLength = 64;
     id.title = "1–64 位，以字母或数字开头，可包含下划线和短横线";
     form.append(element("p", "plain-copy", "编号支持 1、2 等数字，同一项目内不可重复。"));
-    return { id,
-      title: formField(form, "标题", "input", "一句话说明需求"),
-      request: formField(form, "原始需求", "textarea", "背景、目标、期望行为与已有约束"),
-      images: imageUploadField(form),
-    };
-  }, async ({ id, title, request, images }) => {
-    const uploads = await imageUploads(images);
+    const title = formField(form, "标题", "input", "一句话说明需求");
+    const composer = messageComposer(form, "原始需求", "可粘贴截图，再描述背景、目标、期望行为与已有约束。",
+      `${state.principal.id}/${state.currentProjectId}/new-requirement`);
+    return { id, title, request: composer.text, composer };
+  }, async ({ id, title, request, composer }) => {
+    const uploads = composer.images();
     const created = await api("/api/tasks", { method: "POST",
       headers: { "Content-Type": "application/json", "X-Reqflow-Token": state.token },
       body: JSON.stringify({ id: id.value.trim(), title: title.value.trim(), request: request.value.trim(), images: uploads }) });
     state.filter = "all"; state.tab = "alignment"; await refresh(created.id);
+    composer.clearImages();
     closeModal();
     await runIntakeAnalysis(created.id);
   }, "提交并开始沟通");
+}
+
+function messageComposer(form, label, placeholder, draftKey) {
+  const text = formField(form, label, "textarea", placeholder);
+  text.setAttribute("aria-label", label);
+  const field = text.parentElement; const caption = field.children[0];
+  const box = element("div", "message-composer");
+  const preview = element("div", "intake-image-list message-images");
+  const toolbar = element("div", "message-toolbar");
+  const picker = element("input", ""); picker.type = "file"; picker.hidden = true;
+  picker.accept = "image/png,image/jpeg"; picker.multiple = true;
+  const add = element("button", "button", "添加图片"); add.type = "button"; add.disabled = state.busy;
+  add.addEventListener("click", () => picker.click());
+  toolbar.append(add, element("small", "", "可直接粘贴或拖入图片，每张 ≤ 1 MiB，最多 4 张"));
+  field.replaceChildren(caption, box); box.append(preview, text, toolbar, picker);
+  let reading = false;
+  const draw = () => {
+    clear(preview);
+    const images = state.messageImageDrafts.get(draftKey) ?? [];
+    preview.hidden = images.length === 0;
+    for (const [index, image] of images.entries()) {
+      const figure = element("figure", "intake-image"); const img = element("img", "");
+      img.src = `data:${image.mimeType};base64,${image.data}`; img.alt = image.name;
+      const remove = element("button", "button", `移除 ${image.name}`); remove.type = "button"; remove.disabled = state.busy;
+      remove.setAttribute("aria-label", `移除 ${image.name}`);
+      remove.addEventListener("click", () => {
+        state.messageImageDrafts.set(draftKey, images.filter((_image, item) => item !== index)); draw();
+      });
+      figure.append(img, element("figcaption", "", image.name), remove); preview.append(figure);
+    }
+  };
+  const attach = async files => {
+    if (state.busy || reading) throw new Error("请等待当前图片读取或请求完成后再添加图片。");
+    reading = true;
+    try {
+      const uploaded = await imageUploads({ files });
+      const images = [...(state.messageImageDrafts.get(draftKey) ?? []), ...uploaded];
+      if (images.length > 4) throw new Error("每条消息最多添加 4 张图片。");
+      state.messageImageDrafts.set(draftKey, images); draw();
+    } finally { reading = false; }
+  };
+  picker.addEventListener("change", async () => {
+    try { await attach([...picker.files]); picker.value = ""; }
+    catch (error) { toast(error.message, true); }
+  });
+  box.addEventListener("paste", async event => {
+    const files = [...(event.clipboardData?.items ?? [])].filter(item => item.kind === "file").map(item => item.getAsFile());
+    if (!files.length) return;
+    event.preventDefault();
+    try { await attach(files); }
+    catch (error) { toast(error.message, true); }
+  });
+  box.addEventListener("dragover", event => { event.preventDefault(); box.classList.add("dragging"); });
+  box.addEventListener("dragleave", () => box.classList.remove("dragging"));
+  box.addEventListener("drop", async event => {
+    event.preventDefault(); box.classList.remove("dragging");
+    try { await attach([...event.dataTransfer.files]); }
+    catch (error) { toast(error.message, true); }
+  });
+  draw();
+  return { text, images: () => {
+    if (reading) throw new Error("图片正在读取，请稍后发送。");
+    return [...(state.messageImageDrafts.get(draftKey) ?? [])];
+  }, clearImages: () => { state.messageImageDrafts.delete(draftKey); draw(); } };
 }
 
 function imageUploadField(form) {
@@ -1538,12 +1690,36 @@ function renderManagementSummary(card, data) {
   card.append(workload);
 }
 
+function renderImprovementCandidates(container, improvements) {
+  if (!improvements) return;
+  const section = element("details", "audit-diagnostics");
+  section.append(element("summary", "", `失败复盘候选 · ${improvements.total} 类`),
+    element("p", "intake-caption", improvements.note));
+  if (!improvements.total) section.append(element("p", "plain-copy", "当前没有已记录的失败候选。"));
+  for (const candidate of improvements.candidates) {
+    const item = element("details", "audit-event-detail");
+    item.append(element("summary", "", `${eventNames[candidate.stage] ?? candidate.stage} · 同阶段同错误 ${candidate.occurrences} 次 · ${candidate.status === "diagnosis_recorded" ? "已记录负责人诊断，待核实" : "根因待调查"}`),
+      element("p", "plain-copy", candidate.observedFailure === null ? "原记录未提供失败原因，请查原始证据。" : candidate.observedFailure),
+      element("p", "plain-copy", candidate.recommendation), element("p", "plain-copy", candidate.validation));
+    for (const diagnosis of candidate.diagnoses) item.append(element("p", "plain-copy", `负责人诊断 · ${diagnosis.actor} · ${diagnosis.text}`));
+    for (const evidence of candidate.evidence) {
+      const button = element("button", "button", `查看 ${evidence.taskId} 的证据`); button.type = "button";
+      button.addEventListener("click", () => openLifecycle(evidence.taskId).catch(error => toast(error.message, true)));
+      item.append(button, element("p", "intake-caption", `${dateText(evidence.at)} · 事件 ${evidence.eventHash} · 源码 ${evidence.sourceHash === null ? "未记录" : evidence.sourceHash} · 日志 ${evidence.logs.join("、") || "原记录未提供日志路径"}`));
+    }
+    section.append(item);
+  }
+  if (improvements.total > improvements.limit) section.append(element("p", "intake-caption", `按复发次数优先展示 ${improvements.limit} 类；完整失败证据仍在各需求中。`));
+  container.append(section);
+}
+
 async function openAdminReport(offset = 0, filters = {}) {
   const limit = 50;
   const query = new URLSearchParams({ offset, limit, ...filters });
   const data = await api(`/api/admin/report?${query}`);
   const card = auditModal("项目审计与交付总览", `全项目审计链已验证 · ${data.projectTotal} 条需求 · 点击需求回溯关键决定与责任人`);
   renderManagementSummary(card, data);
+  renderImprovementCandidates(card, data.improvements);
   renderAuditFilters(card, filters);
   const identity = element("button", "button", "查看身份变更历史"); identity.type = "button";
   identity.addEventListener("click", () => openAdminEvents("auth", null, 0).catch((error) => toast(error.message, true)));
@@ -1684,6 +1860,7 @@ async function openDiagnostics(id, offset = 0) {
     item.append(element("summary", "", `${dateText(failure.at)} · ${eventNames[failure.stage] ?? failure.stage}`),
       element("p", "error-copy", failure.reason ?? "失败原因未记录")); card.append(item);
   }
+  renderImprovementCandidates(card, data.improvements);
   for (const run of data.runs) {
     const telemetry = run.telemetry;
     const item = element("details", "audit-event-detail");
@@ -1798,6 +1975,8 @@ function openIntakeFinalization() {
 function openPlanEditor() {
   const { meta, planAnalysis } = state.detail;
   const candidate = JSON.parse(JSON.stringify(planAnalysis.draft)); delete candidate.markdown;
+  if (candidate.verification.some(item => !Array.isArray(item.checks) || typeof item.manualSteps !== "string"))
+    return toast("该方案缺少逐项验收检查关联，请先重新分析方案，再编辑并确认。", true);
   const taskId = meta.id; const expectedPlanHash = meta.planHash;
   structuredModal(`修改研发方案 v${meta.planVersion}`, "保存后 AI 会根据冻结需求和真实源码重新核对。修改与分析均留存；涉及业务变化需产品重新确认。", form => {
     const design = {};
@@ -1843,7 +2022,23 @@ function openPlanEditor() {
       form.append(element("h3", "content-heading", `验收 ${item.acceptanceId}`));
       const scenario = formField(form, "完成条件与测试方法", "textarea"); scenario.value = item.scenario; scenario.maxLength = 1000;
       const regression = formField(form, "相关回归检查", "textarea"); regression.value = item.regression; regression.maxLength = 1000;
-      return { acceptanceId: item.acceptanceId, scenario, regression };
+      const manualSteps = formField(form, "未覆盖行为的人工操作及预期结果", "textarea");
+      manualSteps.value = item.manualSteps; manualSteps.maxLength = 1000; manualSteps.required = false;
+      const checks = candidate.validation.checks.map((check, checkIndex) => {
+        const link = item.checks.find(row => row.checkIndex === checkIndex);
+        const label = element("label", "", `关联检查 ${checkIndex + 1} · ${check.command.join(" ")}`);
+        const selected = element("input", ""); selected.type = "checkbox"; selected.checked = Boolean(link); label.append(selected); form.append(label);
+        const kind = formField(form, "检查证明的范围", "select");
+        for (const [value, text] of [["technical", "技术条件（构建、类型、语法等）"], ["behavior", "业务断言"]]) {
+          const option = element("option", "", text); option.value = value; kind.append(option);
+        }
+        kind.value = link ? link.kind : "technical";
+        const coverage = formField(form, "断言位置、覆盖范围及限制", "textarea");
+        coverage.value = link ? link.coverage : ""; coverage.maxLength = 1000; coverage.required = selected.checked;
+        selected.addEventListener("change", () => { coverage.required = selected.checked; });
+        return { checkIndex, selected, kind, coverage };
+      });
+      return { acceptanceId: item.acceptanceId, scenario, regression, checks, manualSteps };
     });
     const feedback = formField(form, "修改原因或希望 AI 重点核对的问题", "textarea"); feedback.maxLength = 2000;
     return { changes, verification, feedback, design };
@@ -1861,7 +2056,9 @@ function openPlanEditor() {
         file: row.file.value.trim(), location: row.location.value.trim(), pseudocode: row.pseudocode.value.trim() }));
     }
     candidate.verification = fields.verification.map(item => ({ acceptanceId: item.acceptanceId,
-      scenario: item.scenario.value.trim(), regression: item.regression.value.trim() }));
+      scenario: item.scenario.value.trim(), regression: item.regression.value.trim(),
+      checks: item.checks.filter(link => link.selected.checked).map(link => ({ checkIndex: link.checkIndex,
+        kind: link.kind.value, coverage: link.coverage.value.trim() })), manualSteps: item.manualSteps.value.trim() }));
     return sendAction("edit-plan", { candidate, feedback: fields.feedback.value.trim(), expectedPlanHash });
   }, "保存并让 AI 核对");
 }
@@ -1901,7 +2098,7 @@ function modelProfileFields(container, saved) {
   advanced.append(element("p", "intake-caption", "USD 单价按每百万 Token 填写。全部留空表示价格未知，不代表免费；设置费用上限时必须提供四项单价。"));
   for (const [name, title] of [["input", "输入"], ["output", "输出"], ["cacheRead", "缓存读取"], ["cacheWrite", "缓存写入"]]) {
     const input = formField(advanced, `${title}单价（USD / 百万 Token）`);
-    input.type = "number"; input.min = 0; input.step = "any"; input.value = String(saved.cost?.[name] ?? "");
+    input.type = "number"; input.required = false; input.min = 0; input.step = "any"; input.value = String(saved.cost?.[name] ?? "");
     fields.cost[name] = input;
   }
   advanced.append(element("p", "intake-caption", "按供应商实际能力配置。思考开关与 reasoning_effort 参数并非所有模型都支持。"));
@@ -1945,7 +2142,7 @@ async function openModelSettings() {
     form.append(element("h3", "content-heading", "默认配置")); fields.default = modelProfileFields(form, setup.default);
     appendModelTest(form, "default", () => modelProfileInput(fields.default), projectId);
     fields.maxCostUsd = formField(fields.default.advanced, "单个需求费用上限（USD）");
-    fields.maxCostUsd.type = "number"; fields.maxCostUsd.min = 0.001; fields.maxCostUsd.step = "any"; fields.maxCostUsd.value = String(setup.maxCostUsd ?? "");
+    fields.maxCostUsd.type = "number"; fields.maxCostUsd.required = false; fields.maxCostUsd.min = 0.001; fields.maxCostUsd.step = "any"; fields.maxCostUsd.value = String(setup.maxCostUsd ?? "");
     fields.maxCostUsd.placeholder = "留空表示不设置费用上限";
     form.append(element("h3", "content-heading", "Agent 模型"), element("p", "intake-caption", "默认继承项目模型；展开对应 Agent，取消继承即可单独设置。"));
     for (const [agent, title] of Object.entries(modelAgentLabels)) {
@@ -2386,6 +2583,18 @@ function openModal(action) {
   card.append(element("h2", "", title), element("p", "", description));
   const input = field ? element("textarea", "") : null;
   if (input) { input.placeholder = placeholder; input.maxLength = 4000; card.append(input); }
+  const acceptanceFields = [];
+  if (action === "accept-test") {
+    for (const item of state.detail.contract.acceptance) {
+      const plan = state.detail.planAnalysis.draft.verification.find(row => row.acceptanceId === item.id);
+      card.append(element("strong", "content-heading", `${item.id} · ${item.text}`));
+      if (plan.manualSteps) card.append(element("p", "plain-copy", `人工步骤：${plan.manualSteps}`));
+      const conclusion = element("textarea", ""); conclusion.maxLength = 1000;
+      conclusion.placeholder = "记录此项实际核对的方法和结果；未完成或失败时请反馈问题，继续修复。";
+      conclusion.setAttribute("aria-label", `${item.id} 人工验收结论`);
+      card.append(conclusion); acceptanceFields.push({ acceptanceId: item.id, conclusion });
+    }
+  }
   let acceptanceChoice;
   if (action === "accept-test" && acceptanceMode === "manual" && state.detail.meta.localValidation?.environment
       && ["running", "not_applicable", "stopped"].includes(state.detail.meta.localValidation.status)
@@ -2406,11 +2615,13 @@ function openModal(action) {
     const value = input?.value.trim();
     if (state.selectedId !== taskId) return toast("需求已切换，请重新打开当前需求的操作。", true);
     if (field && !value) return toast("请填写具体内容。", true);
+    if (acceptanceFields.some(item => !item.conclusion.value.trim())) return toast("请逐项填写实际人工验收结论。", true);
     closeModal(); await sendAction(action, action === "restart-development" ? { expectedAuditHead }
       : action === "develop" ? { authorizeImplementation: true, expectedPlanHash, expectedAfterHash }
       : action === "redeploy-test" ? { authorizeDeployment: true, expectedAfterHash, expectedPlanHash }
       : action === "accept-test" ? { evidence: value, acceptanceMode: acceptanceChoice ? acceptanceChoice.value : acceptanceMode,
-        expectedAfterHash, expectedPlanHash }
+        expectedAfterHash, expectedPlanHash,
+        acceptanceResults: acceptanceFields.map(item => ({ acceptanceId: item.acceptanceId, conclusion: item.conclusion.value.trim() })) }
       : action === "approve-plan" ? { expectedPlanHash } : field ? { [field]: value } : {});
   });
   actions.append(cancel, submit); card.append(actions); root.append(card);
@@ -3169,6 +3380,7 @@ $("#logoutButton").addEventListener("click", async () => {
     if (error.status !== 401) { toast(`退出失败：${error.message}`, true); return; }
   }
   showLogin();
+  state.messageImageDrafts.clear();
 });
 
 establishSession().catch((error) => {

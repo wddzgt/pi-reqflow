@@ -202,7 +202,9 @@ test("web workbench reads audited tasks and archived file changes", async (t) =>
   assert.equal((await chosenDeployment.json()).state, "test_deployed");
   const productAcceptance = await fetch(`${url}/api/tasks/1/actions`, { method: "POST",
     headers: { "Content-Type": "application/json", Cookie: productCookie, "X-Reqflow-Token": productSession.token },
-    body: JSON.stringify({ action: "accept-test", acceptanceMode: "deployed", evidence: "Product verified the frozen acceptance criteria in the test environment." }) });
+    body: JSON.stringify({ action: "accept-test", acceptanceMode: "deployed", expectedAfterHash: automatedTask.meta.afterHash,
+      expectedPlanHash: automatedTask.meta.planHash, acceptanceResults: [{acceptanceId:"AC1",conclusion:"测试环境乘法正确，原加法保持不变"}],
+      evidence: "Product verified the frozen acceptance criteria in the test environment." }) });
   assert.equal(productAcceptance.status, 200);
   assert.equal((await productAcceptance.json()).state, "archived_test_only");
   const otherLogin = await fetch(`${url}/api/login`, { method: "POST", headers: { "Content-Type": "application/json" },

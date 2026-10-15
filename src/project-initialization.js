@@ -137,7 +137,11 @@ export async function initializeProjectContext(project, baseline, options = {}) 
       throw error;
     });
     if (current?.cacheKey === cacheKey && options.refresh !== true) {
-      if (current.baselineHash === baseline.snapshotHash && Object.hasOwn(current.documents, "agent.md")) return readInitialization(project, baseline);
+      if (current.baselineHash === baseline.snapshotHash && Object.hasOwn(current.documents, "agent.md")) {
+        const initialized = await readInitialization(project, baseline);
+        await writeJson(path.join(project.archive, "documentation-mode.json"), { mode: "agent" });
+        return initialized;
+      }
       await readInitialization(project, { snapshotHash: current.baselineHash });
       await validateUnderstanding(current.understanding, baseline, project.root, initializationCommands(baseline));
       const guides = renderUnderstanding(current.understanding, initializationCommands(baseline), baseline);
@@ -153,6 +157,7 @@ export async function initializeProjectContext(project, baseline, options = {}) 
       const metadata = { ...current, baselineHash: baseline.snapshotHash, documents,
         generatedAt: new Date().toISOString(), reusedFromBaselineHash: current.baselineHash };
       await writeJson(path.join(project.archive, "initialization.json"), metadata);
+      await writeJson(path.join(project.archive, "documentation-mode.json"), { mode: "agent" });
       return { metadata, documents: contents };
     }
     const attemptsRoot = path.join(project.archive, "initialization", "attempts");

@@ -105,7 +105,9 @@ test("automatic initialization preserves project rules, skips commands and reuse
   assert.equal(await fs.readFile(path.join(root, "CLAUDE.md"), "utf8"), "@AGENTS.md\n");
   const project = await loadProject(root);
   const baseline = await readProjectBaseline(project);
+  await fs.unlink(path.join(project.archive, "documentation-mode.json"));
   await Promise.all([initializeProjectContext(project, baseline), initializeProjectContext(project, baseline)]);
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(project.archive, "documentation-mode.json"), "utf8")), { mode: "agent" });
   assert.equal(await fs.readFile(counter, "utf8"), "call\n");
   const context = JSON.parse(await baselineAgentContext(project, baseline));
   assert.match(context.projectGuide.overview.text, /现有业务功能/);
@@ -135,7 +137,9 @@ test("legacy generated documents migrate to agent.md without another model call"
   await fs.writeFile(path.join(project.archive, file), content);
   metadata.documents["CLAUDE.md"] = { file, hash: sha256(content) };
   await fs.writeFile(metadataFile, JSON.stringify(metadata));
+  await fs.unlink(path.join(project.archive, "documentation-mode.json"));
   const migrated = await initializeProjectContext(project, baseline);
+  assert.deepEqual(JSON.parse(await fs.readFile(path.join(project.archive, "documentation-mode.json"), "utf8")), { mode: "agent" });
   assert.deepEqual(Object.keys(migrated.documents).sort(), ["PROJECT_REFERENCE.md", "agent.md"]);
   assert.match(migrated.documents["agent.md"], /Project context/);
   assert.equal(await fs.readFile(counter, "utf8"), "call\n");

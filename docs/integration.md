@@ -35,7 +35,11 @@ Git 信息通过 `GET /api/project-git` 读取。`approve-plan` 可传 developme
 
 `read_plan` 每次可请求 1–3000 字符，实际页面同时受模型工具结果字节预算限制；调用方按返回的 `text.length` 前进，直到 `totalChars`，不得假设每页等长。版本哈希和来源校验继续适用。
 
-`accept-test` 必须传 evidence 和 acceptanceMode=manual/local/deployed。manual 在 verified 状态人工确认研发交付，不要求环境；local 要求当前代码及环境版本的实际本地验证；deployed 要求 test_deployed 状态和有效测试环境版本。manual/local 还须传当前 expectedPlanHash、expectedAfterHash；未经审核的实际变更先由负责研发具名确认。动作完成验收后直接归档，记录实际方式、人员与版本，不把未执行的环境验证算作通过。
+`accept-test` 必须传 evidence、acceptanceMode=manual/local/deployed、当前 expectedPlanHash、expectedAfterHash 及 acceptanceResults=[{acceptanceId,conclusion}]。逐项结论必须唯一且完整覆盖冻结需求，conclusion 为非空文本，最多1000字；缺失、重复、额外编号及空结论均拒绝，且不先写入变更审批。manual 在 verified 状态人工确认研发交付，不要求环境；local 要求当前代码及环境版本的实际本地验证；deployed 要求 test_deployed 状态和有效测试环境版本。未经审核的实际变更先由负责研发具名确认。动作完成验收后直接归档，记录实际方式、人员与版本，不把未执行的环境验证算作通过。
+
+方案每个 verification 项包含 acceptanceId、scenario、regression、checks 和 manualSteps。checks=[{checkIndex,kind,coverage}] 使用 validation.checks 的零基索引，kind=behavior/technical，coverage 说明断言位置、覆盖内容及限制。同项引用不能重复，允许多对多关联；没有业务断言关联时 manualSteps 必须说明操作及预期结果。技术检查不能证明业务结果；部分覆盖时也需说明剩余人工步骤。局部方案纠错同步携带这四个可修改字段。
+
+`getRequirementEvidence` 返回 verificationAttempts（事件哈希、尝试编号、时间、是否匹配当前源码及方案、逐项执行证据）与 humanAcceptance（确认人、时间、方式、逐项结论及版本）。检查状态为 passed/failed/interrupted/not_run，passed 只代表所关联命令成功；sourceUnchanged=false 时结果不能作为通过依据。日志内容及摘要、源码版本、冻结需求和方案关联均核对，历史不完整记录明确说明未保存关联，不补造结论。旧方案缺少关联时必须重新分析批准，不能直接继续实施。
 
 `discuss-acceptance` 在 verified/test_deployed 接收 `message={text,images?,expectedContractHash,expectedPlanHash,expectedAfterHash}`。原产品负责人和已接单研发可参与；图片沿用需求图片校验、私有存储与读取权限。AI 在当前实施源码的隔离副本只读调查，返回 route=repair/plan/requirement/clarify/no_change、三个“为什么”、源码证据、原验收项及修复回归建议。`getRequirementEvidence().acceptanceDiscussion` 返回每轮消息及 eventHash；失败明确记录，可继续沟通或暂停后恢复。
 

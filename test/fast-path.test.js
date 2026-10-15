@@ -118,6 +118,7 @@ test("fast path verifies a comment-only change with existing unchanged regressio
   assert.equal(task.events.filter((event) => event.type === "role_review_submitted").length, 0);
   await assert.rejects(executeRequirementAction(root, "REQ-FAST", { action: "accept-test",
     acceptanceMode: "local", expectedAfterHash: task.meta.afterHash, expectedPlanHash: task.meta.planHash,
+    acceptanceResults: [{ acceptanceId: "AC1", conclusion: "查看加法说明及原行为" }],
     evidence: "未设置本地验证环境" }, reviewer), /本地验证/);
 });
 
@@ -170,6 +171,7 @@ test("directory projects without a fixed environment can develop and request loc
   assert.equal(current.events.at(-1).detail.actor, "reviewer");
   const archived = await executeRequirementAction(root, "REQ-FAST", { action: "accept-test",
     acceptanceMode: "local", expectedAfterHash: current.meta.afterHash, expectedPlanHash: current.meta.planHash,
+    acceptanceResults: [{ acceptanceId: "AC1", conclusion: "本地调用乘法及原加法，结果正确" }],
     evidence: "已查看代码差异，本地验证乘法与原加法结果正确。" }, reviewer);
   assert.equal(archived.state, "archived_test_only");
   assert.equal(archived.acceptanceMode, "local");
@@ -188,6 +190,7 @@ test("no automated checks leaves manual acceptance pending without blocking impl
   assert.deepEqual(task.meta.checks, []);
   const archived = await executeRequirementAction(root, "REQ-FAST", { action: "accept-test", acceptanceMode: "manual",
     expectedAfterHash: task.meta.afterHash, expectedPlanHash: task.meta.planHash,
+    acceptanceResults: [{ acceptanceId: "AC1", conclusion: "人工调用乘法及原加法核对结果" }],
     evidence: "已人工核对乘法实现与原加法，没有执行自动测试，确认交付。" }, reviewer);
   assert.equal(archived.state, "archived_test_only"); assert.equal(archived.verificationMode, "manual_pending");
   assert.equal(archived.acceptanceMode, "manual"); assert.equal(archived.localValidation, undefined);

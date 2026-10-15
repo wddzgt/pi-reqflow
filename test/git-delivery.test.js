@@ -256,7 +256,9 @@ test("the developer action stops before Git changes and test acceptance archives
   assert.equal(git(before.workspace, "rev-parse", "HEAD"), meta.baseRevision);
   assert.equal(git(f.root, "ls-remote", "origin", before.branch), "");
   await executeRequirementAction(f.root, "REQ-001", { action: "publish-test", ...confirmation(before) }, actor);
-  const accepted = await executeRequirementAction(f.root, "REQ-001", { action: "accept-test", acceptanceMode: "deployed", evidence: "人工验证乘法及原加法符合需求" },
+  const accepted = await executeRequirementAction(f.root, "REQ-001", { action: "accept-test", acceptanceMode: "deployed",
+    expectedAfterHash: before.afterHash, expectedPlanHash: before.planHash,
+    acceptanceResults: [{acceptanceId:"AC1",conclusion:"测试环境乘法及原加法符合需求"}], evidence: "人工验证乘法及原加法符合需求" },
     { id: "product", roles: ["product"] });
   assert.equal(accepted.state, "archived_test_only");
   const report = await fs.readFile(path.join(f.project.archive, "tasks/REQ-001/result.md"), "utf8");
@@ -310,7 +312,9 @@ test("shared environment replacement blocks stale acceptance and allows explicit
   await fs.writeFile(path.join(f.project.archive, `test-environment-${sha256(url)}.json`), JSON.stringify({ taskId: "REQ-OTHER", url, status: "succeeded" }));
   const evidence = await getRequirementEvidence(f.root, actor, "REQ-001");
   assert.equal(evidence.meta.testEnvironmentSupersededBy, "REQ-OTHER");
-  await assert.rejects(executeRequirementAction(f.root, "REQ-001", { action: "accept-test", acceptanceMode: "deployed", evidence: "checked old link" }, actor), /其他需求/);
+  await assert.rejects(executeRequirementAction(f.root, "REQ-001", { action: "accept-test", acceptanceMode: "deployed",
+    expectedAfterHash: meta.afterHash, expectedPlanHash: meta.planHash,
+    acceptanceResults: [{acceptanceId:"AC1",conclusion:"checked old link"}], evidence: "checked old link" }, actor), /其他需求/);
   const result = await redeployTest(f.root, "REQ-001", "reviewer", { ...confirmation(meta), authorizeDeployment: true });
   assert.equal(result.state, "test_deployed");
   const current = await getRequirementEvidence(f.root, actor, "REQ-001");

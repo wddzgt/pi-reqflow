@@ -4,11 +4,11 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { authorizeTaskRead } from "./auth.js";
 import { loadProject } from "./config.js";
-import { assertInside, readJson, safeId, sha256 } from "./files.js";
+import { assertInside, manifest, manifestHash, readJson, safeId, sha256 } from "./files.js";
 import { readTask, taskPath } from "./store.js";
 import { intakeDiscussion } from "./intake-conversation.js";
 import { readImage } from "./intake-images.js";
-import { readPlanAnalysis } from "./plan-analysis.js";
+import { acceptanceInput, readPlanAnalysis } from "./plan-analysis.js";
 import { planDiscussion } from "./plan-conversation.js";
 import { acceptanceDiscussion } from "./acceptance-feedback.js";
 import { planReviewStatus } from "./plan-review.js";
@@ -35,6 +35,44 @@ export async function getRequirementEvidence(projectPath, principal, id) {
     ? await fs.readFile(path.join(directory, `plan-v${meta.planVersion}.md`), "utf8") : null;
   if (plan && sha256(plan) !== meta.planHash) throw new Error("Approved plan changed");
   const planAnalysis = plan ? await readPlanAnalysis(meta, directory) : null;
+  const verificationAttempts = [];
+  const currentSourceHash = meta.workspace && meta.afterHash
+    ? manifestHash(await manifest(meta.workspace, project.config.excludedPaths, project.config.maxSnapshotBytes)) : null;
+  for (const event of eventRows.filter(row => ["verified", "verification_failed"].includes(row.type))) {
+    const evidence = event.detail.acceptanceEvidence;
+    if (evidence) {
+      if (evidence.contractHash !== event.meta.contractHash || evidence.planHash !== event.meta.planHash
+          || evidence.sourceHash !== event.meta.afterHash) throw new Error("Verification evidence version changed");
+      for (const item of evidence.items) for (const check of item.checks) {
+        if (JSON.stringify(check.command) !== JSON.stringify(event.detail.validation.checks[check.checkIndex].command)
+            || JSON.stringify(check.result) !== JSON.stringify(event.detail.checks[check.checkIndex] ?? null))
+          throw new Error("Acceptance check differs from the recorded execution");
+        if (check.interruption && check.interruption.logFile !== null) {
+          const prefix = event.meta.verificationAttempt === 1 ? "" : `verification-attempt-${event.meta.verificationAttempt}-`;
+          const file = path.join(directory, `${prefix}check-${check.checkIndex + 1}.log`);
+          if (path.basename(check.interruption.logFile) !== path.basename(file)
+              || path.basename(path.dirname(check.interruption.logFile)) !== path.basename(directory)
+              || path.dirname(await fs.realpath(file)) !== await fs.realpath(directory)
+              || sha256(await fs.readFile(file)) !== check.interruption.logHash)
+            throw new Error("Interrupted verification evidence log changed");
+        }
+      }
+    }
+    for (const [index, check] of event.detail.checks.entries()) {
+      const prefix = event.meta.verificationAttempt === 1 ? "" : `verification-attempt-${event.meta.verificationAttempt}-`;
+      const file = path.join(directory, `${prefix}check-${index + 1}.log`);
+      if (path.basename(check.logFile) !== path.basename(file)
+          || path.basename(path.dirname(check.logFile)) !== path.basename(directory)
+          || path.dirname(await fs.realpath(file)) !== await fs.realpath(directory)
+          || sha256(await fs.readFile(file)) !== check.logHash)
+        throw new Error("Verification evidence log changed");
+    }
+    verificationAttempts.push({ eventHash: event.hash, at: event.at, attempt: event.meta.verificationAttempt,
+      outcome: event.type, evidence: evidence ?? null, checks: event.detail.checks,
+      sourceHash: event.meta.afterHash, planHash: event.meta.planHash, error: event.detail.error,
+      current: Boolean(evidence && evidence.sourceUnchanged && evidence.sourceHash === currentSourceHash
+        && evidence.contractHash === meta.contractHash && evidence.planHash === meta.planHash) });
+  }
   const changesFile = path.join(directory, "changes.json");
   const changes = await fs.stat(changesFile).then(() => readJson(changesFile), (error) => {
     if (error.code === "ENOENT") return null;
@@ -50,7 +88,9 @@ export async function getRequirementEvidence(projectPath, principal, id) {
     const failed = eventRows.find(event => event.hash === detail.priorFailureHash && ["implementation_failed", "verification_failed", "verified", "test_deployed"].includes(event.type));
     if (!failed) throw new Error("Retained implementation state event is missing");
     const retained = path.join(directory, `implementation-${["verified", "test_deployed"].includes(failed.type) ? "review" : "failure"}-${failed.hash}`);
-    if (detail.retained !== retained) throw new Error("Retained implementation attempt is outside its archive");
+    if (path.basename(detail.retained) !== path.basename(retained)
+        || path.basename(path.dirname(detail.retained)) !== path.basename(directory)
+        || path.dirname(await fs.realpath(retained)) !== await fs.realpath(directory)) throw new Error("Retained implementation attempt is outside its archive");
     const implementation = failed.type !== "implementation_failed"
       ? eventRows.find(event => event.hash === detail.priorImplementationHash && event.type === "implemented") : failed;
     const report = await readJson(path.join(retained, "changes.json"));
@@ -69,7 +109,9 @@ export async function getRequirementEvidence(projectPath, principal, id) {
   }
   for (const retained of eventRows.filter(event => event.type === "local_validation_changes_retained")) {
     const expected = path.join(directory, `local-review-${retained.previous}`);
-    if (retained.detail.retained !== expected) throw new Error("本地验证历史目录与审计记录不同。");
+    if (path.basename(retained.detail.retained) !== path.basename(expected)
+        || path.basename(path.dirname(retained.detail.retained)) !== path.basename(directory)
+        || path.dirname(await fs.realpath(expected)) !== await fs.realpath(directory)) throw new Error("本地验证历史目录与审计记录不同。");
     const report = await readJson(path.join(expected, "changes.json"));
     const previous = eventRows.find(event => event.hash === retained.detail.priorImplementationHash && event.type === "implemented");
     if (!previous || JSON.stringify(report.changes) !== JSON.stringify(previous.detail.changes)) throw new Error("本地验证前的变更记录已改变。");
@@ -85,7 +127,9 @@ export async function getRequirementEvidence(projectPath, principal, id) {
     const rollback = eventRows.find(event => event.hash === detail.priorRollbackHash && event.type === "workspace_rolled_back");
     const implementation = eventRows.find(event => event.hash === detail.priorImplementationHash);
     const retained = path.join(directory, `rollback-${detail.priorRollbackHash}`);
-    if (!rollback || !implementation || detail.retained !== retained || rollback.meta.baselineHash !== detail.baselineHash
+    if (!rollback || !implementation || path.basename(detail.retained) !== path.basename(retained)
+        || path.basename(path.dirname(detail.retained)) !== path.basename(directory)
+        || path.dirname(await fs.realpath(retained)) !== await fs.realpath(directory) || rollback.meta.baselineHash !== detail.baselineHash
         || eventRows.indexOf(implementation) >= eventRows.indexOf(rollback)) throw new Error("Restart history differs from the audited rollback");
     const report = await readJson(path.join(retained, "changes.json"));
     if (sha256(JSON.stringify(report)) !== detail.reportHash || JSON.stringify(report.changes) !== JSON.stringify(implementation.detail.changes))
@@ -117,7 +161,25 @@ export async function getRequirementEvidence(projectPath, principal, id) {
   });
   const supersededBy = meta.state === "test_deployed" && environment && environment.taskId !== id
     && environment.url === meta.testDeployment.url ? environment.taskId : null;
+  const accepted = eventRows.findLast(event => event.type === "test_accepted"
+    && event.meta.contractHash === meta.contractHash && event.meta.planHash === meta.planHash && event.meta.afterHash === meta.afterHash);
+  let humanAcceptance = null;
+  if (accepted) {
+    const conclusion = await fs.readFile(path.join(directory, "acceptance.md"), "utf8");
+    const recorded = Object.hasOwn(accepted.detail, "acceptanceResults");
+    if (sha256(conclusion) !== accepted.detail.evidenceHash
+        || recorded !== Object.hasOwn(meta, "acceptanceResults")
+        || JSON.stringify(meta.acceptanceResults) !== JSON.stringify(accepted.detail.acceptanceResults))
+      throw new Error("Human acceptance evidence changed");
+    if (recorded) acceptanceInput(accepted.detail.acceptanceResults, contract);
+    humanAcceptance = { eventHash: accepted.hash, at: accepted.at, actor: accepted.detail.actor,
+      acceptanceMode: accepted.detail.acceptanceMode, sourceHash: accepted.detail.afterHash,
+      environmentSourceHash: accepted.detail.environmentSourceHash, planHash: accepted.meta.planHash,
+      contractHash: accepted.meta.contractHash, results: recorded ? accepted.detail.acceptanceResults : null,
+      coverageRecorded: recorded, conclusion };
+  }
   return { auditHead: lastHash, execution: executionStatus(directory), meta: { ...meta, testEnvironmentSupersededBy: supersededBy }, request, feedback, contract, reviews, plan, planAnalysis, changes, implementationAttempts, baselineChecks, events, result,
+    verificationAttempts, humanAcceptance,
     planReview: planAnalysis ? planReviewStatus(meta, planAnalysis.draft) : null,
     planDiscussion: planDiscussion({ meta, directory, events: eventRows }),
     acceptanceDiscussion: acceptanceDiscussion({ meta, directory, events: eventRows }),
