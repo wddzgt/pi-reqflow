@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>需求工作台</title><link rel="stylesheet" href="/styles.css"></head>
+<body>
+<header><div class="brand">需求工作台 <span>把需求说清楚，让 Pi 完成代码</span></div><div class="account" id="account" hidden><select id="project" aria-label="当前项目"></select><button id="context-toggle">项目初始化 / 图谱</button><button id="settings-toggle">项目设置</button><button id="users-toggle" hidden>用户管理</button><button id="import-toggle" hidden>导入项目</button><span id="identity"></span><button id="logout">退出</button></div></header>
+<div id="notice" role="status" hidden></div>
+<section id="login" hidden><form id="login-form" class="login-card"><h1>登录工作台</h1><p>使用项目已有账号，继续你的工作。</p><label>项目<select id="login-project" required></select></label><label>账号<input id="username" autocomplete="username" required></label><label>密码<input id="password" type="password" autocomplete="current-password" required></label><button class="primary">登录</button></form></section>
+<div id="workspace" hidden>
+<aside><div class="sidebar-heading"><span>最近访问</span><span id="sync-status" role="status">自动同步</span></div><button id="center-toggle" aria-controls="empty">需求中心</button><button id="new-task" class="primary">＋ 新需求</button><div id="task-list"></div><details><summary>历史审计 · 只读</summary><div id="history"></div></details></aside>
+<main>
+<section id="empty"><div class="section-heading"><div><span class="eyebrow">REQUIREMENT CENTER</span><h1 id="center-heading" tabindex="-1">需求中心</h1><p class="hint">跨项目查看进展，找到下一项需要你处理的需求。</p></div><button id="empty-new" class="primary">创建需求</button></div>
+<nav id="center-views" aria-label="需求视图"><button data-view="mine" aria-pressed="true">待我处理</button><button data-view="active" aria-pressed="false">进行中</button><button data-view="all" aria-pressed="false">全部</button></nav>
+<form id="center-filter"><div class="center-filters">
+<label>项目范围<select id="center-range"><option value="all">全部项目</option></select></label>
+<label>查找需求<input id="center-query" maxlength="160" placeholder="标题或需求编号，按字面查找"></label>
+<label>状态<select id="center-state"><option value="">全部状态</option><option value="draft">产品完善需求</option><option value="queued">待研发开工</option><option value="running">研发实现与验证中</option><option value="ready">待产品验收</option><option value="accepted">待研发应用</option><option value="done">已验收并应用</option><option value="attention">需要处理</option></select></label>
+<label>产品负责人<input id="center-owner" list="center-owners" maxlength="100" placeholder="姓名或账号标识"><datalist id="center-owners"></datalist></label>
+<label>研发负责人<input id="center-developer" list="center-developers" maxlength="100" placeholder="姓名或账号标识"><datalist id="center-developers"></datalist></label>
+<label>更新时间<select id="center-sort"><option value="updated-desc">最近更新优先</option><option value="updated-asc">最早更新优先</option></select></label>
+</div><div class="actions"><button class="primary">查找</button><button type="button" id="center-reset">清空条件</button><button type="button" id="center-refresh">重新查找</button></div></form>
+<p id="center-updates" class="hint" hidden>需求有更新。点击“重新查找”后更新列表顺序，当前阅读位置保持不变。</p>
+<div id="center-failures" class="failure" role="status" hidden></div>
+<p id="center-status" role="status">正在读取需求…</p>
+<div class="center-table"><table><thead><tr><th>项目 / 需求</th><th>状态</th><th>产品 / 研发</th><th>下一步</th><th>更新时间</th></tr></thead><tbody id="center-rows"></tbody></table></div>
+<div class="actions center-pager"><button id="center-prev" disabled>上一页</button><button id="center-next" disabled>下一页</button><label>每页<select id="center-limit"><option value="25">25 条</option><option value="50">50 条</option><option value="100">100 条</option></select></label></div></section>
+<section id="task" hidden>
+<div class="task-overview">
+<div class="task-heading"><div><p class="eyebrow">需求交付</p><h1 id="task-title" tabindex="-1"></h1></div><div class="task-heading-actions"><span id="task-state" class="badge"></span><button id="revert-development" hidden>退回开工前</button><button id="delete-task" hidden>删除需求</button></div></div>
+<div class="progress"><span id="progress">等待操作</span><span id="usage"></span></div>
+<p id="responsibilities" class="hint"></p>
+<div class="task-next"><p id="next-action" role="status"></p><button id="current-stage" type="button" hidden>回到当前阶段</button></div>
+<div id="task-steps" role="tablist" aria-label="交付阶段">
+<button id="tab-requirement" type="button" role="tab" aria-controls="stage-requirement" aria-selected="false" tabindex="-1">需求</button>
+<button id="tab-development" type="button" role="tab" aria-controls="stage-development" aria-selected="false" tabindex="-1">研发</button>
+<button id="tab-verification" type="button" role="tab" aria-controls="stage-verification" aria-selected="false" tabindex="-1">验证与审核</button>
+<button id="tab-delivery" type="button" role="tab" aria-controls="stage-delivery" aria-selected="false" tabindex="-1">验收与应用</button>
+</div></div>
+<section id="stage-requirement" class="panel requirement-panel" role="tabpanel" aria-labelledby="tab-requirement" tabindex="0" hidden><div class="section-heading"><div><span class="eyebrow">PRODUCT REQUIREMENT</span><h2><span id="requirement-heading">产品需求</span> <span id="revision"></span></h2></div><button id="edit-card" class="quiet" hidden>编辑需求</button></div>
+<div id="requirement-alert"></div>
+<p id="requirement-purpose" class="hint">说明谁在什么场景遇到问题，以及什么结果才算完成。</p>
+<section id="clarification-panel" hidden><span class="eyebrow">CLARIFICATION</span><h3>需求反问 <span id="clarification-round"></span></h3>
+<p class="hint">Pi 只追问会改变业务结果的缺失信息，每题标出推荐答案。必须确认类问题未答会转为未决项；补充信息类问题未答会按推荐答案作为模型默认并留痕。</p>
+<div id="clarification-questions"></div>
+<label for="clarification-note">补充说明（可随本轮回答一起提交）</label>
+<textarea id="clarification-note" rows="2" maxlength="30000" placeholder="补充尚未明确的内容，不必单独发起一轮对话…"></textarea>
+<div id="clarification-shots"><p class="hint">粘贴或拖拽 PNG/JPEG 截图<span class="shot-limit"></span>。</p><div class="actions"><button type="button" id="clarification-shots-pick" class="quiet">添加截图</button></div><div id="clarification-shots-list" class="shot-list"></div><input id="clarification-shots-input" type="file" accept="image/png,image/jpeg" multiple hidden></div>
+<div class="actions"><button id="clarification-submit" class="primary">提交回答并继续</button></div></section>
+<details id="clarification-history" hidden><summary>上一轮反问与回答</summary><div id="clarification-history-body"></div></details>
+<section id="decision-panel" hidden><span class="eyebrow">PENDING DECISIONS</span><h3>未决事项 <span id="decision-count"></span></h3>
+<p class="hint">业务规则、范围、状态流转、权限与验收标准的判断需要你确认；标记待定的事项会阻止确认需求。</p>
+<div id="decision-list"></div>
+<div class="actions"><button id="decision-open" class="primary">逐项处理确认项</button><button id="decision-reconsider" class="quiet">重新请求建议</button></div></section>
+<details id="model-decisions" hidden><summary>Pi 自行决定的细节</summary><ul id="model-decision-list"></ul></details>
+<section id="task-images" hidden><span class="eyebrow">SCREENSHOTS</span><h3>参考截图 <span id="task-image-count"></span></h3><div id="task-image-list" class="shot-list"></div></section>
+<article id="card-preview" class="requirement-document" aria-label="需求正文"></article>
+<div id="card-editor" hidden><p class="hint">填写用户场景、目标、业务范围和可观察的验收结果。技术做法由研发在「研发」阶段说明。</p><textarea id="card" rows="16" aria-label="产品需求"></textarea><p id="card-conflict" class="failure" hidden></p><div class="actions"><button id="save-card" class="primary">保存修改</button><button id="cancel-card">取消编辑</button></div></div>
+<div id="requirement-message"><details id="message-panel"><summary id="message-summary">补充说明与 Pi 讨论</summary><form id="message-form"><label id="message-label" for="message">补充说明</label><textarea id="message" rows="3" placeholder="只需补充尚未明确的内容…"></textarea>
+<button id="send-message">发送给 Pi</button></form></details></div>
+<div class="requirement-handoff"><label id="developer-label">交给研发负责人<select id="task-developer" aria-label="研发负责人"></select></label><div class="actions"><button id="confirm-requirement" class="primary">确认需求并交研发</button></div></div></section>
+<section id="stage-development" class="panel implementation-panel" role="tabpanel" aria-labelledby="tab-development" tabindex="0" hidden>
+<div class="section-heading"><h2>研发实现说明 <span id="implementation-revision"></span></h2><button id="edit-implementation" class="quiet" hidden>编辑研发说明</button></div>
+<div id="development-alert"></div><div id="development-evidence"></div>
+<div class="actions stage-actions"><button id="start" class="primary">确认开工</button><button id="pause" hidden>暂停执行</button><button id="continue" hidden>从当前现场继续</button><button id="diff-toggle">查看代码差异</button></div>
+<p id="implementation-status" class="hint"></p><article id="implementation-preview" class="requirement-document" aria-label="研发实现正文"></article>
+<div id="implementation-editor" hidden><label for="implementation-content">影响位置、实现要点与验证安排</label><textarea id="implementation-content" rows="8" maxlength="6000"></textarea><p id="implementation-conflict" class="failure" hidden></p><div class="actions"><button id="save-implementation" class="primary">保存研发说明</button><button id="cancel-implementation">取消编辑</button></div></div>
+<div id="development-message"></div></section>
+<section id="stage-verification" class="panel verification-panel" role="tabpanel" aria-labelledby="tab-verification" tabindex="0" hidden><h2>验证与审核</h2>
+<section id="review-result" class="review-result" aria-labelledby="review-heading" hidden>
+<h3 id="review-heading"></h3><p id="review-source"></p><p id="review-reason"></p><p id="review-supplement"></p><p id="review-next"></p>
+<details id="review-details"><summary>查看审核依据</summary><div id="review-basis"></div></details>
+</section>
+<div id="verification-alert"><div id="failure" class="failure" hidden></div></div><div id="evidence"></div><div id="issues"></div>
+<div class="actions stage-actions"><button id="records-open">查看技术记录</button><button id="review-development" type="button" hidden>前往研发处理</button></div></section>
+<section id="stage-delivery" class="panel" role="tabpanel" aria-labelledby="tab-delivery" tabindex="0" hidden><h2>验收与应用</h2>
+<div id="delivery-alert"></div><div id="delivery-evidence"></div>
+<p id="delivery-feedback" class="hint" hidden></p>
+<div class="actions stage-actions"><button id="accept" class="primary" hidden>业务验收通过</button><button id="apply" class="primary" hidden>应用到项目</button><button id="reject-toggle" hidden>退回修改</button><button id="rollback" class="quiet" hidden>回滚本次变更</button><button id="delivery-review" type="button">查看验证与审核</button><button id="delivery-diff" type="button">查看代码差异</button></div>
+<form id="reject-form" hidden><label>退回原因<textarea id="reject-reason" required maxlength="4000" rows="3" placeholder="哪项验收未满足？实际与期望结果分别是什么？"></textarea></label><button>确认退回研发</button></form><p class="hint">交互效果与业务结果由产品验收。</p>
+<div id="application-summary" hidden><h3>代码应用进度</h3><p id="application-status" role="status"></p><p id="application-pending" class="hint"></p><div class="actions"><button id="recover" class="primary" hidden>继续应用已验收代码</button><button id="application-open">查看写入清单</button></div></div>
+</section>
+</section>
+</main>
+</div>
+<dialog id="diff-panel" aria-labelledby="diff-heading"><div class="dialog-header"><h2 id="diff-heading">代码差异</h2><button type="button" id="diff-close" autofocus>关闭</button></div><p id="diff-summary" class="hint"></p><pre id="diff" tabindex="0" aria-label="代码差异内容"></pre></dialog>
+<dialog id="application-dialog" aria-labelledby="application-heading"><div class="dialog-header"><h2 id="application-heading">代码写入清单</h2><button type="button" id="application-close" autofocus>关闭</button></div><p id="application-version" class="hint"></p><table><thead><tr><th>来源</th><th>文件</th><th>实际状态</th></tr></thead><tbody id="application-files"></tbody></table></dialog>
+<dialog id="rollback-dialog" aria-labelledby="rollback-heading"><div class="dialog-header"><h2 id="rollback-heading">回滚本次代码变更</h2><button type="button" id="rollback-cancel" autofocus>关闭</button></div><p>先核对全部待撤销文件，仅撤销本任务实际写入的代码。第三方修改、业务数据与审计保留；回滚中断时可从已核实位置继续。</p><p id="rollback-target" class="hint"></p><div class="actions"><button id="rollback-confirm" class="primary">确认回滚本次代码</button></div></dialog>
+<dialog id="records-panel" aria-labelledby="records-heading">
+<div class="dialog-header"><h2 id="records-heading">技术记录</h2><button type="button" id="records-close" autofocus>关闭</button></div>
+<nav id="records-tabs" aria-label="记录类别"><button data-record="info" aria-pressed="true">执行信息</button><button data-record="unit" aria-pressed="false">测试日志</button><button data-record="pi" aria-pressed="false">Pi 记录</button></nav>
+<p id="records-source" class="hint"></p><p id="records-status" role="status"></p>
+<form id="records-search"><label for="records-query">搜索当前记录全文</label><div class="actions"><input id="records-query" maxlength="256" required placeholder="字面搜索，包含尚未加载的片段"><button>开始搜索</button><button id="records-search-more" type="button" hidden>继续搜索</button></div></form>
+<p id="records-search-status" class="hint" role="status"></p><div id="records-results"></div>
+<div id="records-actions" class="actions"><button id="records-refresh">刷新记录</button><button id="records-prev" hidden>上一段</button><button id="records-copy">复制当前片段</button><button id="records-download">下载完整记录</button></div>
+<pre id="records-content" tabindex="0" aria-label="技术记录内容"></pre>
+<button id="records-more" hidden>加载更多</button>
+</dialog>
+<dialog id="decisions-dialog" aria-labelledby="decisions-heading">
+<div class="dialog-header"><div><span class="eyebrow">CONFIRMATION</span><h2 id="decisions-heading">逐项确认业务判断</h2></div><button type="button" id="decisions-close">关闭</button></div>
+<p class="hint">这些判断会改变用户可观察的业务行为或验收标准。Pi 已给出建议答案和一句影响说明，逐项处理后才能提交。</p>
+<p id="decisions-progress" class="hint"></p><div id="decisions-list"></div><p id="decisions-status" role="status"></p>
+<div class="actions"><button id="decisions-submit" class="primary" disabled>提交全部处理结果</button></div></dialog>
+<dialog id="create-dialog" aria-labelledby="create-heading"><form id="create-form"><div class="dialog-header"><div><span class="eyebrow">PRODUCT REQUIREMENT</span><h2 id="create-heading">创建产品需求</h2></div><button type="button" id="create-close">关闭</button></div><p class="hint">描述业务问题和预期结果，研发负责选择实现方法。</p>
+<label>归属项目<select id="new-project" required></select></label>
+<label>需求标题<input id="new-title" required maxlength="160" placeholder="例如：模板列表按创建时间筛选"></label>
+<label>用户场景与目标<textarea id="new-request" rows="3" required placeholder="谁遇到了什么问题？希望改善什么？例如：运营查找上周创建的模板时，需要逐条翻找。希望按时间快速定位。"></textarea></label>
+<label>业务范围与规则（选填）<textarea id="new-scope" rows="2" placeholder="哪些场景包含在本次需求内？哪些行为保持不变？"></textarea></label>
+<label>验收结果<textarea id="new-acceptance" rows="3" placeholder="用实际操作与可观察的结果描述，例如：选择开始和结束日期后，只显示该时间段内创建的模板；清空日期后恢复全部。"></textarea></label>
+<section class="shots" id="create-shots"><div class="section-heading"><span class="eyebrow">SCREENSHOTS</span><button type="button" id="create-shots-pick" class="quiet">添加截图</button></div>
+<p class="hint">可粘贴或拖拽 PNG/JPEG 截图<span class="shot-limit"></span>。截图随需求一起交给 Pi 判断界面现状与期望效果。</p>
+<div id="create-shots-list" class="shot-list"></div><input id="create-shots-input" type="file" accept="image/png,image/jpeg" multiple hidden></section>
+<p class="hint">直接保存需填写验收结果，不消耗模型调用。尚未想清楚时，可请 Pi 帮你补齐业务问题。</p><p id="create-status" role="status" class="failure" hidden></p><div class="actions"><button type="button" id="create-cancel">取消</button><button name="mode" value="clarify">请 Pi 帮我整理</button><button name="mode" value="save" class="primary">保存产品需求</button></div></form></dialog>
+<dialog id="settings-dialog" aria-labelledby="settings-heading">
+<div class="dialog-header"><h2 id="settings-heading">项目设置</h2><button type="button" id="settings-close">关闭</button></div>
+<p id="settings-status" role="status"></p><p id="settings-permission" class="hint"></p><div id="settings-sources" class="source-list"></div>
+<form id="settings-form">
+<fieldset id="model-form"><legend>模型与 API 凭据</legend>
+<p class="hint">供应商使用 OpenAI Chat Completions 协议。API Key 加密保存，已有密钥不会回显；留空保留原凭据。</p>
+<div id="providers"></div><button type="button" id="add-provider">添加供应商</button>
+<div id="role-models" class="settings-grid">
+<label>需求模型<select id="model-requirement" required></select></label>
+<label>开发模型<select id="model-development" required></select></label>
+<label>审核模型<select id="model-review" required></select></label>
+</div></fieldset>
+<fieldset id="policy-form"><legend>需求任务预算与执行策略</legend>
+<div class="settings-grid">
+<label>每个需求任务 Token 上限<input id="budget-tokens" type="number" min="1" step="1" value="100000" required></label>
+<label>最多模型请求次数<input id="budget-requests" type="number" min="1" step="1" value="12" required></label>
+<label>最多定向修复轮数<input id="budget-repairCycles" type="number" min="1" step="1" value="2" required></label>
+<label>单次执行时限（秒）<input id="budget-runMs" type="number" min="0.001" step="0.001" value="900" required></label>
+<label>源码快照上限（字节）<input id="snapshot-bytes" type="number" min="1" step="1" value="104857600" required></label>
+</div><label>快照排除路径（每行一项）<textarea id="excluded-paths" rows="3" placeholder="dist&#10;coverage"></textarea></label>
+<label>运行依赖目录（每行一项）<textarea id="runtime-dependencies" rows="2" placeholder="node_modules&#10;frontend/node_modules"></textarea></label>
+<p class="hint">依赖目录须在项目内且实际存在，只读复用。更改设置后已有开工授权和测试证据会失效；历史用量不重置。</p>
+</fieldset>
+<div class="actions"><button id="save-settings" class="primary">保存模型与执行设置</button></div></form>
+<form id="unit-form"><fieldset><legend>自定义工程检查（可选）</legend><div id="unit-checks"></div><button type="button" id="add-check">添加检查</button>
+<p class="hint">留空时自动识别各来源 package.json 中的 test:unit 或 test，Pi 随实现补充测试。确需自定义时声明命令、工作目录及覆盖来源；必须覆盖全部来源并真实通过，不支持管道或重定向。</p></fieldset>
+<div class="actions"><button id="save-unit" class="primary">保存工程检查</button><button type="button" id="change-password">修改我的密码</button></div>
+</form></dialog>
+<dialog id="context-dialog" aria-labelledby="context-heading"><div class="dialog-header"><div><span class="eyebrow">PROJECT UNDERSTANDING</span><h2 id="context-heading">项目初始化与理解</h2></div><button type="button" id="context-close">关闭</button></div>
+<p class="hint">围绕业务模块梳理职责、关键状态、行为链路、必保规则与验证方法。development 只读分析，review 核对证据；后续需求按阶段复用。</p>
+<p class="hint">每模块最多两轮成批读取后成稿，独立审核限于所列源码证据。未覆盖范围保留为未知项，后续需求实施时针对性核对源码与实际测试。</p>
+<details><summary>初始化独立预算</summary><p class="hint">只用于本轮项目理解的只读梳理与独立核对，不占用需求任务额度。续跑保留累计消耗；保存预算不调用模型，不改变需求任务的开工授权与测试证据。执行中的调整在下次续跑时生效。</p>
+<form id="initialization-budget-form"><fieldset id="initialization-budget-fields"><div class="settings-grid">
+<label>初始化 Token 上限<input id="initialization-tokens" type="number" min="1" step="1" required></label>
+<label>初始化最多请求次数<input id="initialization-requests" type="number" min="1" step="1" required></label>
+<label>初始化最多纠正轮数<input id="initialization-repairCycles" type="number" min="1" step="1" required></label>
+<label>初始化执行时限（秒）<input id="initialization-runMs" type="number" min="0.001" step="0.001" required></label>
+</div></fieldset><button id="save-initialization-budget" class="primary">保存初始化预算</button></form></details>
+<p id="context-status" role="status"></p><div id="context-sources" class="source-list"></div><section id="knowledge-job" hidden><p id="knowledge-progress"></p><p id="knowledge-usage" class="hint"></p><p id="knowledge-failure" class="failure" hidden></p><div class="actions"><button id="knowledge-pause" hidden>暂停梳理</button><button id="knowledge-continue" hidden>从检查点继续</button></div></section>
+<form id="knowledge-form" hidden><label>本次梳理范围<textarea id="knowledge-scope" rows="2" required minlength="5" maxlength="1200" placeholder="描述要理解的业务范围，例如：先梳理编辑、保存与发布流程，其他业务保留待梳理。"></textarea></label><p id="knowledge-budget" class="hint"></p><button id="knowledge-start" class="primary">开始梳理（调用模型）</button></form>
+<section id="knowledge-view"><p id="knowledge-summary"></p><div id="knowledge-vocabulary" class="hint"></div><div class="knowledge-columns"><nav id="knowledge-modules" aria-label="业务模块"></nav><article id="knowledge-detail" class="requirement-document"></article></div></section>
+<details id="context-structure"><summary>结构索引与符号定位 · 辅助资料</summary><p id="context-index-status" class="hint"></p><div class="actions"><button id="context-build">更新结构索引（不调用模型）</button></div>
+<div id="context-map" hidden><label>查找模块、文件或符号<input id="context-query" type="search" placeholder="例如 Editor、撤销、保存、Controller"></label><p id="context-results" class="hint"></p><div class="context-columns"><div id="context-files"></div><article id="context-detail" class="requirement-document"></article></div></div>
+</details>
+<details id="context-history" hidden><summary>历史初始化资料 · 只读</summary><p class="hint">历史资料保留原文及版本，不把历史描述当作当前源码事实。执行使用上方经源码核对的图谱。</p><div id="context-documents"></div></details></dialog>
+<dialog id="password-dialog" aria-labelledby="password-heading"><form id="password-form"><div class="dialog-header"><h2 id="password-heading">修改密码</h2><button type="button" id="password-close">关闭</button></div><label>当前密码<input id="old-password" type="password" autocomplete="current-password" required></label><label>新密码<input id="new-password" type="password" autocomplete="new-password" required minlength="6"></label><div class="actions"><button class="primary">修改并重新登录</button></div></form></dialog>
+<dialog id="users-dialog" aria-labelledby="users-heading"><div class="dialog-header"><h2 id="users-heading">用户管理</h2><button type="button" id="users-close">关闭</button></div>
+<p class="hint">当前工作台共享同一账号库。修改角色或重置密码会使该用户的旧登录失效。</p><p id="users-status" role="status"></p><div id="users-list"></div>
+<button type="button" id="user-new">新建用户</button><form id="user-form"><h3 id="user-heading">新建用户</h3><input id="user-action" type="hidden" value="create"><input id="user-id" type="hidden">
+<label>用户名<input id="user-name" required autocomplete="off"></label><label id="user-password-label">临时密码<input id="user-password" type="password" minlength="6" autocomplete="new-password" required></label>
+<fieldset id="user-roles"><legend>人员角色</legend><label class="check-label"><input type="checkbox" value="admin">管理员</label><label class="check-label"><input type="checkbox" value="product">产品</label><label class="check-label"><input type="checkbox" value="developer">研发</label></fieldset>
+<p class="hint">新用户和重置密码后的用户需在首次登录时修改临时密码。</p><button class="primary">保存用户</button></form></dialog>
+<dialog id="import-dialog" aria-labelledby="import-heading"><form id="import-form"><div class="dialog-header"><h2 id="import-heading">导入已有项目</h2><button type="button" id="import-close">关闭</button></div>
+<p class="hint">登记本机已有源码目录，沿用当前工作台账号。导入后填写模型、执行策略和单测命令。</p><p id="import-status" role="status"></p>
+<label>项目名称<input id="import-name" required maxlength="100"></label>
+<label>源码布局<select id="import-mode"><option value="root">一个项目根目录</option><option value="split">分别选择前端和后端</option></select></label>
+<section id="import-root"><label for="import-directory">项目根目录</label><div class="path-picker"><input id="import-directory" required placeholder="/absolute/path/to/project"><button type="button" id="import-browse">选择文件夹</button></div></section>
+<section id="import-split" hidden><p class="hint">两个目录组成一个完整项目，支持不同 Git 仓库，源码保留原位。</p>
+<label for="import-frontend">前端源码目录</label><div class="path-picker"><input id="import-frontend" disabled placeholder="/absolute/path/to/frontend"><button type="button" id="import-frontend-browse">选择前端文件夹</button></div>
+<label for="import-backend">后端源码目录</label><div class="path-picker"><input id="import-backend" disabled placeholder="/absolute/path/to/backend"><button type="button" id="import-backend-browse">选择后端文件夹</button></div></section>
+<p class="hint">前后端在同一目录时选择其上层目录。原源码和 Git 历史保留；已有 .reqflow 的目录不会被覆盖。</p><button class="primary">导入并打开设置</button></form></dialog>
+<dialog id="directory-dialog" aria-labelledby="directory-heading">
+<div class="dialog-header"><h2 id="directory-heading">选择项目文件夹</h2><button type="button" id="directory-cancel">关闭</button></div>
+<p id="directory-status" role="status"></p>
+<fieldset id="directory-controls"><div class="actions"><button type="button" id="directory-up">上级目录</button><button type="button" id="directory-home">主目录</button></div>
+<form id="directory-path-form"><label for="directory-path">当前目录</label><div class="path-picker"><input id="directory-path" required><button>打开</button></div></form></fieldset>
+<p class="hint">浏览工作台所在电脑的文件夹。单击选择，双击进入；也可输入路径后点击“打开”。</p>
+<div id="directory-list" aria-label="子文件夹列表"></div><p id="directory-selection"></p>
+<div class="actions"><button type="button" id="directory-select" class="primary" disabled>选择此文件夹</button></div>
+</dialog>
+<template id="provider-template"><section class="provider-editor">
+<div class="section-heading"><h3>模型供应商</h3><button type="button" data-remove-provider>移除供应商</button></div>
+<div class="settings-grid"><label>供应商标识<input data-field="id" required placeholder="例如 bailian"></label>
+<label>API 地址<input data-field="baseUrl" type="url" required placeholder="https://provider.example/v1"></label>
+<label>API Key<input data-field="apiKey" type="password" autocomplete="new-password" placeholder="填写新密钥"></label></div>
+<details><summary>供应商协议</summary><div class="settings-grid">
+<label>系统消息角色<select data-field="systemRole"><option value="system">system</option><option value="developer">developer</option></select></label>
+<label>输出上限参数<select data-field="outputLimitField"><option value="max_tokens">max_tokens</option><option value="max_completion_tokens">max_completion_tokens</option></select></label>
+<label class="check-label"><input data-field="thinkingToggle" type="checkbox">发送 enable_thinking（仅支持该参数的供应商勾选）</label>
+</div></details><div data-models></div><button type="button" data-add-model>添加模型</button>
+</section></template>
+<template id="model-template"><section class="model-editor"><div class="settings-grid">
+<label>模型名称<input data-field="id" required placeholder="供应商的模型 ID"></label>
+<label>上下文窗口 Token<input data-field="contextWindow" type="number" min="1" step="1" required></label>
+<label>最大输出 Token<input data-field="maxTokens" type="number" min="1" step="1" required></label>
+<label class="check-label"><input data-field="reasoning" type="checkbox">模型支持推理</label>
+<label class="check-label"><input data-field="text" type="checkbox" checked>模型支持文本输入</label>
+<label class="check-label"><input data-field="image" type="checkbox">模型支持图片输入</label>
+</div><div class="actions"><button type="button" data-remove-model>移除模型</button><button type="button" data-test-model>测试已保存连接（会调用模型）</button></div></section></template>
+<script type="module" src="/app.js"></script>
+</body></html>

@@ -18,38 +18,38 @@
     "requirements",
     "workflow",
     "human-in-the-loop",
-    "docker"
+    "workbench"
   ],
-  "exports": "./src/core.js",
+  "exports": "./dist/server.js",
   "files": [
-    "src/",
-    "web/",
-    "examples/config.local.json",
-    "examples/config.docker.json",
-    "examples/review/",
-    "examples/demo-app/src/",
-    "examples/demo-app/test/",
-    "examples/demo-app/package.json"
+    "dist/",
+    "src/files.js",
+    "src/model-credentials.js",
+    "web/minimal/",
+    "examples/delivery.json"
   ],
   "type": "module",
   "bin": {
-    "pi-reqflow": "./src/cli.js",
-    "devsail": "./src/cli.js",
-    "reqflow": "./src/cli.js"
+    "pi-reqflow": "./dist/cli.js"
   },
   "scripts": {
-    "start": "node src/cli.js web",
-    "test": "node --test test/*.test.js",
-    "check": "for f in src/*.js; do node --check \"$f\" || exit 1; done"
+    "build": "tsc",
+    "setup": "npm run build && node dist/cli.js init",
+    "start": "npm run build && node dist/cli.js web",
+    "check": "tsc --noEmit && node --check web/minimal/app.js && node --check web/minimal/records.js && node --check web/minimal/center.js",
+    "prepack": "npm run build"
   },
   "engines": {
-    "node": ">=22.12"
+    "node": ">=22.19.0"
   },
   "dependencies": {
-    "@mermaid-js/tiny": "12.1.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
     "ajv": "^8.17.1",
-    "minisearch": "7.2.0",
-    "shell-quote": "1.8.3",
-    "yaml": "2.9.1"
+    "diff": "9.0.0",
+    "shell-quote": "1.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.0",
+    "typescript": "5.9.3"
   }
 }

@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "models": {
+    "requirement": { "provider": "configured", "model": "model-id" },
+    "development": { "provider": "configured", "model": "model-id" },
+    "review": { "provider": "configured", "model": "model-id" }
+  },
+  "providers": [{
+    "id": "configured",
+    "baseUrl": "https://provider.example/v1",
+    "credentialId": "00000000-0000-0000-0000-000000000000",
+    "thinkingToggle": false,
+    "systemRole": "system",
+    "outputLimitField": "max_tokens",
+    "models": [{ "id": "model-id", "contextWindow": 65536, "maxTokens": 8192, "reasoning": false, "input": ["text"] }]
+  }],
+  "unitChecks": [],
+  "excludedPaths": ["dist", "coverage", "test-results"],
+  "runtimeDependencies": [],
+  "maxSnapshotBytes": 104857600,
+  "budget": { "tokens": 100000, "requests": 12, "repairCycles": 2, "runMs": 900000 }
+}

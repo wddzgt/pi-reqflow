@@ -1,8 +1,0 @@
-{
-  "name": "pi-reqflow-demo-calculator",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "test": "node --test test/calculator.test.mjs"
-  }
-}

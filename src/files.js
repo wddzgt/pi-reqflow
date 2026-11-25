@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
@@ -8,14 +8,31 @@ export async function readJson(file) {
   return JSON.parse(await fs.readFile(file, "utf8"));
 }
 
-export async function writeAtomic(file, data) {
+export async function writeAtomic(file, data, mode, stagingFile, beforePublish) {
   await fs.mkdir(path.dirname(file), { recursive: true });
-  const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  const temp = stagingFile === undefined ? `${file}.${process.pid}.${randomUUID()}.tmp` : stagingFile;
+  let created = false, createdIdentity;
   try {
-    await fs.writeFile(temp, data, { flag: "wx", mode: 0o600 });
+    if (beforePublish !== undefined) await beforePublish();
+    const handle = await fs.open(temp, "wx", 0o600);
+    created = true;
+    try { createdIdentity = await handle.stat(); await handle.writeFile(data); if (mode !== undefined) await handle.chmod(mode); await handle.sync(); }
+    finally { await handle.close(); }
+    if (beforePublish !== undefined) await beforePublish();
     await fs.rename(temp, file);
+    if (process.platform !== "win32") {
+      const directory = await fs.open(path.dirname(file), "r");
+      try { await directory.sync(); } finally { await directory.close(); }
+    }
   } catch (error) {
-    await fs.rm(temp, { force: true });
+    if (created && createdIdentity !== undefined) {
+      let current;
+      try { current = await fs.lstat(temp); } catch (cleanup) { if (cleanup.code !== 'ENOENT') throw cleanup; }
+      if (current !== undefined) {
+        if (current.ino !== createdIdentity.ino || current.dev !== createdIdentity.dev) throw new Error(`${error.message}；暂存路径归属改变，未清理：${temp}`);
+        await fs.unlink(temp);
+      }
+    }
     throw error;
   }
 }
